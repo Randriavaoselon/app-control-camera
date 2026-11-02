@@ -1,0 +1,67 @@
+name: Build Windows installer
+
+# Se déclenche automatiquement quand client.py, requirements.txt ou le
+# dossier build/windows/ changent sur main, ou manuellement depuis
+# l'onglet "Actions" du dépôt GitHub (bouton "Run workflow").
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "client.py"
+      - "requirements.txt"
+      - "build/windows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # nécessaire pour repousser releases/CameraClient-Setup.exe dans le dépôt
+
+jobs:
+  build:
+    runs-on: windows-latest   # machine Windows fournie gratuitement par GitHub
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Construire CameraClient.exe (sans fenêtre)
+        run: >
+          pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient
+          --specpath build --workpath build\work-gui --distpath dist client.py
+
+      - name: Construire CameraClient-console.exe (diagnostic)
+        run: >
+          pyinstaller --noconfirm --clean --onefile --console --name CameraClient-console
+          --specpath build --workpath build\work-console --distpath dist client.py
+
+      - name: Installer Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Construire l'installateur (CameraClient-Setup.exe)
+        shell: cmd
+        run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\windows\installer.iss'
+
+      - name: Mettre l'installateur à disposition du workflow (résultat immédiat)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CameraClient-Setup
+          path: releases/CameraClient-Setup.exe
+
+      - name: Publier l'installateur dans le dépôt (releases/)
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f releases/CameraClient-Setup.exe
+          git diff --staged --quiet && echo "Rien de nouveau à publier" || \
+            (git commit -m "Build automatique de CameraClient-Setup.exe [skip ci]" && git push)
