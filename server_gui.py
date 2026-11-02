@@ -1,10 +1,10 @@
 """
 Interface graphique de contrôle — consomme l'API HTTP du serveur.
 
-Cette GUI ne parle jamais directement au client caméra : elle passe
-toujours par l'API du serveur (SERVER_URL). Elle peut donc tourner sur
-une machine complètement différente du serveur et du client, sur
-n'importe quel réseau.
+Cette GUI ne parle jamais directement aux clients caméra : elle passe
+toujours par l'API du serveur (SERVER_URL). Comme un serveur peut gérer
+plusieurs clients, elle affiche la liste des appareils connus et pilote
+celui qui est sélectionné.
 """
 
 import io
@@ -19,6 +19,7 @@ import requests
 from PIL import Image, ImageTk
 
 SERVER_URL = "http://127.0.0.1:5050"   # à remplacer par l'URL publique du serveur
+POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
 POLL_FRAME_INTERVAL = 0.1
 REQUEST_TIMEOUT = 5
@@ -32,15 +33,18 @@ class CameraServerApp:
         self.root = root
         self.server_url = server_url.rstrip("/")
         self.root.title("Contrôle caméra — Dashboard")
-        self.root.geometry("840x620")
-        self.root.minsize(700, 520)
+        self.root.geometry("840x660")
+        self.root.minsize(700, 560)
 
         self.camera_on = False
+        self.devices: dict[str, dict] = {}          # device_id -> infos
+        self.selected_device_id: str | None = None
         self.log_queue: "queue.Queue" = queue.Queue()
 
         self._build_ui()
         self._poll_logs()
 
+        threading.Thread(target=self._poll_devices_loop, daemon=True).start()
         threading.Thread(target=self._poll_status_loop, daemon=True).start()
         threading.Thread(target=self._poll_frame_loop, daemon=True).start()
 
@@ -64,6 +68,16 @@ class CameraServerApp:
             header, textvariable=self.status_var, style="Status.TLabel", foreground=COLOR_KO
         )
         self.status_label.pack(side="right")
+
+        device_bar = ttk.Frame(self.root, padding=(12, 0))
+        device_bar.pack(fill="x")
+        ttk.Label(device_bar, text="Appareil :").pack(side="left", padx=(0, 6))
+        self.device_var = tk.StringVar()
+        self.device_combo = ttk.Combobox(
+            device_bar, textvariable=self.device_var, state="readonly", width=50
+        )
+        self.device_combo.pack(side="left", fill="x", expand=True)
+        self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
 
         video_frame = ttk.Frame(self.root, padding=(12, 0))
         video_frame.pack(fill="both", expand=True)
@@ -97,11 +111,28 @@ class CameraServerApp:
     # ------------------------------------------------------------------
     # Boucles réseau (threads d'arrière-plan)
     # ------------------------------------------------------------------
+    def _poll_devices_loop(self) -> None:
+        while True:
+            try:
+                response = requests.get(f"{self.server_url}/api/devices", timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                devices = {d["device_id"]: d for d in response.json().get("devices", [])}
+                self._sync_device_list(devices)
+            except requests.RequestException:
+                pass
+            time.sleep(POLL_DEVICES_INTERVAL)
+
     def _poll_status_loop(self) -> None:
         was_connected = False
         while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_STATUS_INTERVAL)
+                continue
             try:
-                response = requests.get(f"{self.server_url}/api/status", timeout=REQUEST_TIMEOUT)
+                response = requests.get(
+                    f"{self.server_url}/api/status", params={"device_id": device_id}, timeout=REQUEST_TIMEOUT
+                )
                 response.raise_for_status()
                 data = response.json()
                 connected = data["client_connected"]
@@ -122,8 +153,16 @@ class CameraServerApp:
 
     def _poll_frame_loop(self) -> None:
         while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_FRAME_INTERVAL)
+                continue
             try:
-                response = requests.get(f"{self.server_url}/api/frame/latest", timeout=REQUEST_TIMEOUT)
+                response = requests.get(
+                    f"{self.server_url}/api/frame/latest",
+                    params={"device_id": device_id},
+                    timeout=REQUEST_TIMEOUT,
+                )
                 if response.status_code == 200 and response.content:
                     self._display_frame(response.content)
             except requests.RequestException:
@@ -131,7 +170,46 @@ class CameraServerApp:
             time.sleep(POLL_FRAME_INTERVAL)
 
     # ------------------------------------------------------------------
-    # Commandes envoyées au serveur
+    # Sélection de l'appareil (un serveur peut en avoir plusieurs)
+    # ------------------------------------------------------------------
+    def _sync_device_list(self, devices: dict[str, dict]) -> None:
+        def apply():
+            self.devices = devices
+            labels = [
+                f"{d['name']} — {'connecté' if d['connected'] else 'hors ligne'} ({device_id[:8]})"
+                for device_id, d in devices.items()
+            ]
+            self.device_combo["values"] = labels
+
+            if self.selected_device_id is None and devices:
+                first_id = next(iter(devices))
+                self._select_device(first_id)
+            elif self.selected_device_id not in devices and devices:
+                first_id = next(iter(devices))
+                self._select_device(first_id)
+            elif not devices:
+                self.selected_device_id = None
+                self.device_var.set("")
+                self.status_var.set("Aucun appareil connu")
+                self.status_label.configure(foreground=COLOR_KO)
+
+        self.root.after(0, apply)
+
+    def _select_device(self, device_id: str) -> None:
+        self.selected_device_id = device_id
+        device = self.devices.get(device_id, {})
+        label = f"{device.get('name', '?')} — ({device_id[:8]})"
+        self.device_var.set(label)
+        self._log(f"Appareil sélectionné : {label}")
+
+    def _on_device_selected(self, _event) -> None:
+        index = self.device_combo.current()
+        device_ids = list(self.devices.keys())
+        if 0 <= index < len(device_ids):
+            self._select_device(device_ids[index])
+
+    # ------------------------------------------------------------------
+    # Commandes envoyées au serveur (pour l'appareil sélectionné)
     # ------------------------------------------------------------------
     def send_start(self) -> None:
         self._send_command("START_CAMERA")
@@ -141,9 +219,14 @@ class CameraServerApp:
         self.root.after(0, lambda: self.video_label.configure(image="", text="Caméra éteinte"))
 
     def _send_command(self, command: str) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
         try:
             requests.post(
-                f"{self.server_url}/api/command", json={"command": command}, timeout=REQUEST_TIMEOUT
+                f"{self.server_url}/api/command",
+                json={"device_id": self.selected_device_id, "command": command},
+                timeout=REQUEST_TIMEOUT,
             )
             self._log(f"Commande envoyée : {command}")
         except requests.RequestException as exc:

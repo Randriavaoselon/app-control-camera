@@ -5,6 +5,10 @@ Compatible Windows et Linux. Conçu pour tourner en arrière-plan, sans
 terminal visible : les messages vont dans un fichier log, et l'adresse
 du serveur peut être mémorisée une fois pour toutes avec --save.
 
+Chaque client possède un identifiant unique (device_id), généré à la
+première exécution et mémorisé dans la configuration : c'est ce qui
+permet à un même serveur de piloter plusieurs clients différents.
+
 Utilisation :
     python client.py --server https://mon-serveur.com --save   # première fois
     python client.py                                           # ensuite (relit la config)
@@ -17,8 +21,10 @@ import json
 import logging
 import os
 import platform
+import socket
 import time
 import threading
+import uuid
 from pathlib import Path
 
 import cv2
@@ -65,13 +71,36 @@ def load_config() -> dict:
     return {}
 
 
-def save_config(server_url: str) -> None:
-    CONFIG_PATH.write_text(json.dumps({"server_url": server_url}, indent=2), encoding="utf-8")
+def _write_config(config: dict) -> None:
+    CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
     try:
         os.chmod(CONFIG_PATH, 0o600)  # pas d'effet sous Windows, inoffensif
     except OSError:
         pass
+
+
+def save_config(server_url: str) -> None:
+    """Sauvegarde l'URL du serveur SANS écraser le device_id déjà mémorisé."""
+    config = load_config()
+    config["server_url"] = server_url
+    config.setdefault("device_id", uuid.uuid4().hex)
+    _write_config(config)
     logger.info("Configuration sauvegardée : %s", CONFIG_PATH)
+
+
+def get_or_create_device_id() -> str:
+    """Identifiant unique et permanent de CET appareil, pour que le serveur
+    puisse distinguer plusieurs clients différents."""
+    config = load_config()
+    device_id = config.get("device_id")
+    if device_id:
+        return device_id
+
+    device_id = uuid.uuid4().hex
+    config["device_id"] = device_id
+    _write_config(config)
+    logger.info("Nouvel identifiant d'appareil créé : %s", device_id)
+    return device_id
 
 
 def resolve_server_url(cli_value: str | None) -> str:
@@ -91,14 +120,19 @@ def _open_camera() -> cv2.VideoCapture:
 
 
 class CameraClient:
-    def __init__(self, server_url: str):
+    def __init__(self, server_url: str, device_id: str, device_name: str):
         self.server_url = server_url
+        self.device_id = device_id
+        self.device_name = device_name
         self.camera_on = False
         self.capture: cv2.VideoCapture | None = None
         self._stop_streaming = threading.Event()
 
     def run_forever(self) -> None:
-        logger.info("Démarrage du client — serveur : %s", self.server_url)
+        logger.info(
+            "Démarrage du client — serveur : %s — appareil : %s (%s)",
+            self.server_url, self.device_name, self.device_id,
+        )
         while True:
             try:
                 self._check_command()
@@ -107,14 +141,18 @@ class CameraClient:
             time.sleep(POLL_INTERVAL)
 
     def run_once(self) -> None:
-        logger.info("Test (--once) — serveur : %s", self.server_url)
+        logger.info("Test (--once) — serveur : %s — appareil : %s", self.server_url, self.device_id)
         self._check_command()
         time.sleep(1)  # laisse une chance au flux de démarrer avant de couper
         if self.camera_on:
             self._stop_camera()
 
     def _check_command(self) -> None:
-        response = requests.get(f"{self.server_url}/api/command", timeout=REQUEST_TIMEOUT)
+        response = requests.get(
+            f"{self.server_url}/api/command",
+            params={"device_id": self.device_id, "name": self.device_name},
+            timeout=REQUEST_TIMEOUT,
+        )
         response.raise_for_status()
         command = response.json().get("command")
         logger.debug("Commande reçue : %s", command)
@@ -157,6 +195,7 @@ class CameraClient:
             try:
                 requests.post(
                     f"{self.server_url}/api/frame",
+                    params={"device_id": self.device_id},
                     data=buffer.tobytes(),
                     headers={"Content-Type": "application/octet-stream"},
                     timeout=REQUEST_TIMEOUT,
@@ -188,7 +227,10 @@ def main() -> None:
             return
         save_config(server_url)
 
-    client = CameraClient(server_url)
+    device_id = get_or_create_device_id()
+    device_name = socket.gethostname()
+
+    client = CameraClient(server_url, device_id, device_name)
     if args.once:
         client.run_once()
     else:
