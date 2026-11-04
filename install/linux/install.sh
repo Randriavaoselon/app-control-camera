@@ -49,6 +49,13 @@ fetch() {
   fi
 }
 
+# Vérifie que le fichier reçu est bien un module Python (docstring """ en
+# tête), et pas une page d'erreur HTML ou un JSON d'erreur Flask. On ne
+# cherche plus le mot "python" : il n'apparaît nulle part dans client.py.
+looks_like_python() {
+  head -c 3 "$1" | grep -q '"""'
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --server)    [ $# -ge 2 ] || fail "--server attend une valeur"; SERVER="$2"; shift 2 ;;
@@ -93,7 +100,8 @@ else
   say "⬇  Téléchargement du client depuis $SERVER"
   fetch "$SERVER/client/download" "$APP_DIR/client.py.new" \
     || { rm -f "$APP_DIR/client.py.new"; fail "Téléchargement impossible depuis $SERVER."; }
-  head -c 64 "$APP_DIR/client.py.new" | grep -q python || { rm -f "$APP_DIR/client.py.new"; fail "Le serveur n'a pas renvoyé client.py."; }
+  looks_like_python "$APP_DIR/client.py.new" \
+    || { rm -f "$APP_DIR/client.py.new"; fail "Le serveur n'a pas renvoyé client.py (route /client/download absente ou en erreur)."; }
   chmod 755 "$APP_DIR/client.py.new"; mv -f "$APP_DIR/client.py.new" "$APP_DIR/client.py"
   fetch "$SERVER/client/requirements" "$APP_DIR/requirements.txt" 2>/dev/null || true
 fi

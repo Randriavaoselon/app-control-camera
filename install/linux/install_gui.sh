@@ -50,6 +50,12 @@ fetch() {
   fi
 }
 
+# Vérifie que le fichier reçu est bien un module Python (docstring """ en
+# tête), et pas une page d'erreur HTML ou un JSON d'erreur Flask.
+looks_like_python() {
+  head -c 3 "$1" | grep -q '"""'
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --server)    [ $# -ge 2 ] || fail "--server attend une valeur"; SERVER="$2"; shift 2 ;;
@@ -90,7 +96,8 @@ else
   say "⬇  Téléchargement de la GUI depuis $SERVER"
   fetch "$SERVER/gui/download" "$APP_DIR/server_gui.py.new" \
     || { rm -f "$APP_DIR/server_gui.py.new"; fail "Téléchargement impossible depuis $SERVER."; }
-  head -c 64 "$APP_DIR/server_gui.py.new" | grep -q python || { rm -f "$APP_DIR/server_gui.py.new"; fail "Le serveur n'a pas renvoyé server_gui.py."; }
+  looks_like_python "$APP_DIR/server_gui.py.new" \
+    || { rm -f "$APP_DIR/server_gui.py.new"; fail "Le serveur n'a pas renvoyé server_gui.py (route /gui/download absente ou en erreur)."; }
   chmod 755 "$APP_DIR/server_gui.py.new"; mv -f "$APP_DIR/server_gui.py.new" "$APP_DIR/server_gui.py"
   fetch "$SERVER/gui/requirements" "$APP_DIR/requirements-gui.txt" 2>/dev/null || true
 fi
@@ -117,8 +124,6 @@ esac
 # ---------------------------------------------------------------- configuration
 if [ -n "$SERVER" ]; then
   say "💾 Sauvegarde du serveur ($SERVER)"
-  "$LAUNCHER" --server "$SERVER" --save --no-display 2>/dev/null || true
-  # server_gui.py n'a pas de mode --no-display : on écrit directement la config
   mkdir -p "$APP_DIR"
   python3 -c "import json,sys; open(sys.argv[1],'w').write(json.dumps({'server_url': sys.argv[2]}, indent=2))" \
     "$APP_DIR/config.json" "$SERVER"
