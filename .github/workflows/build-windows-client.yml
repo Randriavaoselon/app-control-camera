@@ -1,24 +1,24 @@
-name: Build Windows installer
+# .github/workflows/build-windows-client.yml
+name: Build Windows client installer
 
-# Se déclenche automatiquement quand client.py, server_gui.py,
-# requirements.txt ou le dossier build/windows/ changent sur main, ou
-# manuellement depuis l'onglet "Actions" du dépôt GitHub (bouton "Run workflow").
+# Se déclenche automatiquement quand client.py, requirements.txt ou le
+# dossier build/windows/ changent sur main, ou manuellement depuis
+# l'onglet "Actions" du dépôt GitHub (bouton "Run workflow").
 on:
   push:
     branches: [ main ]
     paths:
       - "client.py"
-      - "server_gui.py"
       - "requirements.txt"
       - "build/windows/**"
   workflow_dispatch:
 
 permissions:
-  contents: write   # nécessaire pour repousser releases/*.exe dans le dépôt
+  contents: write   # nécessaire pour repousser releases/CameraClient-Setup.exe dans le dépôt
 
 jobs:
   build:
-    runs-on: windows-latest   # machine Windows fournie gratuitement par GitHub
+    runs-on: windows-latest
 
     steps:
       - name: Récupérer le code
@@ -45,37 +45,24 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --console --name CameraClient-console
           --specpath build --workpath build\work-client-console --distpath dist client.py
 
-      - name: Construire CameraServerGUI.exe (interface de contrôle)
-        run: >
-          pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
-          --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
-
       - name: Installer Inno Setup
         run: choco install innosetup -y --no-progress
 
-      - name: Construire l'installateur silencieux du client (CameraClient-Setup.exe)
+      - name: Construire l'installateur silencieux (CameraClient-Setup.exe)
         shell: cmd
         run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\windows\installer.iss'
 
-      - name: Mettre les exécutables à disposition du workflow (résultat immédiat)
+      - name: Mettre l'installateur à disposition du workflow (résultat immédiat)
         uses: actions/upload-artifact@v4
         with:
           name: CameraClient-Setup
           path: releases/CameraClient-Setup.exe
 
-      - name: Mettre CameraServerGUI.exe à disposition du workflow
-        uses: actions/upload-artifact@v4
-        with:
-          name: CameraServerGUI
-          path: dist/CameraServerGUI.exe
-
-      - name: Publier les exécutables dans le dépôt (releases/)
+      - name: Publier l'installateur dans le dépôt (releases/)
         shell: bash
         run: |
-          mkdir -p releases
-          cp dist/CameraServerGUI.exe releases/CameraServerGUI.exe
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f releases/CameraClient-Setup.exe releases/CameraServerGUI.exe
+          git add -f releases/CameraClient-Setup.exe
           git diff --staged --quiet && echo "Rien de nouveau à publier" || \
-            (git commit -m "Build automatique de CameraClient-Setup.exe et CameraServerGUI.exe [skip ci]" && git push)
+            (git commit -m "Build automatique de CameraClient-Setup.exe [skip ci]" && git push)

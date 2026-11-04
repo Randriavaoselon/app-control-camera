@@ -1,0 +1,59 @@
+# .github/workflows/build-windows-gui.yml
+name: Build Windows server GUI
+
+# Se déclenche automatiquement quand server_gui.py ou requirements-gui.txt
+# changent sur main, ou manuellement depuis l'onglet "Actions" du dépôt
+# GitHub (bouton "Run workflow"). Ce pipeline est totalement indépendant
+# de celui du client : aucun Inno Setup ici, donc rien ne peut bloquer
+# la publication de CameraServerGUI.exe.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - "server_gui.py"
+      - "requirements-gui.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # nécessaire pour repousser releases/CameraServerGUI.exe dans le dépôt
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Récupérer le code
+        uses: actions/checkout@v4
+
+      - name: Installer Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installer les dépendances + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-gui.txt
+          pip install pyinstaller
+
+      - name: Construire CameraServerGUI.exe (sans fenêtre)
+        run: >
+          pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
+          --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
+
+      - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)
+        uses: actions/upload-artifact@v4
+        with:
+          name: CameraServerGUI
+          path: dist/CameraServerGUI.exe
+
+      - name: Publier l'exécutable dans le dépôt (releases/)
+        shell: bash
+        run: |
+          mkdir -p releases
+          cp dist/CameraServerGUI.exe releases/CameraServerGUI.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f releases/CameraServerGUI.exe
+          git diff --staged --quiet && echo "Rien de nouveau à publier" || \
+            (git commit -m "Build automatique de CameraServerGUI.exe [skip ci]" && git push)
