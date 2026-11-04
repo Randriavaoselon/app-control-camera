@@ -20,9 +20,11 @@ from flask import Flask, request, jsonify, Response, send_from_directory
 
 app = Flask(__name__)
 
-# Dossier de ce fichier : sert client.py et requirements.txt tels quels,
-# pour que les scripts d'installation puissent les télécharger avec curl.
+# Dossier de ce fichier : sert client.py, server_gui.py et leurs
+# requirements tels quels, pour que les scripts d'installation puissent
+# les télécharger avec curl.
 PROJECT_DIR = Path(__file__).resolve().parent
+GUI_INSTALL_DIR = PROJECT_DIR / "install" / "linux"
 
 # Un serveur -> plusieurs clients : chaque appareil a son propre état,
 # rangé dans ce dictionnaire sous son device_id. Protégé par un verrou.
@@ -175,7 +177,7 @@ def get_latest_frame():
 
 
 # ---------------------------------------------------------------------
-# Téléchargement du client (pour `curl | bash` depuis les scripts d'installation)
+# Téléchargement du CLIENT (source + installateur Windows)
 # ---------------------------------------------------------------------
 
 @app.route("/client/download", methods=["GET"])
@@ -191,17 +193,49 @@ def download_requirements():
 @app.route("/download/windows", methods=["GET"])
 def download_windows_installer():
     """
-    Sert l'installateur Windows (CameraClient-Setup.exe).
+    Sert l'installateur Windows du CLIENT (CameraClient-Setup.exe).
 
     Ce fichier n'est PAS construit ici : il est fabriqué une fois, sur un PC
-    Windows, avec build/windows/build_windows.bat (PyInstaller + Inno Setup),
-    puis déposé dans le dossier releases/ du projet (et donc envoyé sur
-    GitHub / PythonAnywhere avec `git add releases/CameraClient-Setup.exe`).
+    Windows (ou via GitHub Actions), avec build/windows/build_windows.bat
+    (PyInstaller + Inno Setup), puis déposé dans releases/.
+    C'est ce fichier que le bouton « Télécharger le client » de server_gui.py
+    récupère.
     """
     releases_dir = PROJECT_DIR / "releases"
     filename = "CameraClient-Setup.exe"
     if not (releases_dir / filename).exists():
-        return jsonify({"error": "Installateur Windows pas encore publié"}), 404
+        return jsonify({"error": "Installateur Windows du client pas encore publié"}), 404
+    return send_from_directory(releases_dir, filename, as_attachment=True)
+
+
+# ---------------------------------------------------------------------
+# Téléchargement de la GUI (installation sous Linux via curl)
+# ---------------------------------------------------------------------
+
+@app.route("/gui/install", methods=["GET"])
+def download_gui_installer_script():
+    """Le script d'installation Linux de la GUI lui-même : c'est lui qu'on
+    récupère avec curl pour installer la commande `camera-gui`."""
+    return send_from_directory(GUI_INSTALL_DIR, "install_gui.sh", as_attachment=False)
+
+
+@app.route("/gui/download", methods=["GET"])
+def download_gui_source():
+    return send_from_directory(PROJECT_DIR, "server_gui.py", as_attachment=False)
+
+
+@app.route("/gui/requirements", methods=["GET"])
+def download_gui_requirements():
+    return send_from_directory(PROJECT_DIR, "requirements-gui.txt", as_attachment=False)
+
+
+@app.route("/download/windows/gui", methods=["GET"])
+def download_windows_gui_exe():
+    """Sert directement CameraServerGUI.exe, si l'admin préfère le récupérer sans curl."""
+    releases_dir = PROJECT_DIR / "releases"
+    filename = "CameraServerGUI.exe"
+    if not (releases_dir / filename).exists():
+        return jsonify({"error": "Exécutable Windows de la GUI pas encore publié"}), 404
     return send_from_directory(releases_dir, filename, as_attachment=True)
 
 

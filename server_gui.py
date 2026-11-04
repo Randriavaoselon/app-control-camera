@@ -2,34 +2,83 @@
 Interface graphique de contrôle — consomme l'API HTTP du serveur.
 
 Cette GUI ne parle jamais directement aux clients caméra : elle passe
-toujours par l'API du serveur (SERVER_URL). Comme un serveur peut gérer
-plusieurs clients, elle affiche la liste des appareils connus et pilote
-celui qui est sélectionné.
+toujours par l'API du serveur. Comme un serveur peut gérer plusieurs
+clients, elle affiche la liste des appareils connus et pilote celui qui
+est sélectionné. Elle permet aussi de télécharger l'installateur Windows
+du client directement depuis le serveur configuré.
+
+Utilisation :
+    python server_gui.py --server https://mon-serveur.com --save   # première fois
+    python server_gui.py                                           # ensuite (relit la config)
 """
 
+import argparse
 import io
+import json
+import os
+import platform
 import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
 from datetime import datetime
+from pathlib import Path
 
 import requests
 from PIL import Image, ImageTk
 
-SERVER_URL = "http://127.0.0.1:5050"   # à remplacer par l'URL publique du serveur
+DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
 POLL_FRAME_INTERVAL = 0.1
 REQUEST_TIMEOUT = 5
+DOWNLOAD_TIMEOUT = 30
 
 COLOR_OK = "#28a745"
 COLOR_KO = "#d9534f"
 
 
+# ---------------------------------------------------------------------
+# Configuration persistée (adaptée à l'OS), comme pour client.py
+# ---------------------------------------------------------------------
+
+def _config_dir() -> Path:
+    if platform.system() == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+        return base / "CameraGui"
+    return Path.home() / ".local" / "share" / "camera-gui"
+
+
+CONFIG_DIR = _config_dir()
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        try:
+            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_config(server_url: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps({"server_url": server_url}, indent=2), encoding="utf-8")
+
+
+def resolve_server_url(cli_value: str | None) -> str:
+    if cli_value:
+        return cli_value.rstrip("/")
+    config_value = load_config().get("server_url")
+    if config_value:
+        return config_value.rstrip("/")
+    return DEFAULT_SERVER_URL
+
+
 class CameraServerApp:
-    def __init__(self, root: tk.Tk, server_url: str = SERVER_URL):
+    def __init__(self, root: tk.Tk, server_url: str = DEFAULT_SERVER_URL):
         self.root = root
         self.server_url = server_url.rstrip("/")
         self.root.title("Contrôle caméra — Dashboard")
@@ -43,6 +92,7 @@ class CameraServerApp:
 
         self._build_ui()
         self._poll_logs()
+        self._log(f"Serveur configuré : {self.server_url}")
 
         threading.Thread(target=self._poll_devices_loop, daemon=True).start()
         threading.Thread(target=self._poll_status_loop, daemon=True).start()
@@ -58,6 +108,7 @@ class CameraServerApp:
         style.configure("Status.TLabel", font=("Segoe UI", 10, "bold"))
         style.configure("Start.TButton", font=("Segoe UI", 10, "bold"), padding=8)
         style.configure("Stop.TButton", font=("Segoe UI", 10, "bold"), padding=8)
+        style.configure("Download.TButton", font=("Segoe UI", 9), padding=6)
 
         header = ttk.Frame(self.root, padding=12)
         header.pack(fill="x")
@@ -100,6 +151,14 @@ class CameraServerApp:
         )
         self.btn_stop.pack(side="left")
         self.btn_stop["state"] = "disabled"
+
+        self.btn_download = ttk.Button(
+            controls,
+            text="⬇  Télécharger le client (.exe)",
+            command=self.download_client_installer,
+            style="Download.TButton",
+        )
+        self.btn_download.pack(side="right")
 
         log_frame = ttk.LabelFrame(self.root, text="Journal des événements", padding=8)
         log_frame.pack(fill="both", expand=False, padx=12, pady=(0, 12))
@@ -233,6 +292,36 @@ class CameraServerApp:
             self._log(f"Échec de l'envoi de la commande : {exc}")
 
     # ------------------------------------------------------------------
+    # Téléchargement de l'installateur Windows du client
+    # ------------------------------------------------------------------
+    def download_client_installer(self) -> None:
+        path = filedialog.asksaveasfilename(
+            title="Enregistrer l'installateur du client",
+            defaultextension=".exe",
+            initialfile="CameraClient-Setup.exe",
+            filetypes=[("Exécutable Windows", "*.exe"), ("Tous les fichiers", "*.*")],
+        )
+        if not path:
+            return
+        self._log(f"Téléchargement du client depuis {self.server_url}/download/windows ...")
+        threading.Thread(target=self._do_download_client, args=(path,), daemon=True).start()
+
+    def _do_download_client(self, path: str) -> None:
+        try:
+            response = requests.get(f"{self.server_url}/download/windows", timeout=DOWNLOAD_TIMEOUT)
+            if response.status_code == 404:
+                self._log("L'installateur Windows du client n'est pas encore publié sur le serveur")
+                return
+            response.raise_for_status()
+            with open(path, "wb") as f:
+                f.write(response.content)
+            self._log(f"Client téléchargé : {path}")
+        except requests.RequestException as exc:
+            self._log(f"Échec du téléchargement du client : {exc}")
+        except OSError as exc:
+            self._log(f"Impossible d'écrire le fichier : {exc}")
+
+    # ------------------------------------------------------------------
     # Mise à jour de l'interface (toujours via root.after, thread principal)
     # ------------------------------------------------------------------
     def _update_status(self, connected: bool) -> None:
@@ -278,9 +367,24 @@ class CameraServerApp:
         self.log_queue.put(f"[{timestamp}] {message}")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Interface de contrôle caméra")
+    parser.add_argument("--server", help="URL du serveur (ex. https://mon-serveur.com)")
+    parser.add_argument("--save", action="store_true", help="mémorise --server pour les prochains lancements")
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
+    server_url = resolve_server_url(args.server)
+    if args.save:
+        if not args.server:
+            print("--save nécessite --server")
+            return
+        save_config(server_url)
+
     root = tk.Tk()
-    CameraServerApp(root)
+    CameraServerApp(root, server_url)
     root.mainloop()
 
 
