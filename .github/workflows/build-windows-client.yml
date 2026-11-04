@@ -48,9 +48,23 @@ jobs:
       - name: Installer Inno Setup
         run: choco install innosetup -y --no-progress
 
+      - name: Diagnostic avant compilation (fichiers attendus par installer.iss)
+        shell: cmd
+        run: |
+          echo == Repertoire de travail ==
+          cd
+          echo == Contenu de dist\ (attendu par [Files] Source) ==
+          dir dist
+          echo == Contenu de build\windows\ (doit contenir installer.iss) ==
+          dir build\windows
+          echo == Contenu de releases\ (attendu par OutputDir) ==
+          dir releases
+
       - name: Construire l'installateur silencieux (CameraClient-Setup.exe)
         shell: cmd
-        run: '"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build\windows\installer.iss'
+        run: |
+          cd build\windows
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
       - name: Mettre l'installateur à disposition du workflow (résultat immédiat)
         uses: actions/upload-artifact@v4
