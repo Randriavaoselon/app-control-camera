@@ -1,8 +1,7 @@
-# .github/workflows/build-windows-client.yml
 name: Build Windows client installer
 
 # Se déclenche automatiquement quand client.py, requirements.txt ou le
-# dossier build/windows/ changent sur main, ou manuellement depuis
+# dossier packaging/windows/ changent sur main, ou manuellement depuis
 # l'onglet "Actions" du dépôt GitHub (bouton "Run workflow").
 on:
   push:
@@ -10,7 +9,7 @@ on:
     paths:
       - "client.py"
       - "requirements.txt"
-      - "build/windows/**"
+      - "packaging/windows/**"
   workflow_dispatch:
 
 permissions:
@@ -55,15 +54,15 @@ jobs:
           cd
           echo == Contenu de dist\ (attendu par [Files] Source) ==
           dir dist
-          echo == Contenu de build\windows\ (doit contenir installer.iss) ==
-          dir build\windows
+          echo == Contenu de packaging\windows\ (doit contenir installer.iss) ==
+          dir packaging\windows
           echo == Contenu de releases\ (attendu par OutputDir) ==
           dir releases
 
       - name: Construire l'installateur silencieux (CameraClient-Setup.exe)
         shell: cmd
         run: |
-          cd build\windows
+          cd packaging\windows
           "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
 
       - name: Mettre l'installateur à disposition du workflow (résultat immédiat)
