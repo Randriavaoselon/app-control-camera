@@ -1,8 +1,5 @@
 name: Build Windows client installer
 
-# Se déclenche automatiquement quand client.py, requirements.txt ou le
-# dossier packaging/windows/ changent sur main, ou manuellement depuis
-# l'onglet "Actions" du dépôt GitHub (bouton "Run workflow").
 on:
   push:
     branches: [main]
@@ -15,7 +12,6 @@ on:
 permissions:
   contents: write # nécessaire pour publier la GitHub Release
 
-# Empêche deux exécutions de tourner en même temps sur la même branche.
 concurrency:
   group: build-windows-client-${{ github.ref }}
   cancel-in-progress: false
@@ -52,6 +48,13 @@ jobs:
       - name: Installer Inno Setup
         run: choco install innosetup -y --no-progress
 
+      # releases/ n'est plus versionné dans le dépôt (il ne contient plus que
+      # des fichiers générés) : on le recrée nous-mêmes avant qu'Inno Setup
+      # n'y écrive CameraClient-Setup.exe.
+      - name: Préparer le dossier releases\
+        shell: cmd
+        run: if not exist releases mkdir releases
+
       - name: Diagnostic avant compilation (fichiers attendus par installer.iss)
         shell: cmd
         run: |
@@ -76,10 +79,6 @@ jobs:
           name: CameraClient-Setup
           path: releases/CameraClient-Setup.exe
 
-      # Remplace l'ancienne étape "git add/commit/push" : plus aucun binaire
-      # n'est commité dans le dépôt, donc .git ne grossit plus jamais.
-      # tag_name fixe ("client-latest") : chaque build met à jour la MÊME
-      # Release (mêmes fichiers remplacés) au lieu d'en créer une nouvelle.
       - name: Publier l'installateur comme GitHub Release
         uses: softprops/action-gh-release@v2
         with:
