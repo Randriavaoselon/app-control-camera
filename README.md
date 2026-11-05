@@ -99,3 +99,8 @@ Sur GitHub, deux workflows séparés et indépendants construisent et publient a
 ## Dépannage rapide
 
 Le script `packaging/windows/installer.iss` doit impérativement vivre en dehors du dossier `build/` (utilisé comme espace de travail par PyInstaller et nettoyé à chaque build) : c'est pour ça qu'il est rangé dans `packaging/windows/` et non `build/windows/`. Si la compilation Inno Setup échoue avec « The system cannot find the path specified », vérifier en premier lieu que `installer.iss` est bien à cet emplacement et que `[Languages]` utilise `compiler:Default.isl` (l'anglais, toujours présent) plutôt qu'un fichier de traduction optionnel comme `French.isl`.
+
+## Desinstallation sous linux
+└─$ curl -fsSL https://briallant.pythonanywhere.com/gui/install -o /tmp/install_gui.sh \
+  && bash /tmp/install_gui.sh --uninstall
+
