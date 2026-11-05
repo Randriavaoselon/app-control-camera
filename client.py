@@ -183,6 +183,7 @@ def _open_camera() -> cv2.VideoCapture:
         capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        capture.set(cv2.CAP_PROP_FPS, 30)   # sans ça, certaines webcams Windows tombent à 5-15 im/s en lumière faible
     return capture
 
 
