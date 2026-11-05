@@ -65,7 +65,12 @@ except ImportError:
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_INTERVAL = 1.0           # secondes entre deux vérifications de commandes
-CAMERA_FRAME_INTERVAL = 0.1   # secondes entre deux images caméra (~10 im/s)
+CAMERA_FRAME_INTERVAL = 0.1   # intervalle MINIMUM entre deux envois caméra (~10 im/s max)
+CAMERA_WIDTH = 640
+CAMERA_HEIGHT = 480
+CAMERA_JPEG_QUALITY = 70
+SCREEN_JPEG_QUALITY = 60
+SCREEN_MAX_WIDTH = 1280        # l'écran est réduit avant envoi : un 1080p plein format pèse 4 à 6x plus lourd
 # Intervalle MINIMUM entre deux captures, par méthode (la capture et l'envoi
 # réseau tournent dans deux threads séparés, donc ceci ne dépend plus du
 # réseau : mss est quasi instantané, le portail xdg passe par un aller-retour
@@ -162,10 +167,18 @@ def resolve_server_url(cli_value: str | None) -> str:
 
 
 def _open_camera() -> cv2.VideoCapture:
-    """Ouvre la caméra avec le backend le plus fiable selon l'OS."""
+    """Ouvre la caméra avec le backend le plus fiable selon l'OS, réglée pour
+    la FAIBLE LATENCE (tampon d'une seule image, MJPG, résolution modeste)."""
     if platform.system() == "Windows":
-        return cv2.VideoCapture(0, cv2.CAP_DSHOW)
-    return cv2.VideoCapture(0)
+        capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    else:
+        capture = cv2.VideoCapture(0)
+    if capture.isOpened():
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # pas de file d'images périmées dans le driver
+        capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+    return capture
 
 
 # ---------------------------------------------------------------------
@@ -397,6 +410,14 @@ class CameraClient:
         self.screen_on = False
         self.capture: cv2.VideoCapture | None = None
         self._stop_camera_event = threading.Event()
+        self._camera_capture_thread: threading.Thread | None = None
+        self._camera_frame: "np.ndarray | None" = None
+        self._camera_frame_version = 0
+        self._camera_frame_lock = threading.Lock()
+        # Sessions HTTP persistantes (keep-alive) : une par usage/thread. Sans
+        # elles, CHAQUE image ouvre une nouvelle connexion TCP (+ TLS en https).
+        self._cmd_session = requests.Session()
+        self._frame_sessions = {"camera": requests.Session(), "screen": requests.Session()}
         self._stop_screen_event = threading.Event()
         self._screen_frame: "np.ndarray | None" = None
         self._screen_frame_version = 0
@@ -424,7 +445,7 @@ class CameraClient:
             self._stop_screen()
 
     def _check_commands(self) -> None:
-        response = requests.get(
+        response = self._cmd_session.get(
             f"{self.server_url}/api/command",
             params={"device_id": self.device_id, "name": self.device_name},
             timeout=REQUEST_TIMEOUT,
@@ -456,25 +477,63 @@ class CameraClient:
             return
 
         self.camera_on = True
-        self._stop_camera_event.clear()
-        threading.Thread(target=self._stream_camera, daemon=True).start()
+        self._camera_frame = None
+        self._camera_frame_version = 0
+        self._stop_camera_event = threading.Event()   # nouveau à chaque démarrage
+        self._camera_capture_thread = threading.Thread(
+            target=self._camera_capture_loop, args=(self.capture, self._stop_camera_event), daemon=True
+        )
+        self._camera_capture_thread.start()
+        threading.Thread(
+            target=self._camera_send_loop, args=(self._stop_camera_event,), daemon=True
+        ).start()
         logger.info("Caméra allumée")
 
     def _stop_camera(self) -> None:
         self.camera_on = False
         self._stop_camera_event.set()
+        thread = self._camera_capture_thread
+        if thread is not None:
+            thread.join(timeout=2)      # laisse le thread finir son read() avant de libérer la caméra
+            self._camera_capture_thread = None
         if self.capture is not None:
             self.capture.release()
             self.capture = None
         logger.info("Caméra éteinte")
 
-    def _stream_camera(self) -> None:
-        while not self._stop_camera_event.is_set() and self.capture is not None:
-            ok, frame = self.capture.read()
+    def _camera_capture_loop(self, capture: cv2.VideoCapture, stop_event: threading.Event) -> None:
+        """Lit la caméra EN CONTINU, sans jamais attendre le réseau : le driver
+        ne peut donc plus accumuler d'images périmées (cause n°1 de la latence).
+        Seule la dernière image est conservée pour le thread d'envoi."""
+        failures = 0
+        while not stop_event.is_set():
+            ok, frame = capture.read()
             if not ok:
+                failures += 1
+                stop_event.wait(0.05 if failures < 20 else 0.5)
                 continue
-            self._send_frame(frame, "camera")
-            time.sleep(CAMERA_FRAME_INTERVAL)
+            failures = 0
+            with self._camera_frame_lock:
+                self._camera_frame = frame
+                self._camera_frame_version += 1
+
+    def _camera_send_loop(self, stop_event: threading.Event) -> None:
+        """Poste toujours la DERNIÈRE image caméra, au plus tous les CAMERA_FRAME_INTERVAL."""
+        last_version = 0
+        last_send = 0.0
+        while not stop_event.is_set():
+            remaining = CAMERA_FRAME_INTERVAL - (time.monotonic() - last_send)
+            if remaining > 0 and stop_event.wait(remaining):
+                break
+            with self._camera_frame_lock:
+                frame = self._camera_frame
+                version = self._camera_frame_version
+            if frame is not None and version != last_version:
+                last_send = time.monotonic()
+                self._send_frame(frame, "camera")
+                last_version = version
+            else:
+                stop_event.wait(SCREEN_SEND_IDLE_WAIT)
 
     # ------------------------------------------------------------------
     # Flux capture d'écran
@@ -605,11 +664,22 @@ class CameraClient:
     # Envoi au serveur (commun aux deux flux)
     # ------------------------------------------------------------------
     def _send_frame(self, frame, stream: str) -> None:
-        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if stream == "screen":
+            height, width = frame.shape[:2]
+            if width > SCREEN_MAX_WIDTH:
+                scale = SCREEN_MAX_WIDTH / width
+                frame = cv2.resize(
+                    frame, (SCREEN_MAX_WIDTH, max(1, int(height * scale))), interpolation=cv2.INTER_AREA
+                )
+            quality = SCREEN_JPEG_QUALITY
+        else:
+            quality = CAMERA_JPEG_QUALITY
+
+        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if not ok:
             return
         try:
-            requests.post(
+            self._frame_sessions[stream].post(
                 f"{self.server_url}/api/frame",
                 params={"device_id": self.device_id, "stream": stream},
                 data=buffer.tobytes(),
@@ -617,7 +687,7 @@ class CameraClient:
                 timeout=REQUEST_TIMEOUT,
             )
         except requests.RequestException:
-            pass  # on retentera à la prochaine image
+            pass  # on retentera avec la dernière image disponible
 
 
 def parse_args() -> argparse.Namespace:

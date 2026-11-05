@@ -30,10 +30,14 @@ GUI_INSTALL_DIR = PROJECT_DIR / "install" / "linux"
 GITHUB_RELEASE_BASE = "https://github.com/Randriavaoselon/app-control-camera/releases/download/client-latest"
 GITHUB_RELEASE_BASE_GUI = "https://github.com/Randriavaoselon/app-control-camera/releases/download/client-latest"
 
-devices_lock = threading.Lock()
+# Condition (= verrou + notification) : permet au GUI d'être réveillé
+# INSTANTANÉMENT quand une nouvelle image arrive (long-polling), au lieu
+# de redemander toutes les 100 ms et de télécharger deux fois la même image.
+devices_lock = threading.Condition()
 devices: dict[str, dict] = {}
 
 CLIENT_TIMEOUT_SECONDS = 10
+MAX_LONG_POLL_SECONDS = 3.0   # attente maximale d'une nouvelle image côté serveur
 STREAM_NAMES = ("camera", "screen")
 
 
@@ -44,7 +48,7 @@ def health():
 
 
 def _default_stream_state() -> dict:
-    return {"command": "STOP", "active": False, "latest_frame": None}
+    return {"command": "STOP", "active": False, "latest_frame": None, "seq": 0}
 
 
 def _default_device_state(name: str | None) -> dict:
@@ -106,8 +110,11 @@ def post_frame():
 
     with devices_lock:
         device = _get_or_create_device(device_id)
-        device["streams"][stream]["latest_frame"] = request.get_data()
+        state = device["streams"][stream]
+        state["latest_frame"] = request.get_data()
+        state["seq"] += 1
         device["last_seen"] = time.time()
+        devices_lock.notify_all()   # réveille les GUI qui attendent une image
     return jsonify({"ok": True})
 
 
@@ -185,18 +192,48 @@ def get_status():
 
 @app.route("/api/frame/latest", methods=["GET"])
 def get_latest_frame():
+    """Renvoie la dernière image d'un flux.
+
+    Paramètres optionnels (long-polling, utilisés par la GUI) :
+      after=<seq> : numéro de la dernière image déjà reçue ; le serveur ne
+                    répond que si une image PLUS RÉCENTE existe (sinon 204).
+      wait=<sec>  : durée max. d'attente d'une nouvelle image avant de
+                    répondre 204.
+    Sans ces paramètres, le comportement historique est conservé.
+    Le numéro de l'image renvoyée est dans l'en-tête X-Frame-Seq."""
     device_id = request.args.get("device_id")
     stream = request.args.get("stream")
     if not device_id or stream not in STREAM_NAMES:
         return "", 400
 
-    with devices_lock:
-        device = devices.get(device_id)
-        frame = device["streams"][stream]["latest_frame"] if device else None
+    after = request.args.get("after", type=int)
+    wait = request.args.get("wait", default=0.0, type=float) or 0.0
+    wait = max(0.0, min(wait, MAX_LONG_POLL_SECONDS))
 
-    if frame is None:
+    def has_new_frame() -> bool:
+        device = devices.get(device_id)
+        if device is None:
+            return False
+        state = device["streams"][stream]
+        if state["latest_frame"] is None:
+            return False
+        return after is None or state["seq"] != after   # != : gère aussi un redémarrage du serveur
+
+    with devices_lock:
+        if wait > 0 and not has_new_frame():
+            devices_lock.wait_for(has_new_frame, timeout=wait)
+        device = devices.get(device_id)
+        state = device["streams"][stream] if device else None
+        frame = state["latest_frame"] if state else None
+        seq = state["seq"] if state else 0
+
+    if frame is None or (after is not None and seq == after):
         return "", 204
-    return Response(frame, mimetype="image/jpeg")
+
+    response = Response(frame, mimetype="image/jpeg")
+    response.headers["X-Frame-Seq"] = str(seq)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 # ---------------------------------------------------------------------
@@ -248,4 +285,9 @@ def download_windows_gui_exe():
 
 
 if __name__ == "__main__":
+    # HTTP/1.1 : indispensable pour que les connexions « keep-alive » du client
+    # fonctionnent avec le serveur de développement Flask (sinon HTTP/1.0 =
+    # une nouvelle connexion TCP à CHAQUE image).
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
     app.run(host="0.0.0.0", port=5050, threaded=True)

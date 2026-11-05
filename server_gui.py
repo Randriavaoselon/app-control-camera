@@ -38,6 +38,10 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
 POLL_FRAME_INTERVAL = 0.1
+# Attente côté serveur d'une nouvelle image (long-polling). 0 = désactivé : OBLIGATOIRE sur
+# PythonAnywhere, dont le nombre de workers est très limité (une requête qui attend bloquerait
+# les envois du client). Avec un VPS / gunicorn --threads 8, mettre 2.0 réduit encore la latence.
+FRAME_LONG_POLL_SECONDS = 0.0
 REQUEST_TIMEOUT = 5
 DOWNLOAD_TIMEOUT = 30
 RECORD_FPS_CAMERA = 10
@@ -399,6 +403,12 @@ class StreamPanel:
         self.recording = False
         self.recorder: VideoRecorder | None = None
         self.last_jpeg: bytes | None = None
+        # Affichage : taille disponible (mise à jour par le thread Tk) et
+        # « boîte aux lettres » à une seule image, pour ne jamais accumuler de retard.
+        self.view_size: tuple[int, int] = (420, 380)
+        self.pending_image = None
+        self.display_scheduled = False
+        self.display_lock = threading.Lock()
         # Widgets (créés dans _build_stream_panel) :
         self.video_label: tk.Label | None = None
         self.title_var: tk.StringVar | None = None
@@ -642,6 +652,10 @@ class CameraServerApp:
             image=panel.placeholder, compound="top", font=(FONT, 11), pady=10,
         )
         panel.video_label.grid(row=2, column=0, sticky="nsew", padx=14)
+        panel.video_label.bind(
+            "<Configure>",
+            lambda event, p=panel: setattr(p, "view_size", (max(event.width, 1), max(event.height, 1))),
+        )
 
         controls = tk.Frame(outer, bg=COLOR_CARD)
         controls.grid(row=3, column=0, sticky="ew", padx=14, pady=14)
@@ -715,20 +729,41 @@ class CameraServerApp:
 
     def _poll_frame_loop(self, stream_key: str) -> None:
         """Boucle dédiée à UN SEUL flux (caméra ou écran) : les deux tournent
-        en parallèle, donc un flux lent à répondre n'affecte jamais l'autre."""
+        en parallèle, donc un flux lent à répondre n'affecte jamais l'autre.
+
+        Long-polling : on indique au serveur le numéro de la dernière image
+        reçue (« after ») ; il ne répond que lorsqu'une image PLUS RÉCENTE
+        existe, et immédiatement à son arrivée. Résultat : pas d'attente
+        artificielle, et plus aucune image téléchargée deux fois."""
         panel = self.panels[stream_key]
+        session = requests.Session()   # connexion persistante (keep-alive)
+        last_device = None
+        last_seq = None
         while True:
             device_id = self.selected_device_id
             if device_id is None:
                 time.sleep(POLL_FRAME_INTERVAL)
                 continue
+            if device_id != last_device:
+                last_device = device_id
+                last_seq = None
+
+            started = time.monotonic()
+            long_poll_ok = False
             try:
-                response = requests.get(
+                params = {"device_id": device_id, "stream": stream_key, "wait": FRAME_LONG_POLL_SECONDS}
+                if last_seq is not None:
+                    params["after"] = last_seq
+                response = session.get(
                     f"{self.server_url}/api/frame/latest",
-                    params={"device_id": device_id, "stream": stream_key},
-                    timeout=REQUEST_TIMEOUT,
+                    params=params,
+                    timeout=REQUEST_TIMEOUT + FRAME_LONG_POLL_SECONDS,
                 )
                 if response.status_code == 200 and response.content:
+                    seq_header = response.headers.get("X-Frame-Seq")
+                    if seq_header is not None:
+                        last_seq = int(seq_header)
+                        long_poll_ok = True   # serveur à jour : pas de pause, on redemande tout de suite
                     self._handle_frame(panel, response.content)
                 elif response.status_code == 204:
                     if panel.recording:
@@ -746,11 +781,14 @@ class CameraServerApp:
                 self._log_throttled(f"unreachable_{stream_key}", f"Flux « {panel.title} » injoignable : {exc}")
             except Exception as exc:
                 # Ne JAMAIS laisser une erreur inattendue (décodage, écriture
-                # vidéo...) arrêter cette boucle en silence : sans ce
-                # garde-fou, l'affichage ET l'enregistrement de CE flux
-                # s'arrêteraient définitivement sans aucun message visible.
+                # vidéo...) arrêter cette boucle en silence.
                 self._log_throttled(f"unexpected_{stream_key}", f"Erreur inattendue sur « {panel.title} » : {exc}")
-            time.sleep(POLL_FRAME_INTERVAL)
+
+            if not long_poll_ok:
+                # Erreur, 204 immédiat ou ancien serveur sans long-polling : on évite de tourner à vide.
+                elapsed = time.monotonic() - started
+                if elapsed < POLL_FRAME_INTERVAL:
+                    time.sleep(POLL_FRAME_INTERVAL - elapsed)
 
     def _log_throttled(self, key: str, message: str, interval: float = LOG_THROTTLE_SECONDS) -> None:
         """Comme _log, mais n'écrit le MÊME message (identifié par key) qu'une
@@ -956,9 +994,10 @@ class CameraServerApp:
     # Mise à jour de l'interface (toujours via root.after, thread principal)
     # ------------------------------------------------------------------
     def _handle_frame(self, panel: StreamPanel, jpeg_bytes: bytes) -> None:
+        # L'affichage d'abord : le décodage pour l'enregistrement ne doit pas le retarder.
+        self._display_frame(panel, jpeg_bytes)
         if panel.recording:
             self._write_recording_frame(panel, jpeg_bytes)
-        self._display_frame(panel, jpeg_bytes)
 
     def _update_status(self, connected: bool) -> None:
         def apply():
@@ -983,15 +1022,32 @@ class CameraServerApp:
         self.root.after(0, apply)
 
     def _display_frame(self, panel: StreamPanel, jpeg_bytes: bytes) -> None:
-        def apply():
-            image = Image.open(io.BytesIO(jpeg_bytes))
-            max_w = panel.video_label.winfo_width() or 420
-            max_h = panel.video_label.winfo_height() or 380
-            image.thumbnail((max_w, max_h))
-            photo = ImageTk.PhotoImage(image)
-            panel.video_label.configure(image=photo, text="")
-            panel.video_label.image = photo  # garder une référence
-        self.root.after(0, apply)
+        """Décode et redimensionne DANS LE THREAD DE RÉCEPTION (le thread Tk ne
+        fait plus que l'affichage). Une seule image en attente par panneau :
+        si l'interface est en retard, l'image périmée est simplement remplacée
+        au lieu de s'empiler dans la file de Tk (cause de latence croissante)."""
+        max_w, max_h = panel.view_size
+        image = Image.open(io.BytesIO(jpeg_bytes))
+        image.thumbnail((max_w, max_h), Image.BILINEAR)   # utilise aussi le décodage JPEG réduit
+        image.load()
+
+        with panel.display_lock:
+            panel.pending_image = image
+            already_scheduled = panel.display_scheduled
+            panel.display_scheduled = True
+        if not already_scheduled:
+            self.root.after(0, self._apply_pending_image, panel)
+
+    def _apply_pending_image(self, panel: StreamPanel) -> None:
+        with panel.display_lock:
+            image = panel.pending_image
+            panel.pending_image = None
+            panel.display_scheduled = False
+        if image is None:
+            return
+        photo = ImageTk.PhotoImage(image)
+        panel.video_label.configure(image=photo, text="")
+        panel.video_label.image = photo  # garder une référence
 
     def _poll_logs(self) -> None:
         while not self.log_queue.empty():
