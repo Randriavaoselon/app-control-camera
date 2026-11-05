@@ -65,12 +65,12 @@ except ImportError:
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_INTERVAL = 1.0           # secondes entre deux vérifications de commandes
-CAMERA_FRAME_INTERVAL = 0.1   # intervalle MINIMUM entre deux envois caméra (~10 im/s max)
+CAMERA_FRAME_INTERVAL = 0.05  # intervalle MINIMUM entre deux envois caméra (~20 im/s max)
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
-CAMERA_JPEG_QUALITY = 70
-SCREEN_JPEG_QUALITY = 60
-SCREEN_MAX_WIDTH = 1280        # l'écran est réduit avant envoi : un 1080p plein format pèse 4 à 6x plus lourd
+CAMERA_JPEG_QUALITY = 65
+SCREEN_JPEG_QUALITY = 55
+SCREEN_MAX_WIDTH = 1024        # l'écran est réduit avant envoi : un 1080p plein format pèse 4 à 6x plus lourd
 # Intervalle MINIMUM entre deux captures, par méthode (la capture et l'envoi
 # réseau tournent dans deux threads séparés, donc ceci ne dépend plus du
 # réseau : mss est quasi instantané, le portail xdg passe par un aller-retour
@@ -82,7 +82,12 @@ SCREEN_CAPTURE_MIN_INTERVAL = {
     "gnome-screenshot": 0.4,
 }
 SCREEN_CAPTURE_MIN_INTERVAL_DEFAULT = 0.2
-SCREEN_SEND_IDLE_WAIT = 0.02   # attente du thread d'envoi quand aucune image nouvelle n'est prête
+# Envois PARALLÈLES : un seul envoi à la fois limitait le débit à 1 image par
+# aller-retour réseau (RTT). Avec 2 envois simultanés, on en émet ~2x plus
+# par seconde sans plus de retard (le serveur ignore les images arrivées en retard).
+CAMERA_SEND_WORKERS = 2
+SCREEN_SEND_WORKERS = 2
+SCREEN_SEND_MIN_INTERVAL = 0.0
 REQUEST_TIMEOUT = 5
 CAPTURE_SUBPROCESS_TIMEOUT = 5
 MIN_VALID_FRAME_STD = 2.0      # en dessous : image considérée comme quasi noire/uniforme
@@ -400,6 +405,50 @@ def _screen_capture_candidates() -> list:
     return working + ["mss"]
 
 
+class _LatestFrame:
+    """Case partagée qui ne garde que la DERNIÈRE image. Les threads d'envoi
+    sont réveillés INSTANTANÉMENT à l'arrivée d'une image (plus de pause
+    fixe de 20 ms) et chaque image n'est prise que par UN seul thread."""
+
+    def __init__(self):
+        self._cond = threading.Condition()
+        self._frame = None
+        self._version = 0
+        self._claimed = 0
+
+    def put(self, frame) -> None:
+        with self._cond:
+            self._frame = frame
+            self._version += 1
+            self._cond.notify()
+
+    def claim(self, stop_event: threading.Event, timeout: float = 0.5):
+        with self._cond:
+            if self._claimed == self._version and not stop_event.is_set():
+                self._cond.wait(timeout)
+            if self._claimed == self._version:
+                return None
+            self._claimed = self._version
+            return self._frame
+
+
+class _RateLimiter:
+    """Espace les envois d'au moins `interval` secondes, tous threads confondus."""
+
+    def __init__(self, interval: float):
+        self._interval = interval
+        self._lock = threading.Lock()
+        self._next = 0.0
+
+    def reserve(self) -> float:
+        """Réserve le prochain créneau et renvoie le délai à attendre avant de l'utiliser."""
+        with self._lock:
+            now = time.monotonic()
+            slot = max(now, self._next)
+            self._next = slot + self._interval
+            return slot - now
+
+
 class CameraClient:
     def __init__(self, server_url: str, device_id: str, device_name: str):
         self.server_url = server_url
@@ -411,17 +460,13 @@ class CameraClient:
         self.capture: cv2.VideoCapture | None = None
         self._stop_camera_event = threading.Event()
         self._camera_capture_thread: threading.Thread | None = None
-        self._camera_frame: "np.ndarray | None" = None
-        self._camera_frame_version = 0
-        self._camera_frame_lock = threading.Lock()
-        # Sessions HTTP persistantes (keep-alive) : une par usage/thread. Sans
+        self._camera_slot = _LatestFrame()
+        # Session HTTP persistante (keep-alive) pour les commandes ; chaque
+        # thread d'envoi d'images a la sienne (voir _sender_worker). Sans
         # elles, CHAQUE image ouvre une nouvelle connexion TCP (+ TLS en https).
         self._cmd_session = requests.Session()
-        self._frame_sessions = {"camera": requests.Session(), "screen": requests.Session()}
         self._stop_screen_event = threading.Event()
-        self._screen_frame: "np.ndarray | None" = None
-        self._screen_frame_version = 0
-        self._screen_frame_lock = threading.Lock()
+        self._screen_slot = _LatestFrame()
 
     def run_forever(self) -> None:
         logger.info(
@@ -477,16 +522,13 @@ class CameraClient:
             return
 
         self.camera_on = True
-        self._camera_frame = None
-        self._camera_frame_version = 0
+        self._camera_slot = slot = _LatestFrame()
         self._stop_camera_event = threading.Event()   # nouveau à chaque démarrage
         self._camera_capture_thread = threading.Thread(
-            target=self._camera_capture_loop, args=(self.capture, self._stop_camera_event), daemon=True
+            target=self._camera_capture_loop, args=(self.capture, self._stop_camera_event, slot), daemon=True
         )
         self._camera_capture_thread.start()
-        threading.Thread(
-            target=self._camera_send_loop, args=(self._stop_camera_event,), daemon=True
-        ).start()
+        self._start_senders("camera", slot, self._stop_camera_event, CAMERA_FRAME_INTERVAL, CAMERA_SEND_WORKERS)
         logger.info("Caméra allumée")
 
     def _stop_camera(self) -> None:
@@ -501,7 +543,7 @@ class CameraClient:
             self.capture = None
         logger.info("Caméra éteinte")
 
-    def _camera_capture_loop(self, capture: cv2.VideoCapture, stop_event: threading.Event) -> None:
+    def _camera_capture_loop(self, capture: cv2.VideoCapture, stop_event: threading.Event, slot: _LatestFrame) -> None:
         """Lit la caméra EN CONTINU, sans jamais attendre le réseau : le driver
         ne peut donc plus accumuler d'images périmées (cause n°1 de la latence).
         Seule la dernière image est conservée pour le thread d'envoi."""
@@ -513,27 +555,29 @@ class CameraClient:
                 stop_event.wait(0.05 if failures < 20 else 0.5)
                 continue
             failures = 0
-            with self._camera_frame_lock:
-                self._camera_frame = frame
-                self._camera_frame_version += 1
+            slot.put(frame)
 
-    def _camera_send_loop(self, stop_event: threading.Event) -> None:
-        """Poste toujours la DERNIÈRE image caméra, au plus tous les CAMERA_FRAME_INTERVAL."""
-        last_version = 0
-        last_send = 0.0
+    def _start_senders(self, stream: str, slot: _LatestFrame, stop_event: threading.Event,
+                       min_interval: float, workers: int) -> None:
+        rate = _RateLimiter(min_interval)
+        for _ in range(workers):
+            threading.Thread(
+                target=self._sender_worker, args=(stream, slot, stop_event, rate), daemon=True
+            ).start()
+
+    def _sender_worker(self, stream: str, slot: _LatestFrame, stop_event: threading.Event,
+                       rate: _RateLimiter) -> None:
+        """Poste toujours la DERNIÈRE image disponible, sans pause inutile.
+        Plusieurs de ces threads tournent en parallèle par flux."""
+        session = requests.Session()   # une session (donc une connexion keep-alive) par thread
         while not stop_event.is_set():
-            remaining = CAMERA_FRAME_INTERVAL - (time.monotonic() - last_send)
-            if remaining > 0 and stop_event.wait(remaining):
+            delay = rate.reserve()
+            if delay > 0 and stop_event.wait(delay):
                 break
-            with self._camera_frame_lock:
-                frame = self._camera_frame
-                version = self._camera_frame_version
-            if frame is not None and version != last_version:
-                last_send = time.monotonic()
-                self._send_frame(frame, "camera")
-                last_version = version
-            else:
-                stop_event.wait(SCREEN_SEND_IDLE_WAIT)
+            frame = slot.claim(stop_event)   # prise APRÈS l'attente : c'est l'image la plus fraîche
+            if frame is None:
+                continue
+            self._send_frame(frame, stream, session, time.time_ns() // 1000)
 
     # ------------------------------------------------------------------
     # Flux capture d'écran
@@ -541,15 +585,11 @@ class CameraClient:
     def _start_screen(self) -> None:
         self.screen_on = True
         self._stop_screen_event = threading.Event()   # nouveau à chaque démarrage
-        self._screen_frame: "np.ndarray | None" = None
-        self._screen_frame_version = 0
-        self._screen_frame_lock = threading.Lock()
+        self._screen_slot = slot = _LatestFrame()
         threading.Thread(
-            target=self._capture_screen_loop, args=(self._stop_screen_event,), daemon=True
+            target=self._capture_screen_loop, args=(self._stop_screen_event, slot), daemon=True
         ).start()
-        threading.Thread(
-            target=self._send_screen_loop, args=(self._stop_screen_event,), daemon=True
-        ).start()
+        self._start_senders("screen", slot, self._stop_screen_event, SCREEN_SEND_MIN_INTERVAL, SCREEN_SEND_WORKERS)
         logger.info("Capture d'écran démarrée")
 
     def _stop_screen(self) -> None:
@@ -557,7 +597,7 @@ class CameraClient:
         self._stop_screen_event.set()
         logger.info("Capture d'écran arrêtée")
 
-    def _capture_screen_loop(self, stop_event: threading.Event) -> None:
+    def _capture_screen_loop(self, stop_event: threading.Event, slot: _LatestFrame) -> None:
         """Capture en continu, SANS jamais attendre le réseau : écrit juste la
         dernière image dans une case partagée, que le thread d'envoi lira à
         son propre rythme."""
@@ -619,29 +659,12 @@ class CameraClient:
                     )
                     black_frame_warned = True
 
-                with self._screen_frame_lock:
-                    self._screen_frame = frame
-                    self._screen_frame_version += 1
+                slot.put(frame)
 
                 stop_event.wait(max(0.0, min_interval - (time.monotonic() - loop_start)))
         finally:
             if mss_instance is not None:
                 mss_instance.close()
-
-    def _send_screen_loop(self, stop_event: threading.Event) -> None:
-        """Poste toujours la DERNIÈRE image capturée, dès qu'elle change.
-        Tourne indépendamment de la capture : un réseau lent ralentit l'envoi,
-        jamais la capture elle-même."""
-        last_sent_version = 0
-        while not stop_event.is_set():
-            with self._screen_frame_lock:
-                frame = self._screen_frame
-                version = self._screen_frame_version
-            if frame is not None and version != last_sent_version:
-                self._send_frame(frame, "screen")
-                last_sent_version = version
-            else:
-                stop_event.wait(SCREEN_SEND_IDLE_WAIT)
 
     @staticmethod
     def _open_mss():
@@ -663,13 +686,13 @@ class CameraClient:
     # ------------------------------------------------------------------
     # Envoi au serveur (commun aux deux flux)
     # ------------------------------------------------------------------
-    def _send_frame(self, frame, stream: str) -> None:
+    def _send_frame(self, frame, stream: str, session: requests.Session, ts: int) -> None:
         if stream == "screen":
             height, width = frame.shape[:2]
             if width > SCREEN_MAX_WIDTH:
                 scale = SCREEN_MAX_WIDTH / width
                 frame = cv2.resize(
-                    frame, (SCREEN_MAX_WIDTH, max(1, int(height * scale))), interpolation=cv2.INTER_AREA
+                    frame, (SCREEN_MAX_WIDTH, max(1, int(height * scale))), interpolation=cv2.INTER_LINEAR
                 )
             quality = SCREEN_JPEG_QUALITY
         else:
@@ -679,9 +702,9 @@ class CameraClient:
         if not ok:
             return
         try:
-            self._frame_sessions[stream].post(
+            session.post(
                 f"{self.server_url}/api/frame",
-                params={"device_id": self.device_id, "stream": stream},
+                params={"device_id": self.device_id, "stream": stream, "ts": ts},
                 data=buffer.tobytes(),
                 headers={"Content-Type": "application/octet-stream"},
                 timeout=REQUEST_TIMEOUT,

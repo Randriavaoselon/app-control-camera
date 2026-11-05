@@ -37,7 +37,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageTk
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
-POLL_FRAME_INTERVAL = 0.1
+POLL_FRAME_INTERVAL = 0.03   # pause après une réponse vide (204) : 0.1 ajoutait jusqu'à 100 ms de latence
 # Attente côté serveur d'une nouvelle image (long-polling). 0 = désactivé : OBLIGATOIRE sur
 # PythonAnywhere, dont le nombre de workers est très limité (une requête qui attend bloquerait
 # les envois du client). Avec un VPS / gunicorn --threads 8, mettre 2.0 réduit encore la latence.

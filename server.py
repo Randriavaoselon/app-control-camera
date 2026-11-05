@@ -48,7 +48,7 @@ def health():
 
 
 def _default_stream_state() -> dict:
-    return {"command": "STOP", "active": False, "latest_frame": None, "seq": 0}
+    return {"command": "STOP", "active": False, "latest_frame": None, "seq": 0, "last_ts": None}
 
 
 def _default_device_state(name: str | None) -> dict:
@@ -108,12 +108,32 @@ def post_frame():
     if stream not in STREAM_NAMES:
         return jsonify({"error": "stream invalide (camera ou screen attendu)"}), 400
 
+    # IMPORTANT : le corps de la requête est lu AVANT de prendre le verrou.
+    # Avant, get_data() (qui attend la fin du téléchargement de l'image, donc
+    # dépend de la vitesse réseau du client) s'exécutait sous le verrou global :
+    # pendant tout ce temps, TOUTES les autres requêtes (GUI, autre flux,
+    # autres appareils) étaient bloquées. C'était une cause majeure de latence.
+    data = request.get_data()
+    try:
+        ts = int(request.args.get("ts", ""))   # horodatage client (µs), pour ordonner les images
+    except ValueError:
+        ts = None
+
     with devices_lock:
         device = _get_or_create_device(device_id)
         state = device["streams"][stream]
-        state["latest_frame"] = request.get_data()
-        state["seq"] += 1
         device["last_seen"] = time.time()
+        # Le client envoie plusieurs images en parallèle : une image plus
+        # ancienne peut arriver APRÈS une plus récente. On l'ignore, sinon la
+        # vidéo « reculerait » dans le temps. (Écart > 10 s = le client a
+        # redémarré / l'horloge a changé : on accepte.)
+        last_ts = state["last_ts"]
+        if ts is not None and last_ts is not None and ts <= last_ts and last_ts - ts < 10_000_000:
+            return jsonify({"ok": True, "stale": True})
+        if ts is not None:
+            state["last_ts"] = ts
+        state["latest_frame"] = data
+        state["seq"] += 1
         devices_lock.notify_all()   # réveille les GUI qui attendent une image
     return jsonify({"ok": True})
 
