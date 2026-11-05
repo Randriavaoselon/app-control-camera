@@ -16,12 +16,19 @@ from datetime import datetime
 
 from pathlib import Path
 
-from flask import Flask, request, jsonify, Response, send_from_directory
+from flask import Flask, request, jsonify, Response, send_from_directory, redirect
 
 app = Flask(__name__)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 GUI_INSTALL_DIR = PROJECT_DIR / "install" / "linux"
+
+# Les installateurs Windows (.exe) ne sont plus commités dans le dépôt
+# (ils gonflaient l'historique Git à chaque build) : ils sont publiés comme
+# assets d'une GitHub Release, mise à jour à chaque build via le workflow.
+# Changez ces constantes si le nom du dépôt ou les tags de Release changent.
+GITHUB_RELEASE_BASE = "https://github.com/Randriavaoselon/app-control-camera/releases/download/client-latest"
+GITHUB_RELEASE_BASE_GUI = "https://github.com/Randriavaoselon/app-control-camera/releases/download/client-latest"
 
 devices_lock = threading.Lock()
 devices: dict[str, dict] = {}
@@ -208,11 +215,10 @@ def download_requirements():
 
 @app.route("/download/windows", methods=["GET"])
 def download_windows_installer():
-    releases_dir = PROJECT_DIR / "releases"
-    filename = "CameraClient-Setup.exe"
-    if not (releases_dir / filename).exists():
-        return jsonify({"error": "Installateur Windows du client pas encore publié"}), 404
-    return send_from_directory(releases_dir, filename, as_attachment=True)
+    """L'installateur n'est plus stocké sur ce serveur : il est publié comme
+    asset d'une GitHub Release à chaque build (voir le workflow CI), donc on
+    redirige simplement vers son URL stable."""
+    return redirect(f"{GITHUB_RELEASE_BASE}/CameraClient-Setup.exe")
 
 
 # ---------------------------------------------------------------------
@@ -236,11 +242,9 @@ def download_gui_requirements():
 
 @app.route("/download/windows/gui", methods=["GET"])
 def download_windows_gui_exe():
-    releases_dir = PROJECT_DIR / "releases"
-    filename = "CameraServerGUI.exe"
-    if not (releases_dir / filename).exists():
-        return jsonify({"error": "Exécutable Windows de la GUI pas encore publié"}), 404
-    return send_from_directory(releases_dir, filename, as_attachment=True)
+    """Même principe que /download/windows : l'exe de la GUI est aussi
+    publié en GitHub Release plutôt que stocké sur ce serveur."""
+    return redirect(f"{GITHUB_RELEASE_BASE_GUI}/CameraServerGUI.exe")
 
 
 if __name__ == "__main__":
