@@ -5,7 +5,7 @@ name: Build Windows client installer
 # l'onglet "Actions" du dépôt GitHub (bouton "Run workflow").
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - "client.py"
       - "requirements.txt"
@@ -13,14 +13,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # nécessaire pour repousser releases/CameraClient-Setup.exe dans le dépôt
+  contents: write # nécessaire pour publier la GitHub Release
 
-# Empêche deux exécutions de tourner en même temps sur la même branche :
-# c'est la cause la plus fréquente du "fetch first" (deux jobs qui partent
-# du même commit puis essaient de pousser chacun leur propre commit).
+# Empêche deux exécutions de tourner en même temps sur la même branche.
 concurrency:
   group: build-windows-client-${{ github.ref }}
-  cancel-in-progress: false   # on laisse le run en cours se terminer plutôt que de l'interrompre
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -78,33 +76,16 @@ jobs:
           name: CameraClient-Setup
           path: releases/CameraClient-Setup.exe
 
-      - name: Publier l'installateur dans le dépôt (releases/)
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f releases/CameraClient-Setup.exe
-
-          if git diff --staged --quiet; then
-            echo "Rien de nouveau à publier"
-            exit 0
-          fi
-
-          git commit -m "Build automatique de CameraClient-Setup.exe [skip ci]"
-
-          # Si main a bougé entre le checkout et ce push (run concurrent,
-          # push humain pendant le build...), on récupère les derniers
-          # commits et on rejoue le nôtre par-dessus avant de réessayer.
-          for i in 1 2 3 4 5; do
-            if git push; then
-              echo "Push réussi"
-              exit 0
-            fi
-            echo "Push refusé, nouvelle tentative ($i/5)..."
-            git fetch origin main
-            git rebase origin/main
-            sleep 5
-          done
-
-          echo "Échec du push après plusieurs tentatives" >&2
-          exit 1
+      # Remplace l'ancienne étape "git add/commit/push" : plus aucun binaire
+      # n'est commité dans le dépôt, donc .git ne grossit plus jamais.
+      # tag_name fixe ("client-latest") : chaque build met à jour la MÊME
+      # Release (mêmes fichiers remplacés) au lieu d'en créer une nouvelle.
+      - name: Publier l'installateur comme GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: client-latest
+          name: CameraClient (dernière build)
+          body: "Installateur généré automatiquement — build du ${{ github.sha }}"
+          files: releases/CameraClient-Setup.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
