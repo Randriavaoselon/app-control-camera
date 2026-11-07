@@ -4,17 +4,15 @@ rem  Fabrique les programmes Windows du projet camera :
 rem    dist\CameraClient.exe           client, sans fenetre (usage normal)
 rem    dist\CameraClient-console.exe   client, avec console (diagnostic)
 rem    dist\CameraServerGUI.exe        interface de controle (GUI), sans console
-rem    releases\CameraClient-Setup.exe installateur 100%% silencieux (si Inno Setup present)
+rem    releases\CameraClient-Setup.exe installateur silencieux (si Inno Setup present)
 rem
-rem  Usage :
-rem      build_windows.bat https://mon-serveur.com
+rem  L'URL du serveur est INTEGREE dans le client via le fichier
+rem  embedded_config.py (a la racine du projet, versionne dans GitHub).
+rem  Pour changer de serveur : modifiez ce fichier, ou passez l'URL en argument :
+rem      build_windows.bat https://autre-serveur.com
 rem
-rem  L'URL du serveur est INTEGREE dans le client (fichier embedded_config.py
-rem  genere a la racine du projet). Si vous ne la donnez pas, le script reutilise
-rem  celle du dernier build, ou vous la demande.
-rem
-rem  A lancer sur un PC Windows avec Python 3.10+ (python.org).
-rem  Double-cliquez, ou lancez depuis une invite de commandes.
+rem  Fonctionne en local (double-clic) et dans GitHub Actions (variable CI :
+rem  aucune pause, aucune question).
 rem
 rem  IMPORTANT : ce script vit dans packaging\windows\, PAS dans build\windows\.
 rem  build\ est l'espace de travail de PyInstaller (nettoye/recree a chaque
@@ -25,6 +23,10 @@ cd /d "%~dp0..\.."
 set "SERVER_URL=%~1"
 if not "%SERVER_URL%"=="" goto :write_config
 if exist embedded_config.py goto :config_ready
+if defined CI (
+  echo ERREUR : embedded_config.py est introuvable.
+  exit /b 1
+)
 set /p "SERVER_URL=URL du serveur (ex. https://mon-serveur.com) : "
 if "%SERVER_URL%"=="" (
   echo ERREUR : l'URL du serveur est obligatoire.
@@ -38,6 +40,8 @@ if "%SERVER_URL:~-1%"=="/" set "SERVER_URL=%SERVER_URL:~0,-1%"
 echo URL du serveur integree au client : %SERVER_URL%
 
 :config_ready
+echo Contenu de embedded_config.py :
+type embedded_config.py
 
 echo [1/4] Environnement de construction...
 python -m venv build\venv || goto :error
@@ -65,7 +69,7 @@ if errorlevel 1 (
   echo        puis relancez ce script pour obtenir l'installateur complet.
   echo        En attendant, dist\CameraClient.exe et dist\CameraServerGUI.exe
   echo        fonctionnent deja seuls ^(pas besoin de Python^).
-  pause
+  if not defined CI pause
   exit /b 0
 )
 
@@ -82,11 +86,11 @@ echo   dist\CameraClient.exe              (client seul, aucun Python requis)
 echo   dist\CameraClient-console.exe      (diagnostic : --debug --once)
 echo   dist\CameraServerGUI.exe           (interface de controle, aucun Python requis)
 echo   releases\CameraClient-Setup.exe    (installateur : double-clic = installation invisible)
-pause
+if not defined CI pause
 exit /b 0
 
 :error
 echo.
 echo ERREUR : la construction a echoue (voir les messages ci-dessus).
-pause
+if not defined CI pause
 exit /b 1
