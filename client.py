@@ -36,6 +36,10 @@ Utilisation :
     python client.py --server https://mon-serveur.com --save   # première fois
     python client.py                                           # ensuite (relit la config)
     python client.py --once --debug                             # test : un seul cycle, logs détaillés
+
+Ordre de priorité pour l'URL du serveur : --server, puis la configuration
+mémorisée (--save), puis l'URL intégrée au build (embedded_config.py, utilisée
+par l'installateur Windows), puis la valeur par défaut locale.
 """
 
 import argparse
@@ -62,6 +66,13 @@ try:
     from mss import MSS as _MSS   # versions récentes de mss
 except ImportError:
     from mss import mss as _MSS   # anciennes versions
+
+try:
+    # Fichier généré par build_windows.bat : contient l'URL du serveur
+    # intégrée dans le .exe (SERVER_URL = "https://...").
+    from embedded_config import SERVER_URL as EMBEDDED_SERVER_URL
+except ImportError:
+    EMBEDDED_SERVER_URL = ""
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_INTERVAL = 1.0           # secondes entre deux vérifications de commandes
@@ -168,6 +179,8 @@ def resolve_server_url(cli_value: str | None) -> str:
     config_value = load_config().get("server_url")
     if config_value:
         return config_value.rstrip("/")
+    if EMBEDDED_SERVER_URL:
+        return EMBEDDED_SERVER_URL.rstrip("/")
     return DEFAULT_SERVER_URL
 
 
