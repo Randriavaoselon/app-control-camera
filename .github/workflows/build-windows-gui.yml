@@ -37,8 +37,14 @@ jobs:
           pip install pyinstaller
 
       - name: Construire CameraServerGUI.exe (sans fenêtre)
+        # --collect-all tkintermapview : embarque aussi les fichiers non-Python
+        # du paquet (icônes des marqueurs de la carte...), que PyInstaller ne
+        # détecte pas tout seul par simple analyse des imports. Sans ce flag,
+        # la carte du panneau "Localisation" peut manquer ses marqueurs ou
+        # planter à l'exécution dans l'.exe compilé.
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
+          --collect-all tkintermapview
           --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
 
       - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)
