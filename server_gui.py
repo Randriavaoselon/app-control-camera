@@ -50,6 +50,15 @@ POLL_STATUS_INTERVAL = 1.0
 POLL_LOCATION_INTERVAL = 2.0
 DEFAULT_MAP_LAT = -18.8792    # Antananarivo : position affichée tant qu'aucune position n'est reçue
 DEFAULT_MAP_LON = 47.5079
+# tkintermapview pointe par défaut sur les serveurs de tuiles d'OpenStreetMap, qui bloquent
+# désormais les requêtes ne respectant pas leur politique d'usage (pas de user-agent dédié).
+# CARTO (basemaps.cartocdn.com) a ensuite été essayé, mais exige maintenant une clé API.
+# On utilise donc Esri, gratuit et sans clé pour ce type d'usage, en style sombre pour rester
+# cohérent avec le thème. Attention : Esri inverse x et y dans son schéma d'URL (contrairement
+# à OSM/CARTO/Google) — d'où {z}/{y}/{x} et non {z}/{x}/{y}. Couverture : zoom 0 à 16 seulement.
+# Attribution requise : Esri, HERE, Garmin, © contributeurs OpenStreetMap.
+MAP_TILE_SERVER = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
+MAP_TILE_MAX_ZOOM = 16
 POLL_FRAME_INTERVAL = 0.03   # pause après une réponse vide (204) : 0.1 ajoutait jusqu'à 100 ms de latence
 # Attente côté serveur d'une nouvelle image (long-polling). 0 = désactivé : OBLIGATOIRE sur
 # PythonAnywhere, dont le nombre de workers est très limité (une requête qui attend bloquerait
@@ -439,10 +448,12 @@ class CameraServerApp:
         self.root = root
         self.server_url = server_url.rstrip("/")
         self.root.title("Contrôle caméra / écran — Dashboard")
-        self.root.geometry("1300x980")
-        self.root.minsize(1040, 820)
+        # Taille adaptée à l'écran : la fenêtre ne dépasse jamais la zone visible
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win_w, win_h = min(1440, screen_w - 60), min(860, screen_h - 90)
+        self.root.geometry(f"{win_w}x{win_h}+{max((screen_w - win_w) // 2, 0)}+{max((screen_h - win_h) // 3, 0)}")
+        self.root.minsize(min(1040, win_w), min(660, win_h))
         self.root.configure(bg=COLOR_BG)
-        self._banner_width = 0
 
         self.camera_on = False
         self.screen_on = False
@@ -479,101 +490,122 @@ class CameraServerApp:
     # Construction de l'interface
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
+        """Mise en page « tableau de bord » : TOUT est visible sans défiler.
+
+        +--------------------------------------------------------------+
+        |  En-tête compact : logo · titre · statut · téléchargement    |
+        |  Barre d'outils : appareil · serveur                          |
+        +-----------------------------------------+--------------------+
+        |   Caméra        |        Écran          |   📍 Localisation  |
+        |   (vidéo + contrôles)  (vidéo + contrôles)|   (carte pleine    |
+        +-----------------------------------------+    hauteur)         |
+        |   Journal des événements (redimensionnable)|                  |
+        +-----------------------------------------+--------------------+
+        Les séparateurs (sashes) se glissent à la souris pour ajuster chaque zone.
+        """
         self._apply_theme()
 
-        # ---- Bandeau d'en-tête (image générée, ou banner.png si présent) ----
-        self.banner = tk.Canvas(self.root, height=BANNER_HEIGHT, bg=COLOR_BG, highlightthickness=0)
-        self.banner.pack(fill="x")
-        self._banner_item = self.banner.create_image(0, 0, anchor="nw")
-        self._logo_photo = ImageTk.PhotoImage(make_logo(56))
-        self.banner.create_image(26, BANNER_HEIGHT // 2, image=self._logo_photo, anchor="w")
-        self.banner.create_text(
-            100, BANNER_HEIGHT // 2 - 13, anchor="w", text="Contrôle caméra / écran",
-            fill="white", font=(FONT, 19, "bold"),
-        )
-        self.banner.create_text(
-            101, BANNER_HEIGHT // 2 + 15, anchor="w",
-            text="Tableau de bord à distance  ·  multi-appareils  ·  temps réel",
-            fill="#b8c2e8", font=(FONT, 10),
-        )
+        self._logo_photo = ImageTk.PhotoImage(make_logo(34))
         try:
             self.root.iconphoto(True, self._logo_photo)
         except tk.TclError:
             pass
 
-        self.status_var = tk.StringVar(value="● Connexion au serveur...")
-        status_pill = tk.Frame(
-            self.banner, bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER
+        # ---- En-tête compact ----
+        header = tk.Frame(self.root, bg=COLOR_CARD)
+        header.pack(fill="x")
+        tk.Frame(header, bg=COLOR_ACCENT, height=2).pack(fill="x")
+        header_in = tk.Frame(header, bg=COLOR_CARD)
+        header_in.pack(fill="x", padx=16, pady=9)
+        tk.Label(header_in, image=self._logo_photo, bg=COLOR_CARD).pack(side="left")
+        titles = tk.Frame(header_in, bg=COLOR_CARD)
+        titles.pack(side="left", padx=(12, 0))
+        tk.Label(
+            titles, text="Contrôle caméra / écran", bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 13, "bold")
+        ).pack(anchor="w")
+        tk.Label(
+            titles, text="Tableau de bord à distance  ·  multi-appareils  ·  temps réel",
+            bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 8),
+        ).pack(anchor="w")
+
+        # Packés côté droit : ils gardent toujours leur place quand la fenêtre rétrécit
+        self.btn_download = ttk.Button(
+            header_in, text="⬇  Télécharger le client (.exe)", command=self.download_client_installer,
+            style="Primary.TButton", cursor="hand2",
         )
+        self.btn_download.pack(side="right")
+        self.status_var = tk.StringVar(value="● Connexion au serveur...")
+        status_pill = tk.Frame(header_in, bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        status_pill.pack(side="right", padx=(0, 14))
         self.status_label = tk.Label(
             status_pill, textvariable=self.status_var, bg=COLOR_BG, fg=COLOR_KO,
-            font=(FONT, 10, "bold"), padx=16, pady=7,
+            font=(FONT, 9, "bold"), padx=14, pady=5,
         )
         self.status_label.pack()
-        self._status_window = self.banner.create_window(0, BANNER_HEIGHT // 2, window=status_pill, anchor="e")
-        self.banner.bind("<Configure>", self._on_banner_resize)
+        tk.Frame(header, bg=COLOR_BORDER, height=1).pack(fill="x")
 
-        # ---- Sélecteur d'appareil ----
-        device_bar = tk.Frame(self.root, bg=COLOR_BG)
-        device_bar.pack(fill="x", padx=18, pady=(16, 0))
-        # Bouton packé en premier (côté droit) : il garde toujours sa place, même si la fenêtre rétrécit
-        self.btn_download = ttk.Button(
-            device_bar,
-            text="⬇  Télécharger le client (.exe)",
-            command=self.download_client_installer,
-            style="Primary.TButton",
-            cursor="hand2",
-        )
-        self.btn_download.pack(side="right", padx=(14, 0))
+        # ---- Barre d'outils : sélecteur d'appareil + adresse du serveur ----
+        toolbar = tk.Frame(self.root, bg=COLOR_BG)
+        toolbar.pack(fill="x", padx=14, pady=(10, 8))
         tk.Label(
-            device_bar, text="APPAREIL", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9, "bold")
-        ).pack(side="left", padx=(0, 12))
+            toolbar, text=f"Serveur  ·  {self.server_url}", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9),
+        ).pack(side="right", padx=(14, 0))
+        tk.Label(
+            toolbar, text="APPAREIL", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9, "bold")
+        ).pack(side="left", padx=(0, 10))
         self.device_var = tk.StringVar()
         self.device_combo = ttk.Combobox(
-            device_bar, textvariable=self.device_var, state="readonly", width=45,
+            toolbar, textvariable=self.device_var, state="readonly", width=45,
             style="Dark.TCombobox", font=(FONT, 10),
         )
-        self.device_combo.pack(side="left", fill="x", expand=True, ipady=3)
+        self.device_combo.pack(side="left", fill="x", expand=True, ipady=2)
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
 
-        # ---- Les deux flux, affichés en permanence côte à côte ----
-        streams_frame = tk.Frame(self.root, bg=COLOR_BG)
-        streams_frame.pack(fill="both", expand=True, padx=18, pady=(14, 0))
+        # ---- Zone principale : [ flux + journal ] | [ localisation ] ----
+        sash = dict(bg=COLOR_BG, sashwidth=8, sashrelief="flat", borderwidth=0, sashpad=0, opaqueresize=True)
+        main = tk.PanedWindow(self.root, orient="horizontal", **sash)
+        main.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        left = tk.PanedWindow(main, orient="vertical", **sash)
+        main.add(left, minsize=620, stretch="always")
+
+        # Les deux flux, côte à côte, en haut à gauche
+        streams_frame = tk.Frame(left, bg=COLOR_BG)
         streams_frame.columnconfigure(0, weight=1, uniform="panel")
         streams_frame.columnconfigure(1, weight=1, uniform="panel")
         streams_frame.rowconfigure(0, weight=1)
-
         self._build_stream_panel(streams_frame, self.panels["camera"], column=0)
         self._build_stream_panel(streams_frame, self.panels["screen"], column=1)
+        left.add(streams_frame, minsize=280, stretch="always")
 
-        # ---- Localisation précise (carte + ouverture/fermeture du navigateur) ----
-        self._build_location_panel(self.root)
+        # Journal : toujours visible sous les flux, hauteur réglable à la souris
+        log_card = self._build_log_panel(left)
+        left.add(log_card, minsize=90, height=170, stretch="never")
 
-        # ---- Barre du bas : serveur + téléchargement du client ----
-        bottom_controls = tk.Frame(self.root, bg=COLOR_BG)
-        bottom_controls.pack(fill="x", padx=18, pady=(12, 8))
+        # Localisation : colonne de droite, la carte occupe toute la hauteur
+        location_card = self._build_location_panel(main)
+        main.add(location_card, minsize=300, width=420, stretch="never")
+
+    def _build_log_panel(self, parent: tk.Misc) -> tk.Frame:
+        log_card = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        header = tk.Frame(log_card, bg=COLOR_CARD)
+        header.pack(fill="x", padx=14, pady=(8, 2))
         tk.Label(
-            bottom_controls, text=f"Serveur  ·  {self.server_url}", bg=COLOR_BG, fg=COLOR_MUTED,
-            font=(FONT, 9),
+            header, text="JOURNAL DES ÉVÉNEMENTS", bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 9, "bold"),
         ).pack(side="left")
-
-        # ---- Journal ----
-        log_card = tk.Frame(
-            self.root, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER
-        )
-        log_card.pack(fill="both", expand=False, padx=18, pady=(0, 18))
-        tk.Label(
-            log_card, text="JOURNAL DES ÉVÉNEMENTS", bg=COLOR_CARD, fg=COLOR_MUTED,
-            font=(FONT, 9, "bold"), anchor="w",
-        ).pack(fill="x", padx=14, pady=(10, 4))
+        ttk.Button(
+            header, text="Effacer", style="Ghost.TButton", cursor="hand2", command=self._clear_log,
+        ).pack(side="right")
         log_body = tk.Frame(log_card, bg=COLOR_CARD)
-        log_body.pack(fill="both", expand=True, padx=(14, 6), pady=(0, 10))
+        log_body.pack(fill="both", expand=True, padx=(14, 6), pady=(0, 8))
         self.log_text = tk.Text(
-            log_body, height=7, state="disabled", bg=COLOR_CARD, fg="#c5cce3",
+            log_body, height=3, state="disabled", bg=COLOR_CARD, fg="#c5cce3",
             font=(FONT_MONO, 9), relief="flat", borderwidth=0, highlightthickness=0,
             insertbackground=COLOR_TEXT, selectbackground=COLOR_ACCENT, wrap="word", spacing1=2,
         )
-        log_scroll = ttk.Scrollbar(log_body, orient="vertical", command=self.log_text.yview, style="Dark.Vertical.TScrollbar")
+        log_scroll = ttk.Scrollbar(
+            log_body, orient="vertical", command=self.log_text.yview, style="Dark.Vertical.TScrollbar"
+        )
         self.log_text.configure(yscrollcommand=log_scroll.set)
         log_scroll.pack(side="right", fill="y")
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -581,6 +613,12 @@ class CameraServerApp:
         self.log_text.tag_configure("err", foreground=COLOR_KO_HI)
         self.log_text.tag_configure("warn", foreground=COLOR_WARN)
         self.log_text.tag_configure("ok", foreground=COLOR_OK_HI)
+        return log_card
+
+    def _clear_log(self) -> None:
+        self.log_text["state"] = "normal"
+        self.log_text.delete("1.0", "end")
+        self.log_text["state"] = "disabled"
 
     def _apply_theme(self) -> None:
         """Déclare tous les styles ttk (thème « clam » repeint aux couleurs de l'application)."""
@@ -590,7 +628,7 @@ class CameraServerApp:
         def button(name: str, bg: str, hover: str, fg: str = "white") -> None:
             style.configure(
                 name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg, darkcolor=bg,
-                focuscolor=bg, font=(FONT, 9, "bold"), padding=(16, 8), relief="flat", borderwidth=0,
+                focuscolor=bg, font=(FONT, 9, "bold"), padding=(14, 7), relief="flat", borderwidth=0,
             )
             style.map(
                 name,
@@ -606,6 +644,8 @@ class CameraServerApp:
         button("Record.TButton", COLOR_CARD_HI, COLOR_BORDER, fg=COLOR_TEXT)
         button("RecordOn.TButton", COLOR_REC, COLOR_KO_HI)
         button("Primary.TButton", COLOR_ACCENT, COLOR_ACCENT_HI)
+        button("Ghost.TButton", COLOR_CARD, COLOR_CARD_HI, fg=COLOR_MUTED)
+        style.configure("Ghost.TButton", padding=(8, 2), font=(FONT, 8))
 
         style.configure(
             "Dark.TCombobox", fieldbackground=COLOR_CARD, background=COLOR_CARD_HI, foreground=COLOR_TEXT,
@@ -633,19 +673,11 @@ class CameraServerApp:
         self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
         self.root.option_add("*TCombobox*Listbox.font", (FONT, 10))
 
-    def _on_banner_resize(self, event) -> None:
-        if abs(event.width - self._banner_width) < 4:
-            return
-        self._banner_width = event.width
-        self._banner_photo = ImageTk.PhotoImage(make_banner(event.width, BANNER_HEIGHT))
-        self.banner.itemconfigure(self._banner_item, image=self._banner_photo)
-        self.banner.coords(self._status_window, event.width - 26, BANNER_HEIGHT // 2)
-
     def _build_stream_panel(self, parent: tk.Frame, panel: StreamPanel, column: int) -> None:
         """Construit un panneau complet (vidéo + ses propres boutons) pour un flux."""
         accent = STREAM_ACCENTS.get(panel.key, COLOR_ACCENT)
         outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        outer.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 8, 8 if column == 0 else 0))
+        outer.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 5 if column == 0 else 0))
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=1)
 
@@ -653,7 +685,7 @@ class CameraServerApp:
         tk.Frame(outer, bg=accent, height=3).grid(row=0, column=0, sticky="ew")
 
         title_bar = tk.Frame(outer, bg=COLOR_CARD)
-        title_bar.grid(row=1, column=0, sticky="ew", padx=14, pady=(12, 10))
+        title_bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(9, 7))
         panel.title_var = tk.StringVar(value=panel.title)
         tk.Label(
             title_bar, textvariable=panel.title_var, bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 12, "bold")
@@ -668,34 +700,41 @@ class CameraServerApp:
         )
         panel.status_label.pack(side="right")
 
-        panel.placeholder = ImageTk.PhotoImage(make_placeholder(panel.key, accent, 150))
+        # Le « support » a une taille FIXE minimale et ne grandit jamais selon l'image :
+        # la vidéo s'adapte à l'espace disponible au lieu de pousser les boutons hors de la fenêtre.
+        panel.placeholder = ImageTk.PhotoImage(make_placeholder(panel.key, accent, 96))
+        holder = tk.Frame(outer, bg=COLOR_VIDEO_BG, width=240, height=140)
+        holder.pack_propagate(False)
+        holder.grid(row=2, column=0, sticky="nsew", padx=12)
         panel.video_label = tk.Label(
-            outer, bg=COLOR_VIDEO_BG, fg=COLOR_MUTED, text="Aucun flux vidéo",
-            image=panel.placeholder, compound="top", font=(FONT, 11), pady=10,
+            holder, bg=COLOR_VIDEO_BG, fg=COLOR_MUTED, text="Aucun flux vidéo",
+            image=panel.placeholder, compound="top", font=(FONT, 10), pady=6,
         )
-        panel.video_label.grid(row=2, column=0, sticky="nsew", padx=14)
+        panel.video_label.pack(fill="both", expand=True)
         panel.video_label.bind(
             "<Configure>",
             lambda event, p=panel: setattr(p, "view_size", (max(event.width, 1), max(event.height, 1))),
         )
 
         controls = tk.Frame(outer, bg=COLOR_CARD)
-        controls.grid(row=3, column=0, sticky="ew", padx=14, pady=14)
+        controls.grid(row=3, column=0, sticky="ew", padx=12, pady=10)
+        for col in range(3):
+            controls.columnconfigure(col, weight=1, uniform="ctl")
         panel.btn_start = ttk.Button(
             controls, text="▶  Démarrer", style="Start.TButton", cursor="hand2",
             command=lambda k=panel.key: self._send_command(k, "START"),
         )
-        panel.btn_start.pack(side="left", padx=(0, 8))
+        panel.btn_start.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         panel.btn_stop = ttk.Button(
             controls, text="■  Arrêter", style="Stop.TButton", cursor="hand2",
             command=lambda k=panel.key: self._send_command(k, "STOP"),
         )
-        panel.btn_stop.pack(side="left", padx=(0, 8))
+        panel.btn_stop.grid(row=0, column=1, sticky="ew", padx=(0, 6))
         panel.btn_record = ttk.Button(
             controls, text="⏺  Enregistrer", style="Record.TButton", cursor="hand2",
             command=lambda k=panel.key: self.toggle_recording(k),
         )
-        panel.btn_record.pack(side="left")
+        panel.btn_record.grid(row=0, column=2, sticky="ew")
         panel.btn_start["state"] = "disabled"
         panel.btn_stop["state"] = "disabled"
 
@@ -703,18 +742,19 @@ class CameraServerApp:
         panel.video_label.configure(image=panel.placeholder, text="Aucun flux vidéo")
         panel.video_label.image = panel.placeholder
 
-    def _build_location_panel(self, parent: tk.Frame) -> None:
-        """Panneau « Localisation » : commandes pour ouvrir/fermer le
-        navigateur chez le client sélectionné, coordonnées reçues, et une
-        carte (tkintermapview, basée sur OpenStreetMap) centrée sur la
-        dernière position précise transmise par CE navigateur."""
+    def _build_location_panel(self, parent: tk.Misc) -> tk.Frame:
+        """Panneau « Localisation » (colonne de droite) : commandes pour
+        ouvrir/fermer le navigateur chez le client sélectionné, carte
+        (tkintermapview / OpenStreetMap) qui occupe toute la hauteur
+        disponible, et dernières coordonnées reçues sous la carte."""
         outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
-        outer.pack(fill="x", padx=18, pady=(14, 0))
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(3, weight=1)       # la carte absorbe tout l'espace vertical
 
-        tk.Frame(outer, bg=COLOR_WARN, height=3).pack(fill="x")
+        tk.Frame(outer, bg=COLOR_WARN, height=3).grid(row=0, column=0, sticky="ew")
 
         header = tk.Frame(outer, bg=COLOR_CARD)
-        header.pack(fill="x", padx=14, pady=(12, 10))
+        header.grid(row=1, column=0, sticky="ew", padx=12, pady=(9, 7))
         tk.Label(
             header, text="📍  Localisation", bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 12, "bold")
         ).pack(side="left")
@@ -724,50 +764,53 @@ class CameraServerApp:
         )
         self.location_status_label.pack(side="right")
 
-        body = tk.Frame(outer, bg=COLOR_CARD)
-        body.pack(fill="x", padx=14, pady=(0, 14))
-        body.columnconfigure(1, weight=1)
-
-        # ---- Colonne de gauche : contrôles + dernières coordonnées ----
-        left = tk.Frame(body, bg=COLOR_CARD)
-        left.grid(row=0, column=0, sticky="n", padx=(0, 14))
-
+        buttons = tk.Frame(outer, bg=COLOR_CARD)
+        buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        buttons.columnconfigure(0, weight=1, uniform="loc")
+        buttons.columnconfigure(1, weight=1, uniform="loc")
         self.btn_location_open = ttk.Button(
-            left, text="🌐  Ouvrir navigateur", style="Start.TButton", cursor="hand2",
+            buttons, text="🌐  Ouvrir", style="Start.TButton", cursor="hand2",
             command=lambda: self._send_location_command("OPEN"),
         )
-        self.btn_location_open.pack(fill="x", pady=(0, 6))
+        self.btn_location_open.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.btn_location_close = ttk.Button(
-            left, text="✖  Fermer navigateur", style="Stop.TButton", cursor="hand2",
+            buttons, text="✖  Fermer", style="Stop.TButton", cursor="hand2",
             command=lambda: self._send_location_command("CLOSE"),
         )
-        self.btn_location_close.pack(fill="x")
+        self.btn_location_close.grid(row=0, column=1, sticky="ew")
         self.btn_location_open["state"] = "disabled"
         self.btn_location_close["state"] = "disabled"
 
-        self.location_coords_var = tk.StringVar(value="Aucune position reçue pour le moment.")
-        tk.Label(
-            left, textvariable=self.location_coords_var, bg=COLOR_CARD, fg=COLOR_MUTED,
-            font=(FONT_MONO, 9), justify="left", wraplength=230, anchor="w",
-        ).pack(fill="x", pady=(14, 0))
-
-        # ---- Colonne de droite : la carte ----
         if _HAS_MAP:
-            self.location_map = TkinterMapView(body, width=460, height=260, corner_radius=6)
-            self.location_map.grid(row=0, column=1, sticky="nsew")
+            self.location_map = TkinterMapView(outer, width=200, height=200, corner_radius=0)
+            self.location_map.grid(row=3, column=0, sticky="nsew", padx=12)
+            self.location_map.set_tile_server(MAP_TILE_SERVER, max_zoom=MAP_TILE_MAX_ZOOM)
+            tk.Label(
+                outer, text="Fond de carte © Esri, HERE, Garmin, OpenStreetMap",
+                bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 7),
+            ).grid(row=3, column=0, sticky="sw", padx=16, pady=(0, 2))
             self.location_map.set_position(DEFAULT_MAP_LAT, DEFAULT_MAP_LON)
             self.location_map.set_zoom(5)
         else:
             self.location_map = None
             tk.Label(
-                body,
+                outer,
                 text=(
-                    "Carte indisponible : installez le paquet « tkintermapview »\n"
-                    "(pip install tkintermapview) puis relancez le server-gui.\n"
-                    "Les coordonnées restent affichées en texte à gauche."
+                    "Carte indisponible : installez « tkintermapview »\n"
+                    "(pip install tkintermapview) puis relancez.\n"
+                    "Les coordonnées restent affichées ci-dessous."
                 ),
-                bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 9), justify="left", anchor="nw",
-            ).grid(row=0, column=1, sticky="nw")
+                bg=COLOR_VIDEO_BG, fg=COLOR_MUTED, font=(FONT, 9), justify="center",
+            ).grid(row=3, column=0, sticky="nsew", padx=12)
+
+        self.location_coords_var = tk.StringVar(value="Aucune position reçue pour le moment.")
+        coords = tk.Label(
+            outer, textvariable=self.location_coords_var, bg=COLOR_CARD, fg=COLOR_MUTED,
+            font=(FONT_MONO, 9), justify="left", anchor="w", wraplength=360,
+        )
+        coords.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 10))
+        outer.bind("<Configure>", lambda e: coords.configure(wraplength=max(e.width - 28, 120)))
+        return outer
 
     def _send_location_command(self, command: str) -> None:
         """Envoie OPEN ou CLOSE : la GUI ne parle jamais directement au
