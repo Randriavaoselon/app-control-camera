@@ -12,6 +12,11 @@ REM  Options :
 REM      --server URL     adresse du serveur (sauvegardee, plus besoin de la retaper)
 REM      --autostart      demarre le client automatiquement a l'ouverture de session
 REM      --uninstall      desinstalle tout (programme, tache planifiee, configuration)
+REM
+REM  Localisation (commande OPEN/CLOSE envoyee depuis le server-gui) :
+REM  Chrome ou Edge sont utilises en mode fenetre dediee s'ils sont installes
+REM  (cas normal sur Windows, Edge est preinstalle) : la fermeture a distance
+REM  depuis le server-gui fonctionne alors directement, sans rien configurer.
 REM =============================================================================
 
 set "SCRIPT_DIR=%~dp0"

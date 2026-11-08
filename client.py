@@ -56,6 +56,7 @@ import tempfile
 import time
 import threading
 import uuid
+import webbrowser
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -198,6 +199,46 @@ def _open_camera() -> cv2.VideoCapture:
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
         capture.set(cv2.CAP_PROP_FPS, 30)   # sans ça, certaines webcams Windows tombent à 5-15 im/s en lumière faible
     return capture
+
+
+# ---------------------------------------------------------------------
+# Navigateur de localisation (ouvert/fermé à la demande du server-gui)
+# ---------------------------------------------------------------------
+
+# Navigateurs capables du mode "--app" (fenêtre SANS barre d'adresse, lancée
+# comme un process à part). C'est volontairement PAS webbrowser.open() :
+# cette fonction ne donne aucune prise sur la fenêtre ouverte, alors que
+# subprocess.Popen() renvoie un processus qu'on peut TERMINER à la demande
+# (bouton "Fermer navigateur" du server-gui). C'est tout l'enjeu : pouvoir
+# fermer à distance, pas seulement ouvrir.
+LOCATION_BROWSER_CANDIDATES_LINUX = (
+    "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
+    "microsoft-edge", "microsoft-edge-stable",
+)
+LOCATION_BROWSER_CANDIDATES_WINDOWS = (
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+)
+LOCATION_WINDOW_SIZE = "420,640"
+
+
+def _find_app_mode_browser() -> "str | None":
+    """Cherche un navigateur Chromium (Chrome/Edge/Chromium) capable du mode
+    --app. Si aucun n'est trouvé, l'appelant se rabat sur webbrowser.open()
+    (le navigateur par défaut s'ouvre, mais ne pourra pas être fermé à
+    distance depuis le server-gui — seulement ouvert)."""
+    if platform.system() == "Windows":
+        for path in LOCATION_BROWSER_CANDIDATES_WINDOWS:
+            if os.path.exists(path):
+                return path
+        return None
+    for name in LOCATION_BROWSER_CANDIDATES_LINUX:
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -482,6 +523,10 @@ class CameraClient:
         self._stop_screen_event = threading.Event()
         self._screen_slot = _LatestFrame()
 
+        # Localisation : navigateur ouvert chez CE client, piloté par le server-gui.
+        self.location_open = False
+        self._location_process: subprocess.Popen | None = None
+
     def run_forever(self) -> None:
         logger.info(
             "Démarrage du client — serveur : %s — appareil : %s (%s)",
@@ -504,9 +549,20 @@ class CameraClient:
             self._stop_screen()
 
     def _check_commands(self) -> None:
+        # Si l'UTILISATEUR a fermé lui-même la fenêtre du navigateur de
+        # localisation (plutôt que la GUI), on le détecte ici AVANT d'envoyer
+        # le statut : sinon la GUI afficherait "ouvert" indéfiniment.
+        if self._location_process is not None and self._location_process.poll() is not None:
+            self._location_process = None
+            self.location_open = False
+
         response = self._cmd_session.get(
             f"{self.server_url}/api/command",
-            params={"device_id": self.device_id, "name": self.device_name},
+            params={
+                "device_id": self.device_id,
+                "name": self.device_name,
+                "location_open": "1" if self.location_open else "0",
+            },
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -524,6 +580,12 @@ class CameraClient:
             self._start_screen()
         elif screen_cmd == "STOP" and self.screen_on:
             self._stop_screen()
+
+        location_cmd = commands.get("location")
+        if location_cmd == "OPEN" and not self.location_open:
+            self._open_location_browser()
+        elif location_cmd == "CLOSE" and self.location_open:
+            self._close_location_browser()
 
     # ------------------------------------------------------------------
     # Flux caméra
@@ -696,6 +758,58 @@ class CameraClient:
         if mss_instance is None:
             return None
         return _grab_screen_mss(mss_instance, monitor)
+
+    # ------------------------------------------------------------------
+    # Navigateur de localisation
+    # ------------------------------------------------------------------
+    def _open_location_browser(self) -> None:
+        """Ouvre, chez CE client, un navigateur sur la page de localisation
+        du serveur (qui demande la position précise via navigator.geolocation
+        et la renvoie elle-même au serveur — ce client ne calcule rien)."""
+        url = f"{self.server_url}/location/page?device_id={self.device_id}"
+        browser_path = _find_app_mode_browser()
+        try:
+            if browser_path:
+                self._location_process = subprocess.Popen([
+                    browser_path,
+                    f"--app={url}",
+                    f"--window-size={LOCATION_WINDOW_SIZE}",
+                    "--new-window",
+                ])
+            else:
+                # Repli : navigateur par défaut. Fonctionne pour OUVRIR, mais
+                # sans prise sur le processus on ne pourra pas le FERMER à
+                # distance (seul l'utilisateur, ou lui-même, pourra fermer l'onglet).
+                webbrowser.open(url, new=1)
+                self._location_process = None
+                logger.warning(
+                    "Aucun navigateur en mode « app » (Chrome/Edge/Chromium) trouvé : ouverture "
+                    "dans le navigateur par défaut. La fermeture à distance depuis le server-gui "
+                    "ne sera pas possible dans ce cas."
+                )
+            self.location_open = True
+            logger.info("Navigateur de localisation ouvert (%s)", url)
+        except Exception as exc:
+            logger.error("Impossible d'ouvrir le navigateur de localisation : %s", exc)
+
+    def _close_location_browser(self) -> None:
+        """Ferme le navigateur ouvert par _open_location_browser, s'il a été
+        lancé via subprocess (donc si un navigateur en mode --app était
+        disponible). Sans ce process (repli webbrowser.open), rien à fermer
+        depuis ici : on se contente de mettre à jour l'état local."""
+        self.location_open = False
+        process = self._location_process
+        self._location_process = None
+        if process is not None and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=3)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+        logger.info("Navigateur de localisation fermé (ou déjà fermé)")
 
     # ------------------------------------------------------------------
     # Envoi au serveur (commun aux deux flux)

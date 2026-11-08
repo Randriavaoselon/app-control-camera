@@ -24,6 +24,15 @@
 #      commande        ~/.local/bin/camera-client
 #      configuration   ~/.local/share/camera-client/config.json   (droits 600)
 #      service         ~/.config/systemd/user/camera-client.service
+#
+#  Localisation (commande OPEN/CLOSE envoyée depuis le server-gui) :
+#  nécessite un environnement graphique (X11/Wayland) sur CETTE machine. Pour
+#  pouvoir fermer le navigateur À DISTANCE (et pas seulement l'ouvrir),
+#  installez Chrome, Chromium ou Edge (sinon repli automatique sur le
+#  navigateur par défaut, qui ne pourra être fermé que manuellement) :
+#      Debian/Ubuntu : sudo apt install chromium-browser   (ou chromium)
+#      Fedora        : sudo dnf install chromium
+#      Arch          : sudo pacman -S chromium
 # =============================================================================
 set -euo pipefail
 

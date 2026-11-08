@@ -23,6 +23,10 @@
 #      Fedora        : sudo dnf install python3-tkinter
 #      Arch          : sudo pacman -S tk
 #
+#  La carte du panneau « Localisation » (tkintermapview, installé via
+#  requirements-gui.txt) télécharge ses tuiles OpenStreetMap à la volée :
+#  un accès Internet est nécessaire sur la machine qui fait tourner la GUI.
+#
 #  Emplacements :
 #      programme       ~/.local/share/camera-gui/
 #      commande        ~/.local/bin/camera-gui

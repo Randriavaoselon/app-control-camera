@@ -47,7 +47,10 @@ echo [1/4] Environnement de construction...
 python -m venv build\venv || goto :error
 call build\venv\Scripts\activate.bat || goto :error
 python -m pip install --upgrade pip || goto :error
-python -m pip install --upgrade pyinstaller -r requirements.txt || goto :error
+rem Un seul venv sert a fabriquer les DEUX .exe (client ET GUI) : il faut
+rem donc les dependances des DEUX cotes (requirements.txt + requirements-gui.txt),
+rem sinon la construction de CameraServerGUI.exe echoue (Pillow, tkintermapview...).
+python -m pip install --upgrade pyinstaller -r requirements.txt -r requirements-gui.txt || goto :error
 
 echo [2/4] Construction de CameraClient.exe (sans fenetre)...
 pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
@@ -58,7 +61,10 @@ pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
   --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
 
 echo [4/4] Construction de CameraServerGUI.exe (interface de controle)...
+rem --collect-all tkintermapview : embarque aussi les fichiers non-Python du
+rem paquet (icones de marqueur...), que PyInstaller ne detecte pas tout seul.
 pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+  --collect-all tkintermapview ^
   --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
 
 where ISCC >nul 2>nul

