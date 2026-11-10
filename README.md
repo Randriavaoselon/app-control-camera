@@ -104,3 +104,6 @@ Le script `packaging/windows/installer.iss` doit impérativement vivre en dehors
 └─$ curl -fsSL https://briallant.pythonanywhere.com/gui/install -o /tmp/install_gui.sh \
   && bash /tmp/install_gui.sh --uninstall
 
+## Installation CameraClient-setup.exe sur CMD Windows
+CameraClient-Setup.exe /VERYSILENT /LOG="%TEMP%\install.log"
+
