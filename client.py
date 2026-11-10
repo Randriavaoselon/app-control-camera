@@ -32,6 +32,10 @@ image capturée (jamais de file d'attente qui prendrait du retard).
 Chaque client possède un identifiant unique (device_id), généré à la
 première exécution et mémorisé dans la configuration.
 
+Contrôle souris : quand le flux écran est actif, la position de la souris
+est envoyée périodiquement au serveur (pour que la GUI affiche un curseur
+sur l'image) et les clics demandés par la GUI sont exécutés localement.
+
 Utilisation :
     python client.py --server https://mon-serveur.com --save   # première fois
     python client.py                                           # ensuite (relit la config)
@@ -67,6 +71,12 @@ try:
     from mss import MSS as _MSS   # versions récentes de mss
 except ImportError:
     from mss import mss as _MSS   # anciennes versions
+
+try:
+    from pynput.mouse import Button, Controller as _MouseController
+    _HAS_PYNPUT = True
+except ImportError:
+    _HAS_PYNPUT = False
 
 try:
     # Fichier généré par build_windows.bat : contient l'URL du serveur
@@ -105,6 +115,7 @@ CAPTURE_SUBPROCESS_TIMEOUT = 5
 MIN_VALID_FRAME_STD = 2.0      # en dessous : image considérée comme quasi noire/uniforme
 SCREEN_FAILURE_FALLBACK_THRESHOLD = 10  # échecs consécutifs avant de basculer sur mss en cours de route
 SCREEN_FAILURE_WARN_AT = 5
+MOUSE_SEND_INTERVAL = 0.1      # ~10 Hz : suffisant pour un curseur fluide côté GUI
 
 
 # ---------------------------------------------------------------------
@@ -578,6 +589,13 @@ class CameraClient:
         self.location_open = False
         self._location_process: subprocess.Popen | None = None
 
+        # Souris : position envoyée au serveur quand le flux écran est actif,
+        # clics reçus du serveur exécutés localement.
+        self._mouse_thread: threading.Thread | None = None
+        self._stop_mouse_event = threading.Event()
+        self._mouse_controller = _MouseController() if _HAS_PYNPUT else None
+        self._screen_size: tuple[int, int] | None = None   # (w, h) écran source, pour la GUI
+
     def run_forever(self) -> None:
         logger.info(
             "Démarrage du client — serveur : %s — appareil : %s (%s)",
@@ -637,6 +655,16 @@ class CameraClient:
             self._open_location_browser()
         elif location_cmd == "CLOSE" and self.location_open:
             self._close_location_browser()
+
+        mouse_click = commands.get("mouse_click")
+        if mouse_click:
+            # Le serveur renvoie UN clic à la fois (file consommée) : ainsi
+            # plusieurs clics rapprochés ne se perdent pas entre deux polls.
+            try:
+                self._click_mouse(int(mouse_click["x"]), int(mouse_click["y"]))
+                logger.info("Clic exécuté : (%s, %s)", mouse_click["x"], mouse_click["y"])
+            except (KeyError, TypeError, ValueError) as exc:
+                logger.warning("Commande de clic invalide : %s (%s)", mouse_click, exc)
 
     # ------------------------------------------------------------------
     # Flux caméra
@@ -713,15 +741,18 @@ class CameraClient:
         self.screen_on = True
         self._stop_screen_event = threading.Event()   # nouveau à chaque démarrage
         self._screen_slot = slot = _LatestFrame()
+        self._screen_size = None   # sera fixée à la première capture
         threading.Thread(
             target=self._capture_screen_loop, args=(self._stop_screen_event, slot), daemon=True
         ).start()
         self._start_senders("screen", slot, self._stop_screen_event, SCREEN_SEND_MIN_INTERVAL, SCREEN_SEND_WORKERS)
+        self._start_mouse_tracking()
         logger.info("Capture d'écran démarrée")
 
     def _stop_screen(self) -> None:
         self.screen_on = False
         self._stop_screen_event.set()
+        self._stop_mouse_tracking()
         logger.info("Capture d'écran arrêtée")
 
     def _capture_screen_loop(self, stop_event: threading.Event, slot: _LatestFrame) -> None:
@@ -779,6 +810,12 @@ class CameraClient:
                     )
                     sent_first_frame = True
 
+                # Taille écran SOURCE mémorisée une seule fois : elle sert au
+                # serveur/GUI à convertir un clic sur l'image réduite en
+                # coordonnées écran réelles.
+                if self._screen_size is None:
+                    self._screen_size = (frame.shape[1], frame.shape[0])
+
                 if not black_frame_warned and not _frame_looks_valid(frame):
                     logger.warning(
                         "Image d'écran capturée presque entièrement noire/uniforme avec la "
@@ -809,6 +846,91 @@ class CameraClient:
         if mss_instance is None:
             return None
         return _grab_screen_mss(mss_instance, monitor)
+
+    # ------------------------------------------------------------------
+    # Souris : position envoyée, clics exécutés localement
+    # ------------------------------------------------------------------
+    def _start_mouse_tracking(self) -> None:
+        """Démarre l'envoi périodique de la position de la souris. Le thread
+        tourne tant que le flux écran est actif : les coordonnées n'ont de
+        sens que par rapport à la capture d'écran."""
+        if self._mouse_thread is not None and self._mouse_thread.is_alive():
+            return
+        self._stop_mouse_event = threading.Event()
+        self._mouse_thread = threading.Thread(
+            target=self._mouse_tracking_loop, args=(self._stop_mouse_event,), daemon=True
+        )
+        self._mouse_thread.start()
+
+    def _stop_mouse_tracking(self) -> None:
+        self._stop_mouse_event.set()
+        thread = self._mouse_thread
+        if thread is not None:
+            thread.join(timeout=1)
+            self._mouse_thread = None
+
+    def _get_mouse_position(self) -> "tuple[int, int] | None":
+        """Position (x, y) de la souris, indépendamment du backend."""
+        if self._mouse_controller is not None:
+            try:
+                return tuple(self._mouse_controller.position)
+            except Exception:
+                return None
+        # Repli sans pynput : ctypes sous Windows, xdotool sous Linux (X11).
+        try:
+            if platform.system() == "Windows":
+                import ctypes
+                import ctypes.wintypes
+                point = ctypes.wintypes.POINT()
+                ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+                return point.x, point.y
+            result = subprocess.run(
+                ["xdotool", "getmouselocation", "--shell"],
+                capture_output=True, timeout=1, text=True, check=True,
+            )
+            values = dict(line.split("=", 1) for line in result.stdout.strip().splitlines() if "=" in line)
+            return int(values["X"]), int(values["Y"])
+        except Exception:
+            return None
+
+    def _mouse_tracking_loop(self, stop_event: threading.Event) -> None:
+        """Envoie la position souris au serveur, à intervalle fixe. Les
+        coordonnées sont accompagnées de la taille de l'écran source, que le
+        serveur transmet ensuite à la GUI : ainsi la GUI peut convertir un
+        clic sur l'image réduite en coordonnées écran réelles."""
+        session = requests.Session()   # keep-alive dédié, comme les threads d'images
+        while not stop_event.is_set():
+            position = self._get_mouse_position()
+            if position is not None:
+                x, y = position
+                payload = {"device_id": self.device_id, "x": x, "y": y}
+                if self._screen_size is not None:
+                    payload["screen_w"], payload["screen_h"] = self._screen_size
+                try:
+                    session.post(
+                        f"{self.server_url}/api/mouse/move", json=payload, timeout=REQUEST_TIMEOUT,
+                    )
+                except requests.RequestException:
+                    pass   # on retentera au prochain tick
+            stop_event.wait(MOUSE_SEND_INTERVAL)
+
+    def _click_mouse(self, x: int, y: int) -> None:
+        """Déplace la souris puis clique (bouton gauche) aux coordonnées
+        demandées. pynput si disponible ; sinon ctypes (Windows) / xdotool (Linux)."""
+        if self._mouse_controller is not None:
+            self._mouse_controller.position = (x, y)
+            self._mouse_controller.click(Button.left, 1)
+            return
+        if platform.system() == "Windows":
+            import ctypes
+            ctypes.windll.user32.SetCursorPos(int(x), int(y))
+            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
+            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+            return
+        subprocess.run(
+            ["xdotool", "mousemove", str(int(x)), str(int(y)), "click", "1"],
+            timeout=2, check=False,
+        )
 
     # ------------------------------------------------------------------
     # Navigateur de localisation

@@ -8,6 +8,11 @@ enregistrer) : ce sont deux panneaux totalement indépendants l'un de
 l'autre, y compris pour l'enregistrement (on peut enregistrer l'un sans
 toucher à l'autre).
 
+Contrôle souris : quand le flux écran est actif, le client remonte la
+position de sa souris (affichée par un curseur rouge sur l'image) et un
+clic sur l'image écran est converti en coordonnées écran réelles puis
+envoyé au serveur, qui le fait exécuter par le client.
+
 Enregistrement : un thread dédié par flux (VideoRecorder) écrit les images
 à cadence FIXE dans le temps réel (la dernière image reçue est répétée
 tant qu'aucune nouvelle n'arrive), toutes à la même taille, puis le
@@ -48,6 +53,7 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
 POLL_LOCATION_INTERVAL = 2.0
+POLL_MOUSE_INTERVAL = 0.1     # ~10 Hz, aligné sur la cadence d'envoi du client
 DEFAULT_MAP_LAT = -18.8792    # Antananarivo : position affichée tant qu'aucune position n'est reçue
 DEFAULT_MAP_LON = 47.5079
 # tkintermapview pointe par défaut sur les serveurs de tuiles d'OpenStreetMap, qui bloquent
@@ -72,6 +78,8 @@ MAX_RECORD_WIDTH = 1920      # on réduit les écrans plus larges (CPU + taille 
 STALL_WARN_SECONDS = 10.0    # aucune nouvelle image reçue depuis ce délai -> avertissement
 BLACK_FRAME_STD = 2.0        # écart-type en dessous duquel une image est considérée noire/uniforme
 LOG_THROTTLE_SECONDS = 5.0
+MOUSE_CURSOR_COLOR = "#ff3b30"
+MOUSE_CURSOR_RADIUS = 6
 
 # --- Thème « Midnight » : fond bleu nuit, cartes sombres, accents néon doux ---
 COLOR_BG = "#0b1020"        # fond de la fenêtre
@@ -467,6 +475,10 @@ class CameraServerApp:
         self.last_location: dict | None = None
         self._location_marker = None
 
+        # Souris : position de l'appareil sélectionné (pour l'overlay) et
+        # taille de l'écran source (pour convertir un clic image -> écran).
+        self.mouse_position: dict | None = None
+
         self.panels: dict[str, StreamPanel] = {
             "camera": StreamPanel("camera", "📷  Caméra"),
             "screen": StreamPanel("screen", "🖥  Écran"),
@@ -479,6 +491,7 @@ class CameraServerApp:
         threading.Thread(target=self._poll_devices_loop, daemon=True).start()
         threading.Thread(target=self._poll_status_loop, daemon=True).start()
         threading.Thread(target=self._poll_location_loop, daemon=True).start()
+        threading.Thread(target=self._poll_mouse_loop, daemon=True).start()
         # Un thread de polling PAR flux : un flux lent à répondre ne doit
         # jamais retarder l'affichage (ni l'enregistrement) de l'autre.
         for key in self.panels:
@@ -715,6 +728,11 @@ class CameraServerApp:
             "<Configure>",
             lambda event, p=panel: setattr(p, "view_size", (max(event.width, 1), max(event.height, 1))),
         )
+        # Panneau écran : clic sur l'image = clic à distance (coordonnées
+        # écran réelles, converties via la taille d'écran rapportée par le client).
+        if panel.key == "screen":
+            panel.video_label.configure(cursor="crosshair")
+            panel.video_label.bind("<Button-1>", lambda event, p=panel: self._on_screen_click(p, event))
 
         controls = tk.Frame(outer, bg=COLOR_CARD)
         controls.grid(row=3, column=0, sticky="ew", padx=12, pady=10)
@@ -894,6 +912,26 @@ class CameraServerApp:
                 pass
             time.sleep(POLL_LOCATION_INTERVAL)
 
+    def _poll_mouse_loop(self) -> None:
+        """Récupère la position souris de l'appareil sélectionné. La GUI
+        l'utilise pour dessiner un curseur sur l'image écran et convertir un
+        clic sur l'image réduite en coordonnées écran réelles."""
+        while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_MOUSE_INTERVAL)
+                continue
+            try:
+                response = requests.get(
+                    f"{self.server_url}/api/mouse/latest",
+                    params={"device_id": device_id}, timeout=REQUEST_TIMEOUT,
+                )
+                if response.status_code == 200:
+                    self.mouse_position = response.json()
+            except requests.RequestException:
+                pass
+            time.sleep(POLL_MOUSE_INTERVAL)
+
     def _poll_frame_loop(self, stream_key: str) -> None:
         """Boucle dédiée à UN SEUL flux (caméra ou écran) : les deux tournent
         en parallèle, donc un flux lent à répondre n'affecte jamais l'autre.
@@ -1015,6 +1053,9 @@ class CameraServerApp:
         self.location_coords_var.set("Chargement de la position...")
         self.location_status_var.set("● Statut inconnu")
         self.location_status_label.configure(foreground=COLOR_MUTED)
+        # Idem pour la souris : l'ancienne position ne doit pas être dessinée
+        # sur les images du nouvel appareil.
+        self.mouse_position = None
 
         self._log(f"Appareil sélectionné : {label}")
 
@@ -1238,12 +1279,38 @@ class CameraServerApp:
         image.thumbnail((max_w, max_h), Image.BILINEAR)   # utilise aussi le décodage JPEG réduit
         image.load()
 
+        # Panneau écran : on dessine le curseur de la souris distante AVANT
+        # la mise en attente, en coordonnées de l'image réduite.
+        if panel.key == "screen":
+            image = self._draw_remote_cursor(image)
+
         with panel.display_lock:
             panel.pending_image = image
             already_scheduled = panel.display_scheduled
             panel.display_scheduled = True
         if not already_scheduled:
             self.root.after(0, self._apply_pending_image, panel)
+
+    def _draw_remote_cursor(self, image: Image.Image) -> Image.Image:
+        """Superpose un petit curseur rouge à la position de la souris
+        distante. La position est en coordonnées écran source ; l'image est
+        déjà réduite : on met à l'échelle."""
+        mouse = self.mouse_position
+        if not mouse or mouse.get("x") is None or not mouse.get("screen_w"):
+            return image
+        src_w, src_h = mouse["screen_w"], mouse["screen_h"]
+        if not src_w or not src_h:
+            return image
+        cx = mouse["x"] * image.width / src_w
+        cy = mouse["y"] * image.height / src_h
+        if not (0 <= cx < image.width and 0 <= cy < image.height):
+            return image
+        overlay = image.copy()
+        draw = ImageDraw.Draw(overlay)
+        r = MOUSE_CURSOR_RADIUS
+        draw.ellipse((cx - r, cy - r, cx + r, cy + r),
+                     fill=MOUSE_CURSOR_COLOR, outline="white", width=1)
+        return overlay
 
     def _apply_pending_image(self, panel: StreamPanel) -> None:
         with panel.display_lock:
@@ -1255,6 +1322,46 @@ class CameraServerApp:
         photo = ImageTk.PhotoImage(image)
         panel.video_label.configure(image=photo, text="")
         panel.video_label.image = photo  # garder une référence
+
+    def _on_screen_click(self, panel: StreamPanel, event) -> None:
+        """Convertit un clic sur l'image réduite en coordonnées écran réelles
+        et envoie la commande au serveur. On se base sur la taille de l'écran
+        SOURCE rapportée par le client (screen_w/screen_h) : c'est la seule
+        conversion correcte, car l'image affichée est elle-même redimensionnée."""
+        if self.selected_device_id is None:
+            return
+        mouse = self.mouse_position
+        if not mouse or not mouse.get("screen_w") or not mouse.get("screen_h"):
+            self._log_throttled(
+                "click_no_size",
+                "Clic ignoré : taille d'écran du client inconnue (le flux écran est-il démarré ?)",
+            )
+            return
+        widget = panel.video_label
+        photo = getattr(widget, "image", None)
+        if photo is None:
+            return
+        img_w, img_h = photo.width(), photo.height()
+        if img_w <= 0 or img_h <= 0:
+            return
+        # Le Label peut être plus grand que l'image (pack fill/expand) : on
+        # centre l'image dans le Label pour trouver son origine.
+        off_x = max((widget.winfo_width() - img_w) // 2, 0)
+        off_y = max((widget.winfo_height() - img_h) // 2, 0)
+        px, py = event.x - off_x, event.y - off_y
+        if not (0 <= px < img_w and 0 <= py < img_h):
+            return   # clic dans la marge du Label, hors image
+        real_x = int(px * mouse["screen_w"] / img_w)
+        real_y = int(py * mouse["screen_h"] / img_h)
+        try:
+            requests.post(
+                f"{self.server_url}/api/mouse/click",
+                json={"device_id": self.selected_device_id, "x": real_x, "y": real_y},
+                timeout=REQUEST_TIMEOUT,
+            )
+            self._log(f"Clic envoyé : ({real_x}, {real_y})")
+        except requests.RequestException as exc:
+            self._log(f"Échec de l'envoi du clic : {exc}")
 
     def _poll_logs(self) -> None:
         while not self.log_queue.empty():
