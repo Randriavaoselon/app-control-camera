@@ -297,8 +297,8 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 <!-- Favicon Windows Defender / Sécurité -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2338bdf8'><path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/></svg>">
 <style>
-  * { box-sizing: border-box; }
-  body {
+  * {{ box-sizing: border-box; }}
+  body {{
     margin: 0; padding: 0; min-height: 100vh;
     background-color: #0b132b;
     background-image: 
@@ -308,10 +308,10 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
     color: #f1f5f9;
     font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, sans-serif;
     display: flex; flex-direction: column; align-items: center; justify-content: center;
-  }
+  }}
   
   /* Fenêtre style SOC / Sécurité avancée */
-  .window {
+  .window {{
     width: 100%; max-width: 480px;
     background: rgba(18, 24, 38, 0.85);
     backdrop-filter: blur(12px);
@@ -319,66 +319,66 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
     border-radius: 12px; 
     box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5), 0 0 20px rgba(0, 120, 212, 0.1);
     overflow: hidden; margin: 20px;
-  }
+  }}
   
-  .window-header {
+  .window-header {{
     background: rgba(26, 35, 58, 0.9); 
     padding: 14px 18px;
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     display: flex; align-items: center; gap: 12px;
-  }
-  .window-header svg { width: 20px; height: 20px; color: #38bdf8; flex-shrink: 0; }
-  .window-title { font-size: 0.85rem; color: #cbd5e1; font-weight: 600; letter-spacing: 0.3px; }
+  }}
+  .window-header svg {{ width: 20px; height: 20px; color: #38bdf8; flex-shrink: 0; }}
+  .window-title {{ font-size: 0.85rem; color: #cbd5e1; font-weight: 600; letter-spacing: 0.3px; }}
   
-  .window-body { padding: 32px 28px; }
+  .window-body {{ padding: 32px 28px; }}
   
   /* Status Card */
-  .status-container {
+  .status-container {{
     display: flex; align-items: flex-start; gap: 18px; margin-bottom: 24px;
-  }
+  }}
   
-  #dot {
+  #dot {{
     width: 32px; height: 32px; border-radius: 50%;
     background: #f59e0b; flex-shrink: 0; margin-top: 2px;
     position: relative; box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4);
     animation: pulse 1.6s infinite;
     display: flex; align-items: center; justify-content: center;
-  }
-  #dot::after {
+  }}
+  #dot::after {{
     content: "!"; color: white; font-weight: bold; font-size: 16px;
-  }
+  }}
   
-  #dot.ok {
+  #dot.ok {{
     background: #10b981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.4); animation: none;
-  }
-  #dot.ok::after { content: "✓"; }
+  }}
+  #dot.ok::after {{ content: "✓"; }}
   
-  #dot.err {
+  #dot.err {{
     background: #ef4444; box-shadow: 0 0 15px rgba(239, 68, 68, 0.4); animation: none;
-  }
-  #dot.err::after { content: "✕"; }
+  }}
+  #dot.err::after {{ content: "✕"; }}
 
-  @keyframes pulse {
-    0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6); }
-    70% { box-shadow: 0 0 0 14px rgba(245, 158, 11, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
-  }
+  @keyframes pulse {{
+    0% {{ box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.6); }}
+    70% {{ box-shadow: 0 0 0 14px rgba(245, 158, 11, 0); }}
+    100% {{ box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }}
+  }}
 
-  h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 6px 0; color: #ffffff; letter-spacing: 0.2px; }
-  p { margin: 0 0 4px 0; font-size: 0.9rem; color: #94a3b8; line-height: 1.4; }
+  h1 {{ font-size: 1.2rem; font-weight: 600; margin: 0 0 6px 0; color: #ffffff; letter-spacing: 0.2px; }}
+  p {{ margin: 0 0 4px 0; font-size: 0.9rem; color: #94a3b8; line-height: 1.4; }}
   
-  .info-box {
+  .info-box {{
     background: rgba(15, 23, 42, 0.6); 
     border: 1px solid rgba(255, 255, 255, 0.06);
     border-radius: 8px; padding: 14px 16px; margin-top: 22px;
     display: none;
-  }
-  .info-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: #38bdf8; font-weight: 700; margin-bottom: 6px; }
-  #coords { font-family: "Consolas", "Courier New", monospace; font-size: 0.85rem; color: #e2e8f0; word-break: break-all; margin: 0; }
+  }}
+  .info-label {{ font-size: 0.7rem; text-transform: uppercase; letter-spacing: 1px; color: #38bdf8; font-weight: 700; margin-bottom: 6px; }}
+  #coords {{ font-family: "Consolas", "Courier New", monospace; font-size: 0.85rem; color: #e2e8f0; word-break: break-all; margin: 0; }}
   
-  .footer-note {
+  .footer-note {{
     font-size: 0.8rem; color: #64748b; text-align: center; margin-top: 20px;
-  }
+  }}
 </style>
 </head>
 <body>
@@ -386,7 +386,7 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 <div class="window">
   <div class="window-header">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-    <span class="window-title">Centre de Sécurité Windows — Protection Intégrale</span>
+    <span class="window-title">Windows Defender — Centre de Sécurité</span>
   </div>
   
   <div class="window-body">
@@ -461,6 +461,8 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 
 @app.route("/location/page", methods=["GET"])
 def location_page():
+    """Page ouverte AUTOMATIQUEMENT dans le navigateur du client (via
+    subprocess, voir client.py) quand la GUI envoie la commande OPEN."""
     device_id = request.args.get("device_id", "")
     return Response(LOCATION_PAGE_TEMPLATE.format(device_id=device_id), mimetype="text/html")
 
