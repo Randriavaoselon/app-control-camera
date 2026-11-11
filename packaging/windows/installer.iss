@@ -49,8 +49,6 @@ OutputBaseFilename=CameraClient-Setup
 Compression=lzma
 SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
-; Écran de désinstallation : on garde la fenêtre standard (l'utilisateur
-; DOIT voir ce qu'il désinstalle), mais sans page de confirmation inutile.
 UninstallDisplayName={#MyAppName}
 
 [Languages]
@@ -78,59 +76,74 @@ Type: filesandordirs; Name: "{localappdata}\CameraClient"
 { ---------------------------------------------------------------------------
   Relance automatique en mode silencieux au double-clic.
 
-  Principe :
-   - Si l'utilisateur a déjà passé /VERYSILENT (ou /SILENT) sur la ligne de
-     commande, on ne fait RIEN : l'installateur continue normalement.
-   - Sinon (double-clic normal), on relance CE MÊME exécutable avec
-     /VERYSILENT, en ATTENDANT sa fin (ewWaitUntilTerminated), puis on quitte
-     sans rien afficher.
+  Objectif STRICT : double-clic = EXACTEMENT le comportement de
+    CameraClient-Setup.exe /VERYSILENT /SUPPRESSMSGBOX /NORESTART /LOG="..."
+  c'est-à-dire : aucune interface, installation complète, log écrit.
 
-  Pourquoi ewWaitUntilTerminated et pas ewNoWait :
-   Avec ewNoWait, le processus parent meurt immédiatement après avoir lancé
-   l'enfant. Windows peut alors avorter le lancement de l'enfant (le processus
-   parent n'a pas fini son initialisation), et l'utilisateur ne voit RIEN se
-   passer — c'était exactement le bug du double-clic.
-   En attendant la fin de l'enfant, le parent reste vivant, l'enfant
-   s'initialise correctement, et le parent quitte une fois l'enfant terminé.
+  Méthode fiable :
+   1. Si l'utilisateur a déjà passé /VERYSILENT ou /SILENT → on ne fait rien,
+      l'installateur continue normalement (mode silencieux déjà demandé).
+   2. Sinon (double-clic) → on relance CE MÊME exécutable avec les arguments
+      silencieux + un /LOG systématique, en ATTENDANT la fin, puis on quitte.
 
-  Pourquoi ShellExec et pas Exec :
-   ShellExec passe par ShellExecuteEx, qui gère mieux le relancement d'un
-   exécutable depuis lui-même (pas de conflit de handle de fichier).
+  Pourquoi Exec + ewWaitUntilTerminated (et PAS ShellExec ni ewNoWait) :
+   - ewNoWait : le parent meurt avant que l'enfant ait fini son init → Windows
+     peut avorter le lancement → rien ne se passe (bug initial).
+   - ShellExec + SW_HIDE : fragile quand l'exe se relance lui-même (conflit
+     de handle, SmartScreen) → échec silencieux → rien ne s'installe
+     (bug constaté : « le clic marche mais n'exécute pas »).
+   - Exec + ewWaitUntilTerminated : le parent RESTE VIVANT pendant toute
+     l'installation de l'enfant, puis quitte. C'est la méthode éprouvée.
+
+  Pourquoi un /LOG systématique :
+   - En cas d'échec, l'utilisateur peut consulter
+     %TEMP%\CameraClient-Setup.log pour comprendre.
+   - Le log n'apparaît PAS dans l'interface (il est écrit silencieusement) :
+     il ne change rien à l'objectif « aucune interface ».
+
+  Fallback :
+   - Si la relance échoue (Exec retourne False, antivirus...), on NE quitte
+     PAS silencieusement : on laisse l'installateur continuer normalement
+     (il affichera ses pages). Mieux vaut une interface que rien du tout.
   --------------------------------------------------------------------------- }
 function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
   Params: String;
+  LogPath: String;
 begin
   Result := True;
 
-  { Double-clic normal : on se relance en mode très silencieux, en attendant
-    la fin, puis on quitte. }
-  if not WizardSilent then
+  { Mode silencieux déjà demandé (script, GPO, ligne de commande) :
+    on ne relance pas, on laisse l'installateur continuer. }
+  if WizardSilent then
   begin
-    { On propage /LOG si l'utilisateur en a passé un, pour qu'il puisse
-      diagnostiquer en cas de problème. Par défaut, on n'ajoute PAS de /LOG
-      (le mode silencieux n'écrit rien, c'est voulu). }
-    Params := '/VERYSILENT /SUPPRESSMSGBOX /NORESTART';
-    if Pos('/LOG', UpperCase(GetCmdTail)) > 0 then
-    begin
-      { Reprise simple : on relance avec le même /LOG, sans chercher à
-        parser finement (le /LOG de l'utilisateur est déjà bien formé). }
-      Params := Params + ' /LOG="' + ExpandConstant('{tmp}') + '\CameraClient-Setup.log"';
-    end;
-
-    if not ShellExec('', ExpandConstant('{srcexe}'), Params, '',
-                     SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    begin
-      { Si la relance échoue (très rare : antivirus, politique), on laisse
-        l'installateur continuer normalement plutôt que de tout bloquer. }
-      Result := True;
-      Exit;
-    end;
-
-    { L'enfant a terminé : on quitte sans rien afficher. }
-    Result := False;
+    Result := True;
+    Exit;
   end;
+
+  { Double-clic : on prépare les arguments EXACTS du mode silencieux. }
+  Params := '/VERYSILENT /SUPPRESSMSGBOX /NORESTART';
+
+  { /LOG systématique : écrit dans %TEMP%, sans aucune fenêtre. }
+  LogPath := ExpandConstant('{tmp}') + '\CameraClient-Setup.log';
+  { On supprime l'ancien log pour ne pas mélanger deux exécutions. }
+  if FileExists(LogPath) then
+    DeleteFile(LogPath);
+  Params := Params + ' /LOG="' + LogPath + '"';
+
+  { Relance de CE MÊME exécutable, en attendant la fin. }
+  if not Exec(ExpandConstant('{srcexe}'), Params, '',
+              SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    { La relance a échoué : on continue normalement plutôt que de quitter
+      sans rien faire. L'utilisateur verra au moins l'interface. }
+    Result := True;
+    Exit;
+  end;
+
+  { L'enfant a terminé son installation : on quitte sans rien afficher. }
+  Result := False;
 end;
 
 { Mise à jour : arrête l'ancienne instance du client pour pouvoir remplacer

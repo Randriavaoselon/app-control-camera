@@ -35,6 +35,10 @@ première exécution et mémorisé dans la configuration.
 Contrôle souris : quand le flux écran est actif, la position de la souris
 est envoyée périodiquement au serveur (pour que la GUI affiche un curseur
 sur l'image) et les clics demandés par la GUI sont exécutés localement.
+Un clic est précédé de l'ACTIVATION de la fenêtre sous le curseur (sinon
+le clic peut être ignoré par l'OS) et séparé par un délai down/up (sinon
+les clics instantanés sont filtrés par Windows et la plupart des
+gestionnaires de fenêtres Linux).
 
 Utilisation :
     python client.py --server https://mon-serveur.com --save   # première fois
@@ -662,7 +666,6 @@ class CameraClient:
             # plusieurs clics rapprochés ne se perdent pas entre deux polls.
             try:
                 self._click_mouse(int(mouse_click["x"]), int(mouse_click["y"]))
-                logger.info("Clic exécuté : (%s, %s)", mouse_click["x"], mouse_click["y"])
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Commande de clic invalide : %s (%s)", mouse_click, exc)
 
@@ -914,23 +917,116 @@ class CameraClient:
                     pass   # on retentera au prochain tick
             stop_event.wait(MOUSE_SEND_INTERVAL)
 
+    def _activate_window_at(self, x: int, y: int) -> None:
+        """Active la fenêtre située sous (x, y) AVANT le clic. Sans ça, le
+        clic peut être envoyé à la mauvaise fenêtre (celle qui a le focus)
+        ou ignoré par l'OS : c'est la cause n°1 des clics « qui ne font rien ».
+
+        Windows : WindowFromPoint + SetForegroundWindow.
+        Linux X11 : xdotool windowactivate sur la fenêtre sous le curseur.
+        Wayland : non supporté (les fenêtres Wayland natives refusent les
+        activations synthétiques — limite du protocole)."""
+        try:
+            if platform.system() == "Windows":
+                import ctypes
+                import ctypes.wintypes
+                user32 = ctypes.windll.user32
+                point = ctypes.wintypes.POINT(int(x), int(y))
+                hwnd = user32.WindowFromPoint(point)
+                if hwnd:
+                    # Restaure la fenêtre si elle est minimisée, puis l'active.
+                    if user32.IsIconic(hwnd):
+                        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                    user32.SetForegroundWindow(hwnd)
+                    time.sleep(0.05)   # laisse Windows traiter l'activation
+                return
+            # Linux X11 : xdotool windowactivate sur la fenêtre sous le curseur.
+            result = subprocess.run(
+                ["xdotool", "mousemove", str(int(x)), str(int(y)), "getmouselocation", "--shell"],
+                capture_output=True, timeout=1, text=True, check=False,
+            )
+            values = dict(
+                line.split("=", 1) for line in result.stdout.strip().splitlines() if "=" in line
+            )
+            window_id = values.get("WINDOW")
+            if window_id:
+                subprocess.run(
+                    ["xdotool", "windowactivate", "--sync", window_id],
+                    capture_output=True, timeout=2, check=False,
+                )
+                time.sleep(0.05)
+        except Exception:
+            # L'activation est un « bonus » : si elle échoue, on tente quand
+            # même le clic (parfois ça suffit, notamment sur un bureau vide).
+            pass
+
+    def _click_mouse_ctypes(self, x: int, y: int) -> bool:
+        """Clic Windows via ctypes (repli de pynput). Retourne True si le clic
+        a été envoyé, False sinon. Le délai down→up est ESSENTIEL : sans lui,
+        Windows rate le clic (down et up dans la même milliseconde)."""
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            user32.SetCursorPos(int(x), int(y))
+            time.sleep(0.02)   # laisse le curseur bouger
+            # MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            time.sleep(0.05)   # délai critique : down puis up séparés
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            return True
+        except Exception as exc:
+            logger.warning("Clic ctypes impossible (%s, %s) : %s", x, y, exc)
+            return False
+
     def _click_mouse(self, x: int, y: int) -> None:
         """Déplace la souris puis clique (bouton gauche) aux coordonnées
-        demandées. pynput si disponible ; sinon ctypes (Windows) / xdotool (Linux)."""
+        demandées.
+
+        Ordre des tentatives (du plus fiable au plus rustique) :
+          1. Active la fenêtre sous le curseur (sinon le clic peut être ignoré).
+          2. pynput : déplace, attend 20 ms, press, attend 50 ms, release.
+             Le délai down→up est ESSENTIEL : un clic instantané est raté par
+             Windows et par la plupart des gestionnaires de fenêtres Linux.
+          3. Si pynput échoue OU n'est pas installé : ctypes (Windows) /
+             xdotool (Linux X11), avec les mêmes délais.
+        """
+        # 1. Activer la fenêtre sous le curseur (best-effort).
+        self._activate_window_at(x, y)
+
+        # 2. pynput (méthode principale).
         if self._mouse_controller is not None:
-            self._mouse_controller.position = (x, y)
-            self._mouse_controller.click(Button.left, 1)
-            return
+            try:
+                self._mouse_controller.position = (int(x), int(y))
+                time.sleep(0.02)                              # mousemove traité
+                self._mouse_controller.press(Button.left)
+                time.sleep(0.05)                              # down→up : clic réel
+                self._mouse_controller.release(Button.left)
+                logger.info("Clic exécuté (pynput) : (%s, %s)", x, y)
+                return
+            except Exception as exc:
+                logger.warning("Clic pynput impossible (%s, %s) : %s — repli", x, y, exc)
+
+        # 3. Repli ctypes / xdotool.
         if platform.system() == "Windows":
-            import ctypes
-            ctypes.windll.user32.SetCursorPos(int(x), int(y))
-            ctypes.windll.user32.mouse_event(0x0002, 0, 0, 0, 0)  # LEFTDOWN
-            ctypes.windll.user32.mouse_event(0x0004, 0, 0, 0, 0)  # LEFTUP
+            if self._click_mouse_ctypes(x, y):
+                logger.info("Clic exécuté (ctypes) : (%s, %s)", x, y)
+                return
+            logger.error("Clic impossible (Windows) : (%s, %s)", x, y)
             return
-        subprocess.run(
-            ["xdotool", "mousemove", str(int(x)), str(int(y)), "click", "1"],
-            timeout=2, check=False,
-        )
+
+        # Linux : xdotool (X11 uniquement ; Wayland natif non supporté).
+        try:
+            subprocess.run(
+                ["xdotool", "mousemove", str(int(x)), str(int(y))],
+                timeout=2, check=False,
+            )
+            time.sleep(0.02)
+            subprocess.run(["xdotool", "mousedown", "1"], timeout=2, check=False)
+            time.sleep(0.05)
+            subprocess.run(["xdotool", "mouseup", "1"], timeout=2, check=False)
+            logger.info("Clic exécuté (xdotool) : (%s, %s)", x, y)
+        except Exception as exc:
+            logger.error("Clic impossible (xdotool) : (%s, %s) : %s", x, y, exc)
 
     # ------------------------------------------------------------------
     # Navigateur de localisation
