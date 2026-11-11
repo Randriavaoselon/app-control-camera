@@ -27,7 +27,9 @@
 [Setup]
 ; AppId unique : ne changez jamais cette ligne, sinon les mises à jour
 ; s'installeront côte à côte au lieu de remplacer l'ancienne version.
-AppId={{2F2C5B3E-7A1D-4B7A-9B2E-CAMERACLIENT1}}
+; GUID valide généré une fois pour toutes (Tools > Generate GUID dans Inno Setup) —
+; ne JAMAIS le régénérer pour ce projet.
+AppId={{3F8A1C2D-6B4E-4A9F-8D3C-1A2B3C4D5E6F}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Selon Randriavao
@@ -41,8 +43,12 @@ DisableReadyPage=yes
 DisableFinishedPage=yes
 ; Installation dans le profil utilisateur, sans UAC (pas d'admin requis).
 PrivilegesRequired=lowest
-; Un seul installateur à la fois : évite les doubles lancements concurrents.
-SetupMutex=Global\CameraClientSetupMutex
+; PAS de SetupMutex : il provoquerait un deadlock entre le processus parent
+; (qui attend la fin de l'enfant avec ewWaitUntilTerminated) et le processus
+; enfant (qui attend que le parent libère le mutex). Sans SetupMutex, la
+; relance fonctionne immédiatement. Les doubles-clics simultanés restent
+; gérés par Inno Setup (il détecte le second lancement et affiche une erreur
+; claire, ce qui est rare et acceptable).
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\releases
 OutputBaseFilename=CameraClient-Setup
@@ -50,6 +56,10 @@ Compression=lzma
 SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
 UninstallDisplayName={#MyAppName}
+; Évite toute tentative de dialogue de langue au démarrage.
+UsePreviousLanguage=no
+; Évite le dialogue « Voulez-vous vraiment annuler ? » en mode silencieux.
+AllowNoIcons=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -64,7 +74,7 @@ Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 [Run]
 ; Lancement immédiat, en arrière-plan, y compris en mode silencieux
 ; (pas de « skipifsilent », sinon le client ne démarrerait qu'à la prochaine session).
-Filename: "{app}\{#MyAppExeName}"; Flags: nowait runhidden runasoriginaluser
+Filename: "{app}\{#MyAppExeName}"; Flags: nowait runhidden
 
 [UninstallRun]
 Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "StopCameraClient"
@@ -90,16 +100,15 @@ Type: filesandordirs; Name: "{localappdata}\CameraClient"
    - ewNoWait : le parent meurt avant que l'enfant ait fini son init → Windows
      peut avorter le lancement → rien ne se passe (bug initial).
    - ShellExec + SW_HIDE : fragile quand l'exe se relance lui-même (conflit
-     de handle, SmartScreen) → échec silencieux → rien ne s'installe
-     (bug constaté : « le clic marche mais n'exécute pas »).
+     de handle, SmartScreen) → échec silencieux → rien ne s'installe.
    - Exec + ewWaitUntilTerminated : le parent RESTE VIVANT pendant toute
      l'installation de l'enfant, puis quitte. C'est la méthode éprouvée.
 
-  Pourquoi un /LOG systématique :
-   - En cas d'échec, l'utilisateur peut consulter
-     %TEMP%\CameraClient-Setup.log pour comprendre.
-   - Le log n'apparaît PAS dans l'interface (il est écrit silencieusement) :
-     il ne change rien à l'objectif « aucune interface ».
+  Pourquoi PAS de SetupMutex :
+   - Avec SetupMutex, le parent détient le mutex pendant qu'il attend
+     l'enfant (ewWaitUntilTerminated), et l'enfant BLOQUE sur le mutex
+     → deadlock → Inno Setup timeout → interface affichée (bug constaté).
+   - Sans SetupMutex, la relance fonctionne immédiatement.
 
   Fallback :
    - Si la relance échoue (Exec retourne False, antivirus...), on NE quitte
