@@ -21,7 +21,11 @@
 ; chaque build avec --clean) : tout fichier qui y vivrait serait supprimé.
 
 #define MyAppName "Camera Client"
-#define MyAppVersion "1.0"
+; Version bumpée à 1.0.1 pour vérifier facilement qu'on teste bien le
+; nouveau build : clic droit sur CameraClient-Setup.exe > Propriétés >
+; Détails > "Version du produit" doit afficher 1.0.1. Si ça affiche
+; encore 1.0, c'est l'ancien exe (avec DisableReadyPage=no) qui est testé.
+#define MyAppVersion "1.0.1"
 #define MyAppExeName "CameraClient.exe"
 
 [Setup]
@@ -41,6 +45,9 @@ DisableWelcomePage=yes
 DisableDirPage=yes
 DisableReadyPage=yes
 DisableFinishedPage=yes
+; Supprime aussi la boîte « Ceci va installer [...] sur cet ordinateur.
+; Continuer ? » qui s'affiche normalement avant même la page de bienvenue.
+DisableStartupPrompt=yes
 ; Installation dans le profil utilisateur, sans UAC (pas d'admin requis).
 PrivilegesRequired=lowest
 ; PAS de SetupMutex : il provoquerait un deadlock entre le processus parent
