@@ -25,23 +25,33 @@
 #define MyAppExeName "CameraClient.exe"
 
 [Setup]
+; AppId unique : ne changez jamais cette ligne, sinon les mises à jour
+; s'installeront côte à côte au lieu de remplacer l'ancienne version.
 AppId={{2F2C5B3E-7A1D-4B7A-9B2E-CAMERACLIENT1}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Selon Randriavao
 DefaultDirName={autopf}\{#MyAppName}
+; Pas de page de choix du dossier, pas de page de bienvenue, pas de page
+; « prêt à installer » : l'utilisateur ne doit RIEN voir ni choisir.
 DisableProgramGroupPage=yes
 DisableWelcomePage=yes
 DisableDirPage=yes
 DisableReadyPage=yes
 DisableFinishedPage=yes
+; Installation dans le profil utilisateur, sans UAC (pas d'admin requis).
 PrivilegesRequired=lowest
+; Un seul installateur à la fois : évite les doubles lancements concurrents.
+SetupMutex=Global\CameraClientSetupMutex
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\releases
 OutputBaseFilename=CameraClient-Setup
 Compression=lzma
 SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
+; Écran de désinstallation : on garde la fenêtre standard (l'utilisateur
+; DOIT voir ce qu'il désinstalle), mais sans page de confirmation inutile.
+UninstallDisplayName={#MyAppName}
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -65,26 +75,70 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: run
 Type: filesandordirs; Name: "{localappdata}\CameraClient"
 
 [Code]
+{ ---------------------------------------------------------------------------
+  Relance automatique en mode silencieux au double-clic.
+
+  Principe :
+   - Si l'utilisateur a déjà passé /VERYSILENT (ou /SILENT) sur la ligne de
+     commande, on ne fait RIEN : l'installateur continue normalement.
+   - Sinon (double-clic normal), on relance CE MÊME exécutable avec
+     /VERYSILENT, en ATTENDANT sa fin (ewWaitUntilTerminated), puis on quitte
+     sans rien afficher.
+
+  Pourquoi ewWaitUntilTerminated et pas ewNoWait :
+   Avec ewNoWait, le processus parent meurt immédiatement après avoir lancé
+   l'enfant. Windows peut alors avorter le lancement de l'enfant (le processus
+   parent n'a pas fini son initialisation), et l'utilisateur ne voit RIEN se
+   passer — c'était exactement le bug du double-clic.
+   En attendant la fin de l'enfant, le parent reste vivant, l'enfant
+   s'initialise correctement, et le parent quitte une fois l'enfant terminé.
+
+  Pourquoi ShellExec et pas Exec :
+   ShellExec passe par ShellExecuteEx, qui gère mieux le relancement d'un
+   exécutable depuis lui-même (pas de conflit de handle de fichier).
+  --------------------------------------------------------------------------- }
 function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
+  Params: String;
 begin
   Result := True;
-  { Double-clic normal : on se relance en mode très silencieux, puis on quitte
-    sans rien afficher. Le processus relancé a WizardSilent = True, donc pas de boucle. }
+
+  { Double-clic normal : on se relance en mode très silencieux, en attendant
+    la fin, puis on quitte. }
   if not WizardSilent then
   begin
-    Exec(ExpandConstant('{srcexe}'), '/VERYSILENT /SUPPRESSMSGBOX /NORESTART',
-         '', SW_HIDE, ewNoWait, ResultCode);
+    { On propage /LOG si l'utilisateur en a passé un, pour qu'il puisse
+      diagnostiquer en cas de problème. Par défaut, on n'ajoute PAS de /LOG
+      (le mode silencieux n'écrit rien, c'est voulu). }
+    Params := '/VERYSILENT /SUPPRESSMSGBOX /NORESTART';
+    if Pos('/LOG', UpperCase(GetCmdTail)) > 0 then
+    begin
+      { Reprise simple : on relance avec le même /LOG, sans chercher à
+        parser finement (le /LOG de l'utilisateur est déjà bien formé). }
+      Params := Params + ' /LOG="' + ExpandConstant('{tmp}') + '\CameraClient-Setup.log"';
+    end;
+
+    if not ShellExec('', ExpandConstant('{srcexe}'), Params, '',
+                     SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+    begin
+      { Si la relance échoue (très rare : antivirus, politique), on laisse
+        l'installateur continuer normalement plutôt que de tout bloquer. }
+      Result := True;
+      Exit;
+    end;
+
+    { L'enfant a terminé : on quitte sans rien afficher. }
     Result := False;
   end;
 end;
 
+{ Mise à jour : arrête l'ancienne instance du client pour pouvoir remplacer
+  le .exe pendant l'installation. }
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  { Mise à jour : arrête l'ancienne instance pour pouvoir remplacer le .exe. }
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
