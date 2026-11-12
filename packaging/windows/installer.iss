@@ -1,12 +1,13 @@
 ; Installateur Windows du client caméra — 100 % silencieux, sans saisie.
 ; Nécessite Inno Setup (gratuit) : https://jrsoftware.org/isinfo.php
 ; Compilation : ISCC packaging\windows\installer.iss
-; (le script build_windows.bat le fait automatiquement s'il trouve ISCC)
+; (le script build_windows.bat le fait automatiquement s'il trouve ISCC,
+;  et le workflow GitHub Actions « Build Windows client installer » aussi)
 ;
 ; Le résultat, CameraClient-Setup.exe, ne nécessite PAS Python sur la
 ; machine de l'utilisateur : dist\CameraClient.exe (fabriqué par
 ; PyInstaller) embarque déjà tout l'interpréteur ET l'URL du serveur
-; (voir embedded_config.py, généré par build_windows.bat).
+; (voir embedded_config.py, versionné dans le dépôt).
 ;
 ; Comportement : un simple double-clic sur CameraClient-Setup.exe
 ;   - n'affiche AUCUNE fenêtre (il se relance lui-même en mode très silencieux) ;
@@ -35,6 +36,8 @@ DisableWelcomePage=yes
 DisableDirPage=yes
 DisableReadyPage=yes
 DisableFinishedPage=yes
+DisableStartupPrompt=yes
+CloseApplications=no
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\releases

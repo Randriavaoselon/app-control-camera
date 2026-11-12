@@ -6,6 +6,7 @@ on:
     paths:
       - "client.py"
       - "requirements.txt"
+      - "embedded_config.py"
       - "packaging/windows/**"
   workflow_dispatch:
 
@@ -23,6 +24,15 @@ jobs:
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v4
+
+      - name: Vérifier embedded_config.py (URL du serveur intégrée au client)
+        shell: cmd
+        run: |
+          if not exist embedded_config.py (
+            echo ERREUR : embedded_config.py est introuvable dans le depot.
+            exit /b 1
+          )
+          type embedded_config.py
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -72,6 +82,15 @@ jobs:
         run: |
           cd packaging\windows
           "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      - name: Vérifier que l'installateur a bien été créé
+        shell: cmd
+        run: |
+          if not exist releases\CameraClient-Setup.exe (
+            echo ERREUR : releases\CameraClient-Setup.exe n'a pas ete cree.
+            exit /b 1
+          )
+          dir releases
 
       - name: Mettre l'installateur à disposition du workflow (résultat immédiat)
         uses: actions/upload-artifact@v4
