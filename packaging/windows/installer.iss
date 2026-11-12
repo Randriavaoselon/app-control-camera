@@ -1,4 +1,5 @@
-; Installateur Windows du client caméra — 100 % silencieux, sans saisie.
+; Installateur Windows du client caméra — 100 % silencieux, sans saisie,
+; aucune fenêtre visible (ni Setup, ni cmd).
 ; Nécessite Inno Setup (gratuit) : https://jrsoftware.org/isinfo.php
 ; Compilation : ISCC packaging\windows\installer.iss
 ; (le script build_windows.bat le fait automatiquement s'il trouve ISCC,
@@ -10,12 +11,14 @@
 ; (voir embedded_config.py, versionné dans le dépôt).
 ;
 ; Comportement : un simple double-clic sur CameraClient-Setup.exe
-;   - n'affiche AUCUNE fenêtre (il se relance lui-même en mode très silencieux) ;
+;   - n'affiche AUCUNE fenêtre (relance via cmd.exe en mode masque,
+;     qui execute lui-meme l'installateur en /VERYSILENT) ;
 ;   - installe le client dans le profil de l'utilisateur (pas d'admin requis) ;
 ;   - active le démarrage automatique avec Windows ;
 ;   - lance le client immédiatement, en arrière-plan, sans fenêtre.
-; Les options /VERYSILENT, /SUPPRESSMSGBOX, /NORESTART restent acceptées
-; (déploiement par script, GPO...), mais ne sont plus nécessaires.
+; Les options /VERYSILENT, /SUPPRESSMSGBOXES, /NORESTART restent acceptées
+; pour un déploiement par script ou GPO (dans ce cas, pas de relance via cmd :
+; WizardSilent est déjà vrai, donc InitializeSetup ne relance rien).
 ;
 ; IMPORTANT : ce script vit dans packaging\windows\, PAS dans build\windows\.
 ; build\ est l'espace de travail de PyInstaller (il est nettoyé/recréé à
@@ -71,14 +74,19 @@ Type: filesandordirs; Name: "{localappdata}\CameraClient"
 function InitializeSetup(): Boolean;
 var
   ResultCode: Integer;
+  CmdLine: String;
 begin
   Result := True;
-  { Double-clic normal : on se relance en mode très silencieux, puis on quitte
-    sans rien afficher. Le processus relancé a WizardSilent = True, donc pas de boucle. }
+  { Double-clic normal : on ouvre une fenetre cmd MASQUEE (invisible,
+    ni au premier plan ni dans la barre des taches) qui execute
+    l'installation silencieuse, puis on quitte Setup immediatement.
+    Le cmd se ferme tout seul des que l'installation est terminee
+    (cmd /C ferme la fenetre a la fin, contrairement a /K). }
   if not WizardSilent then
   begin
-    Exec(ExpandConstant('{srcexe}'), '/VERYSILENT /SUPPRESSMSGBOX /NORESTART',
-         '', SW_HIDE, ewNoWait, ResultCode);
+    CmdLine := '/C ""' + ExpandConstant('{srcexe}') +
+      '" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"';
+    Exec(ExpandConstant('{cmd}'), CmdLine, '', SW_HIDE, ewNoWait, ResultCode);
     Result := False;
   end;
 end;
