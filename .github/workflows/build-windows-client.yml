@@ -5,9 +5,11 @@ on:
     branches: [main]
     paths:
       - "client.py"
+      - "console_windows.py"
       - "requirements.txt"
       - "embedded_config.py"
       - "packaging/windows/**"
+      - "packaging/icons/**"
   workflow_dispatch:
 
 permissions:
@@ -34,6 +36,16 @@ jobs:
           )
           type embedded_config.py
 
+      - name: Vérifier la présence des icônes
+        shell: cmd
+        run: |
+          if not exist packaging\icons\camera_client.ico (
+            echo ERREUR : packaging\icons\camera_client.ico est introuvable.
+            exit /b 1
+          )
+          echo Icone du client trouvee :
+          dir packaging\icons\camera_client.ico
+
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
@@ -48,12 +60,27 @@ jobs:
       - name: Construire CameraClient.exe (sans fenêtre)
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient
+          --icon packaging\icons\camera_client.ico
           --specpath build --workpath build\work-client-gui --distpath dist client.py
 
       - name: Construire CameraClient-console.exe (diagnostic)
         run: >
           pyinstaller --noconfirm --clean --onefile --console --name CameraClient-console
+          --icon packaging\icons\camera_client.ico
           --specpath build --workpath build\work-client-console --distpath dist client.py
+
+      - name: Test de fumée (le client démarre sans planter)
+        shell: cmd
+        run: |
+          rem Lance le client en mode --once : suffisant pour detecter une erreur
+          rem d'import (console_windows.py absent, ctypes mal utilise...).
+          rem Sans serveur joignable, le client logue un avertissement et termine
+          rem proprement (errorlevel 0 attendu).
+          dist\CameraClient-console.exe --once --debug
+          if errorlevel 1 (
+            echo ERREUR : le client s'est termine en erreur.
+            exit /b 1
+          )
 
       - name: Installer Inno Setup
         run: choco install innosetup -y --no-progress
@@ -74,6 +101,8 @@ jobs:
           dir dist
           echo == Contenu de packaging\windows\ (doit contenir installer.iss) ==
           dir packaging\windows
+          echo == Contenu de packaging\icons\ (doit contenir camera_client.ico) ==
+          dir packaging\icons
           echo == Contenu de releases\ (attendu par OutputDir) ==
           dir releases
 

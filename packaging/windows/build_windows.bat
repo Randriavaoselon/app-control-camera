@@ -17,8 +17,21 @@ rem
 rem  IMPORTANT : ce script vit dans packaging\windows\, PAS dans build\windows\.
 rem  build\ est l'espace de travail de PyInstaller (nettoye/recree a chaque
 rem  build avec --clean) : tout fichier qui y vivrait serait supprime.
+rem
+rem  Icones : les fichiers packaging\icons\camera_client.ico et
+rem  packaging\icons\camera_gui.ico doivent exister AVANT l'execution.
 rem ===========================================================================
 cd /d "%~dp0..\.."
+
+rem --- Verification des icones (fichiers optionnels : on continue si absents) ---
+if not exist "packaging\icons\camera_client.ico" (
+  echo [Info] packaging\icons\camera_client.ico introuvable : le client sera
+  echo        construit SANS icone personnalisee ^(icone PyInstaller par defaut^).
+)
+if not exist "packaging\icons\camera_gui.ico" (
+  echo [Info] packaging\icons\camera_gui.ico introuvable : la GUI sera
+  echo        construite SANS icone personnalisee ^(icone PyInstaller par defaut^).
+)
 
 set "SERVER_URL=%~1"
 if not "%SERVER_URL%"=="" goto :write_config
@@ -54,10 +67,12 @@ python -m pip install --upgrade pyinstaller -r requirements.txt -r requirements-
 
 echo [2/4] Construction de CameraClient.exe (sans fenetre)...
 pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
+  --icon "packaging\icons\camera_client.ico" ^
   --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
 
 echo [3/4] Construction de CameraClient-console.exe (diagnostic)...
 pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
+  --icon "packaging\icons\camera_client.ico" ^
   --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
 
 echo [4/4] Construction de CameraServerGUI.exe (interface de controle)...
@@ -65,6 +80,7 @@ rem --collect-all tkintermapview : embarque aussi les fichiers non-Python du
 rem paquet (icones de marqueur...), que PyInstaller ne detecte pas tout seul.
 pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
   --collect-all tkintermapview ^
+  --icon "packaging\icons\camera_gui.ico" ^
   --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
 
 where ISCC >nul 2>nul
