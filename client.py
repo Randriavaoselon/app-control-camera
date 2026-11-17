@@ -719,6 +719,11 @@ class CameraClient:
                 self._check_commands()
             except requests.RequestException as exc:
                 logger.warning("Serveur injoignable (%s), nouvelle tentative...", exc)
+            except Exception as exc:
+                # Filet de sécurité : une erreur inattendue dans le traitement
+                # d'une commande (ex. console chat, localisation) ne doit JAMAIS
+                # faire sortir de run_forever : le client se déconnecterait.
+                logger.exception("Erreur inattendue dans _check_commands : %s", exc)
             time.sleep(POLL_INTERVAL)
 
     def run_once(self) -> None:
@@ -731,7 +736,10 @@ class CameraClient:
             self._stop_screen()
         self._remote_console.stop()
         if self._chat_console is not None:
-            self._chat_console.close()
+            try:
+                self._chat_console.close()
+            except Exception as exc:
+                logger.warning("Erreur lors de la fermeture de la console chat : %s", exc)
 
     def _check_commands(self) -> None:
         # Si l'UTILISATEUR a fermé lui-même la fenêtre du navigateur de
@@ -795,16 +803,23 @@ class CameraClient:
 
         # Chat : message de la GUI -> console visible du client
         chat_msg = commands.get("chat_message")
-        if chat_msg and self._chat_console is not None and self._chat_console.is_open():
-            self._chat_console.show_incoming(chat_msg.get("message", ""))
+        if chat_msg and self._chat_console is not None:
+            try:
+                if self._chat_console.is_open():
+                    self._chat_console.show_incoming(chat_msg.get("message", ""))
+            except Exception as exc:
+                logger.exception("Erreur lors de l'injection du message chat : %s", exc)
 
         # Chat : ouverture/fermeture de la console visible (GUI seule décide)
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
-            if chat_window_cmd == "OPEN" and not self._chat_console.is_open():
-                self._chat_console.open()
-            elif chat_window_cmd == "CLOSE" and self._chat_console.is_open():
-                self._chat_console.close()
+            try:
+                if chat_window_cmd == "OPEN" and not self._chat_console.is_open():
+                    self._chat_console.open()
+                elif chat_window_cmd == "CLOSE" and self._chat_console.is_open():
+                    self._chat_console.close()
+            except Exception as exc:
+                logger.exception("Erreur lors de la gestion de la console chat : %s", exc)
 
     # ------------------------------------------------------------------
     # Chat : appelée par le hook clavier quand l'utilisateur tape
@@ -812,7 +827,11 @@ class CameraClient:
     def _handle_user_chat(self, line: str) -> None:
         """L'utilisateur a tapé un message dans la console chat. On l'envoie
         au serveur, puis on injecte localement 'echo Toi: <line>' pour
-        l'afficher (Solution B — préfixe invisible)."""
+        l'afficher (Solution B — préfixe invisible).
+
+        NOTE : cette méthode est appelée depuis un callback Win32
+        (WH_KEYBOARD_LL) ; une exception non attrapée ici serait fatale
+        pour le thread du hook. On enveloppe donc tout dans try/except."""
         try:
             requests.post(
                 f"{self.server_url}/api/shell/result",
@@ -825,17 +844,23 @@ class CameraClient:
             )
         except requests.RequestException:
             pass
+        except Exception as exc:
+            logger.exception("Erreur lors de l'envoi du message chat : %s", exc)
+
         # Affichage local : "echo Toi: <line>"
-        if self._chat_console is not None and self._chat_console.is_open():
-            safe = (
-                line.replace("^", "^^")
-                .replace("&", "^&")
-                .replace("|", "^|")
-                .replace("<", "^<")
-                .replace(">", "^>")
-                .replace('"', "'")
-            )
-            self._chat_console._send_text(f"echo Toi: {safe}\r")
+        try:
+            if self._chat_console is not None and self._chat_console.is_open():
+                safe = (
+                    line.replace("^", "^^")
+                    .replace("&", "^&")
+                    .replace("|", "^|")
+                    .replace("<", "^<")
+                    .replace(">", "^>")
+                    .replace('"', "'")
+                )
+                self._chat_console._send_text(f"echo Toi: {safe}\r")
+        except Exception as exc:
+            logger.exception("Erreur lors de l'affichage local du message chat : %s", exc)
 
     def _chat_window_is_open(self) -> bool:
         return self._chat_console is not None and self._chat_console.is_open()

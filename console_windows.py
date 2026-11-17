@@ -34,6 +34,38 @@ KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
 GWLP_WNDPROC = -4
 
+# --- Prototypes Win32 (essentiel : sans eux, ctypes suppose c_int partout,
+#     ce qui provoque OverflowError sur les pointeurs 64 bits) ---
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+# SetWindowLongPtrW : (HWND, int, LONG_PTR) -> LONG_PTR
+# LONG_PTR = pointeur de la taille d'un pointeur (c_void_p convient).
+_user32.SetWindowLongPtrW.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_void_p,
+]
+_user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+
+# CallWindowProcW : (WNDPROC, HWND, UINT, WPARAM, LPARAM) -> LRESULT
+# WNDPROC est un pointeur de fonction ; LRESULT = LONG_PTR.
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_void_p,  # LRESULT (LONG_PTR)
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+)
+_user32.CallWindowProcW.argtypes = [
+    ctypes.c_void_p,  # WNDPROC
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+]
+_user32.CallWindowProcW.restype = ctypes.c_void_p
+
 
 class KEYBDINPUT(ctypes.Structure):
     _fields_ = [
@@ -89,8 +121,8 @@ class ChatConsole:
         self._hook_proc = None  # garde une référence pour éviter le GC
 
         self._wndproc_installed = False
-        self._new_wndproc = None
-        self._old_wndproc = None
+        self._new_wndproc = None      # objet WNDPROC (callable)
+        self._old_wndproc_ptr = None  # pointeur LONG_PTR retourné par SetWindowLongPtrW
 
         self._last_server_message = time.monotonic()
 
@@ -126,7 +158,6 @@ class ChatConsole:
             self.process = None
         if proc is None or proc.poll() is not None:
             return
-        # `exit` est une vraie commande cmd qui termine le processus.
         self._send_text("exit\r\n", force=True)
         try:
             proc.wait(timeout=3)
@@ -224,42 +255,47 @@ class ChatConsole:
     def _install_close_guard(self) -> None:
         if self._wndproc_installed:
             return
-        user32 = ctypes.windll.user32
         hwnd = self._find_hwnd()
         if not hwnd:
             return
 
-        WNDPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.wintypes.HWND, ctypes.wintypes.UINT,
-            ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM
-        )
-
         def new_wndproc(hwnd, msg, wparam, lparam):
             if msg == WM_CLOSE and not self.is_hook_active():
                 # Timeout de sécurité dépassé : on laisse la fermeture passer.
-                return user32.CallWindowProcW(
-                    self._old_wndproc, hwnd, msg, wparam, lparam
+                return _user32.CallWindowProcW(
+                    self._old_wndproc_ptr, hwnd, msg, wparam, lparam
                 )
             if msg == WM_CLOSE:
                 return 0  # on ignore
-            return user32.CallWindowProcW(self._old_wndproc, hwnd, msg, wparam, lparam)
+            return _user32.CallWindowProcW(
+                self._old_wndproc_ptr, hwnd, msg, wparam, lparam
+            )
 
+        # Instancie le callback C. On garde une référence forte pour éviter le GC.
         self._new_wndproc = WNDPROC(new_wndproc)
-        self._old_wndproc = user32.SetWindowLongPtrW(
-            hwnd, GWLP_WNDPROC, ctypes.cast(self._new_wndproc, ctypes.c_void_p).value
+
+        # Convertit l'objet WNDPROC en c_void_p pour SetWindowLongPtrW.
+        # ctypes.cast(WNDPROC, c_void_p).value donne un int Python, qui
+        # peut dépasser c_int sur 64 bits. On passe donc directement un
+        # c_void_p (créé via ctypes.cast) : SetWindowLongPtrW.argtypes
+        # déclare le 3e argument comme c_void_p, ce qui accepte la valeur.
+        new_ptr = ctypes.cast(self._new_wndproc, ctypes.c_void_p)
+
+        # Remplace le WndProc de la console.
+        self._old_wndproc_ptr = _user32.SetWindowLongPtrW(
+            hwnd, GWLP_WNDPROC, new_ptr
         )
         self._wndproc_installed = True
 
     def _restore_close_guard(self) -> None:
         if not self._wndproc_installed:
             return
-        user32 = ctypes.windll.user32
         hwnd = self._find_hwnd()
-        if hwnd and self._old_wndproc:
-            user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._old_wndproc)
+        if hwnd and self._old_wndproc_ptr:
+            _user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, self._old_wndproc_ptr)
         self._wndproc_installed = False
         self._new_wndproc = None
-        self._old_wndproc = None
+        self._old_wndproc_ptr = None
 
     # ------------------------------------------------------------------
     # Hook clavier : capture les frappes, bloque VK_RETURN (Solution B)
@@ -288,7 +324,10 @@ class ChatConsole:
         kernel32 = ctypes.windll.kernel32
 
         HOOKPROC = ctypes.WINFUNCTYPE(
-            ctypes.c_long, ctypes.c_int, ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM
+            ctypes.c_void_p,  # LRESULT (LONG_PTR)
+            ctypes.c_int,
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
         )
 
         def hook_callback(n_code, w_param, l_param):
@@ -315,6 +354,25 @@ class ChatConsole:
             return user32.CallNextHookEx(self._hook_handle, n_code, w_param, l_param)
 
         self._hook_proc = HOOKPROC(hook_callback)
+        # SetWindowsHookExW.argtypes : sans cela, ctypes suppose c_int et
+        # peut produire des OverflowError sur les pointeurs 64 bits.
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int,
+            HOOKPROC,
+            ctypes.wintypes.HINSTANCE,
+            ctypes.wintypes.DWORD,
+        ]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.wintypes.WPARAM,
+            ctypes.wintypes.LPARAM,
+        ]
+        user32.CallNextHookEx.restype = ctypes.c_void_p
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
+
         self._hook_handle = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, self._hook_proc, kernel32.GetModuleHandleW(None), 0
         )
