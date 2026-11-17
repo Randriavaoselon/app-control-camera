@@ -47,16 +47,18 @@ jobs:
           pip install -r requirements-gui.txt
           pip install pyinstaller
 
+      # IMPORTANT : PyInstaller résout --icon relativement au .spec (créé
+      # dans build/ à cause de --specpath), pas au répertoire courant.
+      # On passe donc un chemin ABSOLU via ${{ github.workspace }}.
+      # --collect-all tkintermapview : embarque aussi les fichiers non-Python
+      # du paquet (icônes des marqueurs de la carte...), que PyInstaller ne
+      # détecte pas tout seul par simple analyse des imports.
       - name: Construire CameraServerGUI.exe (sans fenêtre)
-        # --collect-all tkintermapview : embarque aussi les fichiers non-Python
-        # du paquet (icônes des marqueurs de la carte...), que PyInstaller ne
-        # détecte pas tout seul par simple analyse des imports. Sans ce flag,
-        # la carte du panneau "Localisation" peut manquer ses marqueurs ou
-        # planter à l'exécution dans l'.exe compilé.
+        shell: cmd
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
           --collect-all tkintermapview
-          --icon packaging\icons\camera_gui.ico
+          --icon "${{ github.workspace }}\packaging\icons\camera_gui.ico"
           --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
 
       - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)

@@ -20,17 +20,38 @@ rem  build avec --clean) : tout fichier qui y vivrait serait supprime.
 rem
 rem  Icones : les fichiers packaging\icons\camera_client.ico et
 rem  packaging\icons\camera_gui.ico doivent exister AVANT l'execution.
+rem
+rem  NOTE IMPORTANTE SUR LES CHEMINS D'ICONE :
+rem  PyInstaller resout --icon (et --add-data) RELATIVEMENT AU FICHIER .spec,
+rem  pas au repertoire courant. Comme on utilise --specpath build, un chemin
+rem  relatif "packaging\icons\..." serait cherche dans "build\packaging\icons\..."
+rem  (qui n'existe pas) -> FileNotFoundError. On construit donc un chemin
+rem  ABSOLU a partir de %~dp0 (repertoire du script) pour eviter le probleme.
 rem ===========================================================================
 cd /d "%~dp0..\.."
 
-rem --- Verification des icones (fichiers optionnels : on continue si absents) ---
-if not exist "packaging\icons\camera_client.ico" (
-  echo [Info] packaging\icons\camera_client.ico introuvable : le client sera
+rem --- Repertoire racine du projet (chemin absolu, sans \ final) ---
+set "PROJECT_ROOT=%~dp0..\.."
+pushd "%PROJECT_ROOT%"
+set "PROJECT_ROOT=%CD%"
+popd
+
+rem --- Chemins absolus vers les icones ---
+set "ICON_CLIENT=%PROJECT_ROOT%\packaging\icons\camera_client.ico"
+set "ICON_GUI=%PROJECT_ROOT%\packaging\icons\camera_gui.ico"
+
+rem --- Verification des icones ---
+set "HAS_ICON_CLIENT=1"
+set "HAS_ICON_GUI=1"
+if not exist "%ICON_CLIENT%" (
+  echo [Info] %ICON_CLIENT% introuvable : le client sera
   echo        construit SANS icone personnalisee ^(icone PyInstaller par defaut^).
+  set "HAS_ICON_CLIENT="
 )
-if not exist "packaging\icons\camera_gui.ico" (
-  echo [Info] packaging\icons\camera_gui.ico introuvable : la GUI sera
+if not exist "%ICON_GUI%" (
+  echo [Info] %ICON_GUI% introuvable : la GUI sera
   echo        construite SANS icone personnalisee ^(icone PyInstaller par defaut^).
+  set "HAS_ICON_GUI="
 )
 
 set "SERVER_URL=%~1"
@@ -66,22 +87,38 @@ rem sinon la construction de CameraServerGUI.exe echoue (Pillow, tkintermapview.
 python -m pip install --upgrade pyinstaller -r requirements.txt -r requirements-gui.txt || goto :error
 
 echo [2/4] Construction de CameraClient.exe (sans fenetre)...
-pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
-  --icon "packaging\icons\camera_client.ico" ^
-  --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
+if defined HAS_ICON_CLIENT (
+  pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
+    --icon "%ICON_CLIENT%" ^
+    --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
+) else (
+  pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
+    --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
+)
 
 echo [3/4] Construction de CameraClient-console.exe (diagnostic)...
-pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
-  --icon "packaging\icons\camera_client.ico" ^
-  --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
+if defined HAS_ICON_CLIENT (
+  pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
+    --icon "%ICON_CLIENT%" ^
+    --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
+) else (
+  pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
+    --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
+)
 
 echo [4/4] Construction de CameraServerGUI.exe (interface de controle)...
 rem --collect-all tkintermapview : embarque aussi les fichiers non-Python du
 rem paquet (icones de marqueur...), que PyInstaller ne detecte pas tout seul.
-pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
-  --collect-all tkintermapview ^
-  --icon "packaging\icons\camera_gui.ico" ^
-  --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+if defined HAS_ICON_GUI (
+  pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+    --collect-all tkintermapview ^
+    --icon "%ICON_GUI%" ^
+    --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+) else (
+  pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+    --collect-all tkintermapview ^
+    --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+)
 
 where ISCC >nul 2>nul
 if errorlevel 1 (
