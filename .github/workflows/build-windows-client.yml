@@ -79,10 +79,13 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      # IMPORTANT : PyInstaller résout --icon relativement au .spec (créé
-      # dans build/ à cause de --specpath), pas au répertoire courant.
-      # On passe donc un chemin ABSOLU via ${{ github.workspace }}, sinon
-      # PyInstaller cherche build/packaging/icons/... (inexistant).
+      # IMPORTANT (double piège PyInstaller avec --specpath) :
+      #   * --icon ET --add-data sont résolus RELATIVEMENT AU .SPEC,
+      #     c'est-à-dire dans build\ (à cause de --specpath build), PAS
+      #     au répertoire courant. Un chemin relatif "admin_bridge.py"
+      #     devient donc "build\admin_bridge.py" -> introuvable.
+      #   * On passe donc des chemins ABSOLUS via ${{ github.workspace }}
+      #     pour --icon ET pour --add-data.
       #
       # --add-data "admin_bridge.py;." : admin_bridge.py est lancé en
       # sous-processus par console_admin_windows.py, donc PAS importé par
@@ -92,7 +95,7 @@ jobs:
         shell: cmd
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient
-          --add-data "admin_bridge.py;."
+          --add-data "${{ github.workspace }}\admin_bridge.py;."
           --icon "${{ github.workspace }}\packaging\icons\camera_client.ico"
           --specpath build --workpath build\work-client-gui --distpath dist client.py
 
@@ -100,7 +103,7 @@ jobs:
         shell: cmd
         run: >
           pyinstaller --noconfirm --clean --onefile --console --name CameraClient-console
-          --add-data "admin_bridge.py;."
+          --add-data "${{ github.workspace }}\admin_bridge.py;."
           --icon "${{ github.workspace }}\packaging\icons\camera_client.ico"
           --specpath build --workpath build\work-client-console --distpath dist client.py
 

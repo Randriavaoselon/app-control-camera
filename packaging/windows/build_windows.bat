@@ -22,20 +22,19 @@ rem
 rem  Icones : les fichiers packaging\icons\camera_client.ico et
 rem  packaging\icons\camera_gui.ico doivent exister AVANT l'execution.
 rem
-rem  NOTE IMPORTANTE SUR LES CHEMINS D'ICONE :
-rem  PyInstaller resout --icon (et --add-data) RELATIVEMENT AU FICHIER .spec,
+rem  NOTE IMPORTANTE SUR LES CHEMINS D'ICONE ET DE DONNEES :
+rem  PyInstaller resout --icon ET --add-data RELATIVEMENT AU FICHIER .spec,
 rem  pas au repertoire courant. Comme on utilise --specpath build, un chemin
 rem  relatif "packaging\icons\..." serait cherche dans "build\packaging\icons\..."
-rem  (qui n'existe pas) -> FileNotFoundError. On construit donc un chemin
-rem  ABSOLU a partir de %~dp0 (repertoire du script) pour eviter le probleme.
+rem  (qui n'existe pas) -> FileNotFoundError. Idem pour "admin_bridge.py"
+rem  qui deviendrait "build\admin_bridge.py". On construit donc des chemins
+rem  ABSOLUS a partir de %PROJECT_ROOT% pour eviter le probleme.
 rem
 rem  NOTE v9 : le module console_admin_windows.py (CMD Admin via UAC) et
 rem  admin_bridge.py (pont eleve) sont AUTOMATIQUEMENT embarques par
-rem  PyInstaller car ils sont importes par client.py. Aucune option
-rem  --add-data n'est necessaire : le wrapper admin_bridge.py est lance
-rem  par sys.executable (pythonw.exe) en mode dev, mais en mode .exe
-rem  PyInstaller, c'est le MEME .exe qui est relance avec des arguments
-rem  speciaux (voir console_admin_windows.py, _bootstrap_mode()).
+rem  PyInstaller car ils sont importes par client.py. admin_bridge.py,
+rem  lui, est lance en sous-processus (donc PAS importe) : il faut
+rem  l'embarquer explicitement via --add-data.
 rem ===========================================================================
 cd /d "%~dp0..\.."
 
@@ -45,9 +44,10 @@ pushd "%PROJECT_ROOT%"
 set "PROJECT_ROOT=%CD%"
 popd
 
-rem --- Chemins absolus vers les icones ---
+rem --- Chemins absolus vers les icones et le pont UAC ---
 set "ICON_CLIENT=%PROJECT_ROOT%\packaging\icons\camera_client.ico"
 set "ICON_GUI=%PROJECT_ROOT%\packaging\icons\camera_gui.ico"
+set "BRIDGE_PATH=%PROJECT_ROOT%\admin_bridge.py"
 
 rem --- Verification des icones ---
 set "HAS_ICON_CLIENT=1"
@@ -61,6 +61,13 @@ if not exist "%ICON_GUI%" (
   echo [Info] %ICON_GUI% introuvable : la GUI sera
   echo        construite SANS icone personnalisee ^(icone PyInstaller par defaut^).
   set "HAS_ICON_GUI="
+)
+
+rem --- Verification du pont UAC ---
+if not exist "%BRIDGE_PATH%" (
+  echo ERREUR : %BRIDGE_PATH% est introuvable ^(requis pour CMD Admin^).
+  if not defined CI pause
+  exit /b 1
 )
 
 set "SERVER_URL=%~1"
@@ -96,31 +103,27 @@ rem sinon la construction de CameraServerGUI.exe echoue (Pillow, tkintermapview.
 python -m pip install --upgrade pyinstaller -r requirements.txt -r requirements-gui.txt || goto :error
 
 echo [2/4] Construction de CameraClient.exe (sans fenetre)...
-rem --add-data "admin_bridge.py;." : en mode .exe PyInstaller, admin_bridge.py
-rem n'est PAS importe par client.py (c'est un script autonome lance en
-rem sous-processus par console_admin_windows.py). PyInstaller ne le
-rem detecte donc pas automatiquement : il faut l'embarquer explicitement
-rem dans le bundle. Au runtime, il sera extrait dans sys._MEIPASS.
+rem --add-data "%BRIDGE_PATH%;." : chemin ABSOLU (cf. note en tete de script).
 if defined HAS_ICON_CLIENT (
   pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
-    --add-data "admin_bridge.py;." ^
+    --add-data "%BRIDGE_PATH%;." ^
     --icon "%ICON_CLIENT%" ^
     --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
 ) else (
   pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
-    --add-data "admin_bridge.py;." ^
+    --add-data "%BRIDGE_PATH%;." ^
     --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
 )
 
 echo [3/4] Construction de CameraClient-console.exe (diagnostic)...
 if defined HAS_ICON_CLIENT (
   pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
-    --add-data "admin_bridge.py;." ^
+    --add-data "%BRIDGE_PATH%;." ^
     --icon "%ICON_CLIENT%" ^
     --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
 ) else (
   pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
-    --add-data "admin_bridge.py;." ^
+    --add-data "%BRIDGE_PATH%;." ^
     --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
 )
 
