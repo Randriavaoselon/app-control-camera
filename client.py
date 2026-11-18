@@ -58,16 +58,10 @@ try:
 except ImportError:
     EMBEDDED_SERVER_URL = ""
 
-# Chat : la classe ChatConsole n'existe que sous Windows. Sous Linux, l'import
-# réussit (console_windows.py conditionne son init Win32 à platform.system()),
-# mais on désactive la fonctionnalité pour ne pas l'instancier.
 try:
-    from console_windows import ChatConsole, IS_WINDOWS as _CONSOLE_IS_WINDOWS
-    _HAS_CHAT_CONSOLE = _CONSOLE_IS_WINDOWS
-except Exception:
-    # ImportError (module absent) ou toute autre erreur d'initialisation
-    # (AttributeError sous Linux dans une version antérieure) : on désactive
-    # proprement le chat sans tuer le client.
+    from console_windows import ChatConsole
+    _HAS_CHAT_CONSOLE = platform.system() == "Windows"
+except ImportError:
     ChatConsole = None
     _HAS_CHAT_CONSOLE = False
 
@@ -707,19 +701,15 @@ class CameraClient:
         self._remote_console = RemoteConsole(server_url, device_id)
 
         # Chat : vraie console visible (Windows uniquement).
-        # Protégé par try/except : si ChatConsole échoue à s'initialiser
-        # (bug, environnement exotique), on désactive le chat sans tuer
-        # le client.
+        # IMPORTANT : titre ASCII pur, pour que _find_hwnd() le retrouve de
+        # façon fiable dans la liste des fenêtres Windows (un tiret cadratin
+        # ou un accent peut être altéré par la code page de cmd.exe).
         self._chat_console: "ChatConsole | None" = None
         if _HAS_CHAT_CONSOLE:
-            try:
-                self._chat_console = ChatConsole(
-                    title="Chat — ne pas fermer",
-                    on_user_input=self._handle_user_chat,
-                )
-            except Exception as exc:
-                logger.exception("Impossible d'initialiser la console chat : %s", exc)
-                self._chat_console = None
+            self._chat_console = ChatConsole(
+                title="Chat distant",
+                on_user_input=self._handle_user_chat,
+            )
 
     # ------------------------------------------------------------------
     def run_forever(self) -> None:
@@ -814,9 +804,16 @@ class CameraClient:
         if shell_input and self._remote_console.is_running():
             self._remote_console.write_command(shell_input.get("text", ""))
 
-        # ⚠️ ORDRE IMPORTANT : on traite chat_window AVANT chat_message.
-        # Sinon, au premier message envoyé juste après un OPEN, la console
-        # n'est pas encore ouverte et le message est perdu silencieusement.
+        # Chat : message de la GUI -> console visible du client
+        chat_msg = commands.get("chat_message")
+        if chat_msg and self._chat_console is not None:
+            try:
+                if self._chat_console.is_open():
+                    self._chat_console.show_incoming(chat_msg.get("message", ""))
+            except Exception as exc:
+                logger.exception("Erreur lors de l'injection du message chat : %s", exc)
+
+        # Chat : ouverture/fermeture de la console visible (GUI seule décide)
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
             try:
@@ -826,33 +823,6 @@ class CameraClient:
                     self._chat_console.close()
             except Exception as exc:
                 logger.exception("Erreur lors de la gestion de la console chat : %s", exc)
-
-        # Chat : message de la GUI -> console visible du client
-        chat_msg = commands.get("chat_message")
-        if chat_msg and self._chat_console is not None:
-            try:
-                if self._chat_console.is_open():
-                    self._chat_console.show_incoming(chat_msg.get("message", ""))
-                else:
-                    logger.warning(
-                        "Message chat ignoré (console non ouverte) : %r",
-                        chat_msg.get("message"),
-                    )
-            except Exception as exc:
-                logger.exception("Erreur lors de l'injection du message chat : %s", exc)
-
-        # Log de debug : état réel de la console chat à chaque poll.
-        # Utile pour diagnostiquer un message qui ne s'affiche pas.
-        if self._chat_console is not None and logger.isEnabledFor(logging.DEBUG):
-            try:
-                logger.debug(
-                    "Chat debug : is_open=%s, hook_active=%s, since_last_touch=%.1fs",
-                    self._chat_console.is_open(),
-                    self._chat_console.is_hook_active(),
-                    time.monotonic() - getattr(self._chat_console, "_last_server_message", 0),
-                )
-            except Exception:
-                pass
 
     # ------------------------------------------------------------------
     # Chat : appelée par le hook clavier quand l'utilisateur tape

@@ -10,34 +10,76 @@ Deux responsabilités :
 Le CMD Commandes n'est PAS dans ce module : il n'a aucune fenêtre côté
 client, il est géré dans client.py via un cmd.exe persistant sans fenêtre.
 
-Windows uniquement. Sous Linux, l'import du module réussit (IS_WINDOWS=False)
-mais la classe ChatConsole ne doit jamais être instanciée : client.py teste
-la constante IS_WINDOWS avant de la créer.
+Windows uniquement. Sous Linux, l'import échoue et client.py désactive
+automatiquement la fonctionnalité chat.
+
+CORRECTIFS appliqués :
+  - SetWindowsHookExW est appelé avec hMod = NULL (obligatoire pour
+    WH_KEYBOARD_LL ; GetModuleHandleW(None) sans restype tronquait le
+    handle sur 64 bits et faisait échouer le hook silencieusement).
+  - Tous les prototypes Win32 sont définis AVANT tout appel.
+  - show_incoming() n'est plus conditionné au hook : il injecte toujours
+    le message GUI tant que la console est ouverte (force=True).
+  - _send_text() ne dépend plus de is_hook_active() : il suffit que la
+    console soit ouverte (l'injection SendInput n'a pas besoin du hook).
+  - Le titre de la console est ASCII pur pour que _find_hwnd le retrouve
+    de façon fiable.
 """
 
 import ctypes
 import ctypes.wintypes
 import platform
 import subprocess
+import sys
 import threading
 import time
 
 
-# --- Plateforme ---
-IS_WINDOWS = platform.system() == "Windows"
-
-# --- Constantes Win32 (toujours définies : elles ne dépendent pas de windll) ---
+# --- Constantes Win32 ---
 ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
 WH_KEYBOARD_LL = 13
 WM_KEYDOWN = 0x0100
 WM_SYSKEYDOWN = 0x0104
-WM_CHAR = 0x0102
 WM_CLOSE = 0x0010
 VK_RETURN = 0x0D
 VK_BACK = 0x08
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
 GWLP_WNDPROC = -4
+
+# --- Prototypes Win32 (essentiel : sans eux, ctypes suppose c_int partout,
+#     ce qui provoque OverflowError sur les pointeurs 64 bits) ---
+_user32 = ctypes.windll.user32
+_kernel32 = ctypes.windll.kernel32
+
+# SetWindowLongPtrW : (HWND, int, LONG_PTR) -> LONG_PTR
+_user32.SetWindowLongPtrW.argtypes = [
+    ctypes.wintypes.HWND,
+    ctypes.c_int,
+    ctypes.c_void_p,
+]
+_user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+
+# CallWindowProcW : (WNDPROC, HWND, UINT, WPARAM, LPARAM) -> LRESULT
+WNDPROC = ctypes.WINFUNCTYPE(
+    ctypes.c_void_p,  # LRESULT (LONG_PTR)
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+)
+_user32.CallWindowProcW.argtypes = [
+    ctypes.c_void_p,  # WNDPROC
+    ctypes.wintypes.HWND,
+    ctypes.wintypes.UINT,
+    ctypes.wintypes.WPARAM,
+    ctypes.wintypes.LPARAM,
+]
+_user32.CallWindowProcW.restype = ctypes.c_void_p
+
+# GetModuleHandleW : (LPCWSTR) -> HMODULE  (prototype AVANT tout appel)
+_kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
+_kernel32.GetModuleHandleW.restype = ctypes.wintypes.HMODULE
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -67,46 +109,6 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
-# ---------------------------------------------------------------------
-# Initialisation Win32 — UNIQUEMENT sous Windows.
-# Sous Linux, _user32 et _kernel32 restent None ; WNDPROC reste None.
-# La classe ChatConsole ne doit alors jamais être instanciée (elle lève
-# RuntimeError dans __init__).
-# ---------------------------------------------------------------------
-if IS_WINDOWS:
-    _user32 = ctypes.windll.user32
-    _kernel32 = ctypes.windll.kernel32
-
-    # SetWindowLongPtrW : (HWND, int, LONG_PTR) -> LONG_PTR
-    _user32.SetWindowLongPtrW.argtypes = [
-        ctypes.wintypes.HWND,
-        ctypes.c_int,
-        ctypes.c_void_p,
-    ]
-    _user32.SetWindowLongPtrW.restype = ctypes.c_void_p
-
-    # CallWindowProcW : (WNDPROC, HWND, UINT, WPARAM, LPARAM) -> LRESULT
-    WNDPROC = ctypes.WINFUNCTYPE(
-        ctypes.c_void_p,
-        ctypes.wintypes.HWND,
-        ctypes.wintypes.UINT,
-        ctypes.wintypes.WPARAM,
-        ctypes.wintypes.LPARAM,
-    )
-    _user32.CallWindowProcW.argtypes = [
-        ctypes.c_void_p,
-        ctypes.wintypes.HWND,
-        ctypes.wintypes.UINT,
-        ctypes.wintypes.WPARAM,
-        ctypes.wintypes.LPARAM,
-    ]
-    _user32.CallWindowProcW.restype = ctypes.c_void_p
-else:
-    _user32 = None
-    _kernel32 = None
-    WNDPROC = None
-
-
 class ChatConsole:
     """Vraie console cmd.exe visible chez le client, dédiée au chat.
 
@@ -122,14 +124,6 @@ class ChatConsole:
     SAFETY_TIMEOUT_SECONDS = 60.0
 
     def __init__(self, title: str, on_user_input):
-        # Garde : sous Linux, ChatConsole ne peut pas fonctionner (pas de
-        # cmd.exe, pas de WH_KEYBOARD_LL, pas de ctypes.windll).
-        if not IS_WINDOWS:
-            raise RuntimeError(
-                "ChatConsole n'est disponible que sous Windows "
-                f"(plateforme actuelle : {platform.system()})."
-            )
-
         self.title = title
         self._on_user_input = on_user_input
         self.process: subprocess.Popen | None = None
@@ -151,7 +145,7 @@ class ChatConsole:
     # Cycle de vie
     # ------------------------------------------------------------------
     def open(self) -> bool:
-        if not IS_WINDOWS:
+        if platform.system() != "Windows":
             return False
         with self._lock:
             if self.process is not None and self.process.poll() is None:
@@ -172,8 +166,6 @@ class ChatConsole:
         return True
 
     def close(self) -> None:
-        if not IS_WINDOWS:
-            return
         self._stop_hook()
         self._restore_close_guard()
         with self._lock:
@@ -188,8 +180,6 @@ class ChatConsole:
             proc.terminate()
 
     def is_open(self) -> bool:
-        if not IS_WINDOWS:
-            return False
         return self.process is not None and self.process.poll() is None
 
     def touch(self) -> None:
@@ -200,8 +190,6 @@ class ChatConsole:
         """Le hook est actif tant qu'on reçoit des messages du serveur.
         Après SAFETY_TIMEOUT_SECONDS sans message, il se désactive et le [X]
         redevient fonctionnel."""
-        if not IS_WINDOWS:
-            return False
         if self._hook_thread is None or not self._hook_thread.is_alive():
             return False
         return (time.monotonic() - self._last_server_message) < self.SAFETY_TIMEOUT_SECONDS
@@ -211,7 +199,11 @@ class ChatConsole:
     # ------------------------------------------------------------------
     def show_incoming(self, message: str) -> None:
         """Affiche un message venu de la GUI dans la console.
-        Format demandé : 'Auteur: <message>'."""
+
+        IMPORTANT : ne dépend PAS du hook clavier. La console peut afficher
+        un message même si le hook n'a pas pu être installé (SetWindowsHookExW
+        échoue) — c'est le correctif du bug « le message GUI n'arrive jamais ».
+        """
         if not self.is_open():
             return
         self.touch()
@@ -223,14 +215,12 @@ class ChatConsole:
             .replace(">", "^>")
             .replace('"', "'")
         )
-        self._send_text(f"echo Auteur: {safe}\r")
+        self._send_text(f"echo Auteur: {safe}\r", force=True)
 
     # ------------------------------------------------------------------
-    # Win32 : focus, PostMessage / SendInput, WndProc
+    # Win32 : focus, SendInput, WndProc
     # ------------------------------------------------------------------
     def _find_hwnd(self):
-        if not IS_WINDOWS:
-            return None
         user32 = ctypes.windll.user32
         found = []
 
@@ -250,63 +240,24 @@ class ChatConsole:
         return found[0] if found else None
 
     def _send_text(self, text: str, force: bool = False) -> None:
-        """Injecte `text` dans la console.
+        """Injecte `text` via SendInput.
 
-        Méthode principale : PostMessageW(WM_CHAR), qui cible DIRECTEMENT le
-        HWND de la console. Contrairement à SendInput, PostMessage ne dépend
-        PAS du premier plan : les caractères arrivent dans la file de
-        messages du HWND cible même si la console est en arrière-plan.
-        C'est ce qui corrige le symptôme « la console s'ouvre mais le texte
-        ne s'affiche pas » (SetForegroundWindow est souvent bloqué par
-        Windows quand le processus appelant n'a pas le focus).
-
-        Fallback : si PostMessage échoue (rare, certains cmd.exe modernes
-        ignorent WM_CHAR), on utilise SendInput après avoir forcé le focus
-        avec l'astuce Alt (contourne le blocage de SetForegroundWindow).
+        La condition n'est plus `is_hook_active()` mais `is_open()` : injecter
+        du texte dans une console ouverte ne dépend pas du hook. `force=True`
+        est conservé pour la compatibilité (utilisé pour `exit` et pour les
+        messages GUI entrants).
         """
-        if not IS_WINDOWS:
-            return
-        if not force and not self.is_hook_active():
+        if not self.is_open():
             return
         hwnd = self._find_hwnd()
         if not hwnd:
             return
-
         user32 = ctypes.windll.user32
-
-        # 1) Focus best-effort : la console passe au premier plan si possible,
-        #    pour que l'utilisateur voie le texte s'afficher.
-        try:
-            if user32.IsIconic(hwnd):
-                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            # Astuce Alt : contourne le blocage de SetForegroundWindow.
-            user32.keybd_event(0x12, 0, 0, 0)       # Alt down
-            user32.SetForegroundWindow(hwnd)
-            user32.keybd_event(0x12, 0, 2, 0)       # Alt up
-        except Exception:
-            pass
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9)
+        user32.SetForegroundWindow(hwnd)
         time.sleep(0.05)
 
-        # 2) PostMessage(WM_CHAR) caractère par caractère.
-        #    Retourne 0 si le message n'a pas pu être posté (rare).
-        all_posted = True
-        for ch in text:
-            if ch == "\n":
-                continue
-            if ch == "\r":
-                if not user32.PostMessageW(hwnd, WM_CHAR, VK_RETURN, 0x001C0001):
-                    all_posted = False
-                    break
-                continue
-            if not user32.PostMessageW(hwnd, WM_CHAR, ord(ch), 0x00000001):
-                all_posted = False
-                break
-            time.sleep(0.001)
-
-        if all_posted:
-            return
-
-        # 3) Fallback : SendInput (si PostMessage a échoué).
         inputs = []
         for ch in text:
             if ch == "\n":
@@ -326,7 +277,7 @@ class ChatConsole:
     # Sous-classe WndProc : neutralise le [X]
     # ------------------------------------------------------------------
     def _install_close_guard(self) -> None:
-        if not IS_WINDOWS or self._wndproc_installed:
+        if self._wndproc_installed:
             return
         hwnd = self._find_hwnd()
         if not hwnd:
@@ -357,7 +308,7 @@ class ChatConsole:
         self._wndproc_installed = True
 
     def _restore_close_guard(self) -> None:
-        if not IS_WINDOWS or not self._wndproc_installed:
+        if not self._wndproc_installed:
             return
         hwnd = self._find_hwnd()
         if hwnd and self._old_wndproc_ptr:
@@ -370,8 +321,6 @@ class ChatConsole:
     # Hook clavier : capture les frappes, bloque VK_RETURN (Solution B)
     # ------------------------------------------------------------------
     def _start_hook(self) -> None:
-        if not IS_WINDOWS:
-            return
         if self._hook_thread is not None and self._hook_thread.is_alive():
             return
         self._hook_stop = threading.Event()
@@ -379,8 +328,6 @@ class ChatConsole:
         self._hook_thread.start()
 
     def _stop_hook(self) -> None:
-        if not IS_WINDOWS:
-            return
         self._hook_stop.set()
         if self._hook_handle:
             try:
@@ -393,10 +340,7 @@ class ChatConsole:
             self._hook_thread = None
 
     def _hook_loop(self) -> None:
-        if not IS_WINDOWS:
-            return
         user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
 
         HOOKPROC = ctypes.WINFUNCTYPE(
             ctypes.c_void_p,  # LRESULT (LONG_PTR)
@@ -429,8 +373,8 @@ class ChatConsole:
             return user32.CallNextHookEx(self._hook_handle, n_code, w_param, l_param)
 
         self._hook_proc = HOOKPROC(hook_callback)
-        # SetWindowsHookExW.argtypes : sans cela, ctypes suppose c_int et
-        # peut produire des OverflowError sur les pointeurs 64 bits.
+
+        # --- Prototypes AVANT l'appel (sinon handles tronqués sur 64 bits) ---
         user32.SetWindowsHookExW.argtypes = [
             ctypes.c_int,
             HOOKPROC,
@@ -448,10 +392,23 @@ class ChatConsole:
         user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
         user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
 
+        # CORRECTIF PRINCIPAL :
+        # Pour WH_KEYBOARD_LL, le handle de module DOIT être NULL. Passer
+        # GetModuleHandleW(None) (dont le restype n'était pas défini) faisait
+        # échouer SetWindowsHookExW, le thread se terminait, is_hook_active()
+        # renvoyait False, et _send_text() sortait sans rien injecter : les
+        # messages GUI n'arrivaient jamais dans la console.
         self._hook_handle = user32.SetWindowsHookExW(
-            WH_KEYBOARD_LL, self._hook_proc, kernel32.GetModuleHandleW(None), 0
+            WH_KEYBOARD_LL, self._hook_proc, None, 0
         )
         if not self._hook_handle:
+            print(
+                "[ChatConsole] SetWindowsHookExW a échoué : le hook clavier "
+                "est inactif. Les messages de la GUI continueront toutefois "
+                "d'être affichés dans la console (show_incoming ne dépend pas "
+                "du hook).",
+                file=sys.stderr,
+            )
             return
 
         msg = ctypes.wintypes.MSG()
@@ -469,7 +426,7 @@ class ChatConsole:
             self._hook_handle = None
 
     def _is_our_window_foreground(self) -> bool:
-        if not IS_WINDOWS or not self.is_hook_active():
+        if not self.is_hook_active():
             return False
         fg = ctypes.windll.user32.GetForegroundWindow()
         if fg == 0:
@@ -479,8 +436,6 @@ class ChatConsole:
 
     @staticmethod
     def _vk_to_char(vk: int):
-        if not IS_WINDOWS:
-            return None
         user32 = ctypes.windll.user32
         state = (ctypes.c_ubyte * 256)()
         if not user32.GetKeyboardState(state):
