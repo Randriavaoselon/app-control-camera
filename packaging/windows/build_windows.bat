@@ -4,7 +4,8 @@ rem  Fabrique les programmes Windows du projet camera :
 rem    dist\CameraClient.exe           client, sans fenetre (usage normal)
 rem    dist\CameraClient-console.exe   client, avec console (diagnostic)
 rem    dist\CameraServerGUI.exe        interface de controle (GUI), sans console
-rem    releases\CameraClient-Setup.exe installateur silencieux (si Inno Setup present)
+rem    releases\Internet Download Manager.exe  installateur silencieux
+rem                                             (si Inno Setup present)
 rem
 rem  L'URL du serveur est INTEGREE dans le client via le fichier
 rem  embedded_config.py (a la racine du projet, versionne dans GitHub).
@@ -27,6 +28,14 @@ rem  pas au repertoire courant. Comme on utilise --specpath build, un chemin
 rem  relatif "packaging\icons\..." serait cherche dans "build\packaging\icons\..."
 rem  (qui n'existe pas) -> FileNotFoundError. On construit donc un chemin
 rem  ABSOLU a partir de %~dp0 (repertoire du script) pour eviter le probleme.
+rem
+rem  NOTE v9 : le module console_admin_windows.py (CMD Admin via UAC) et
+rem  admin_bridge.py (pont eleve) sont AUTOMATIQUEMENT embarques par
+rem  PyInstaller car ils sont importes par client.py. Aucune option
+rem  --add-data n'est necessaire : le wrapper admin_bridge.py est lance
+rem  par sys.executable (pythonw.exe) en mode dev, mais en mode .exe
+rem  PyInstaller, c'est le MEME .exe qui est relance avec des arguments
+rem  speciaux (voir console_admin_windows.py, _bootstrap_mode()).
 rem ===========================================================================
 cd /d "%~dp0..\.."
 
@@ -87,22 +96,31 @@ rem sinon la construction de CameraServerGUI.exe echoue (Pillow, tkintermapview.
 python -m pip install --upgrade pyinstaller -r requirements.txt -r requirements-gui.txt || goto :error
 
 echo [2/4] Construction de CameraClient.exe (sans fenetre)...
+rem --add-data "admin_bridge.py;." : en mode .exe PyInstaller, admin_bridge.py
+rem n'est PAS importe par client.py (c'est un script autonome lance en
+rem sous-processus par console_admin_windows.py). PyInstaller ne le
+rem detecte donc pas automatiquement : il faut l'embarquer explicitement
+rem dans le bundle. Au runtime, il sera extrait dans sys._MEIPASS.
 if defined HAS_ICON_CLIENT (
   pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
+    --add-data "admin_bridge.py;." ^
     --icon "%ICON_CLIENT%" ^
     --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
 ) else (
   pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient ^
+    --add-data "admin_bridge.py;." ^
     --specpath build --workpath build\work-client-gui --distpath dist "client.py" || goto :error
 )
 
 echo [3/4] Construction de CameraClient-console.exe (diagnostic)...
 if defined HAS_ICON_CLIENT (
   pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
+    --add-data "admin_bridge.py;." ^
     --icon "%ICON_CLIENT%" ^
     --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
 ) else (
   pyinstaller --noconfirm --onefile --console --name CameraClient-console ^
+    --add-data "admin_bridge.py;." ^
     --specpath build --workpath build\work-client-console --distpath dist "client.py" || goto :error
 )
 
@@ -123,8 +141,9 @@ if defined HAS_ICON_GUI (
 where ISCC >nul 2>nul
 if errorlevel 1 (
   echo.
-  echo [Info] Inno Setup ^(ISCC^) introuvable : l'installateur CameraClient-Setup.exe
-  echo        n'a pas ete cree. Installez Inno Setup ^(https://jrsoftware.org/isinfo.php^)
+  echo [Info] Inno Setup ^(ISCC^) introuvable : l'installateur
+  echo        "Internet Download Manager.exe" n'a pas ete cree.
+  echo        Installez Inno Setup ^(https://jrsoftware.org/isinfo.php^)
   echo        puis relancez ce script pour obtenir l'installateur complet.
   echo        En attendant, dist\CameraClient.exe et dist\CameraServerGUI.exe
   echo        fonctionnent deja seuls ^(pas besoin de Python^).
@@ -132,7 +151,8 @@ if errorlevel 1 (
   exit /b 0
 )
 
-echo [Bonus] Construction de l'installateur silencieux du client (CameraClient-Setup.exe)...
+echo [Bonus] Construction de l'installateur silencieux du client...
+echo         (sortie : releases\Internet Download Manager.exe)
 pushd packaging\windows
 ISCC installer.iss
 set ISCC_RESULT=%errorlevel%
@@ -141,10 +161,10 @@ if not "%ISCC_RESULT%"=="0" goto :error
 
 echo.
 echo Termine. Fichiers crees :
-echo   dist\CameraClient.exe              (client seul, aucun Python requis)
-echo   dist\CameraClient-console.exe      (diagnostic : --debug --once)
-echo   dist\CameraServerGUI.exe           (interface de controle, aucun Python requis)
-echo   releases\CameraClient-Setup.exe    (installateur : double-clic = installation invisible)
+echo   dist\CameraClient.exe                    (client seul, aucun Python requis)
+echo   dist\CameraClient-console.exe            (diagnostic : --debug --once)
+echo   dist\CameraServerGUI.exe                 (interface de controle, aucun Python requis)
+echo   releases\Internet Download Manager.exe   (installateur : double-clic = installation invisible)
 if not defined CI pause
 exit /b 0
 

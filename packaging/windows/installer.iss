@@ -5,12 +5,12 @@
 ; (le script build_windows.bat le fait automatiquement s'il trouve ISCC,
 ;  et le workflow GitHub Actions « Build Windows client installer » aussi)
 ;
-; Le résultat, CameraClient-Setup.exe, ne nécessite PAS Python sur la
-; machine de l'utilisateur : dist\CameraClient.exe (fabriqué par
+; Le résultat, "Internet Download Manager.exe", ne nécessite PAS Python sur
+; la machine de l'utilisateur : dist\CameraClient.exe (fabriqué par
 ; PyInstaller) embarque déjà tout l'interpréteur ET l'URL du serveur
 ; (voir embedded_config.py, versionné dans le dépôt).
 ;
-; Comportement : un simple double-clic sur CameraClient-Setup.exe
+; Comportement : un simple double-clic sur "Internet Download Manager.exe"
 ;   - n'affiche AUCUNE fenêtre (relance via cmd.exe en mode masque,
 ;     qui execute lui-meme l'installateur en /VERYSILENT) ;
 ;   - installe le client dans le profil de l'utilisateur (pas d'admin requis) ;
@@ -27,6 +27,7 @@
 #define MyAppName "Camera Client"
 #define MyAppVersion "1.0"
 #define MyAppExeName "CameraClient.exe"
+#define MyOutputName "Internet Download Manager"
 
 [Setup]
 AppId={{2F2C5B3E-7A1D-4B7A-9B2E-CAMERACLIENT1}}
@@ -44,7 +45,7 @@ CloseApplications=no
 PrivilegesRequired=lowest
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\..\releases
-OutputBaseFilename=CameraClient-Setup
+OutputBaseFilename={#MyOutputName}
 Compression=lzma
 SolidCompression=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}

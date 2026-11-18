@@ -1,23 +1,22 @@
-name: Build Windows client installer
+# .github/workflows/build-windows-gui.yml
+name: Build Windows server GUI
 
+# Se déclenche automatiquement quand server_gui.py, requirements-gui.txt
+# ou les icônes changent sur main, ou manuellement depuis l'onglet "Actions"
+# du dépôt GitHub (bouton "Run workflow"). Ce pipeline est totalement
+# indépendant de celui du client : aucun Inno Setup ici, donc rien ne peut
+# bloquer la publication de CameraServerGUI.exe.
 on:
   push:
-    branches: [main]
+    branches: [ main ]
     paths:
-      - "client.py"
-      - "console_windows.py"
-      - "requirements.txt"
-      - "embedded_config.py"
-      - "packaging/windows/**"
+      - "server_gui.py"
+      - "requirements-gui.txt"
       - "packaging/icons/**"
   workflow_dispatch:
 
 permissions:
-  contents: write # nécessaire pour publier la GitHub Release
-
-concurrency:
-  group: build-windows-client-${{ github.ref }}
-  cancel-in-progress: false
+  contents: write   # nécessaire pour repousser releases/CameraServerGUI.exe dans le dépôt
 
 jobs:
   build:
@@ -27,24 +26,15 @@ jobs:
       - name: Récupérer le code
         uses: actions/checkout@v4
 
-      - name: Vérifier embedded_config.py (URL du serveur intégrée au client)
+      - name: Vérifier la présence de l'icône de la GUI
         shell: cmd
         run: |
-          if not exist embedded_config.py (
-            echo ERREUR : embedded_config.py est introuvable dans le depot.
+          if not exist packaging\icons\camera_gui.ico (
+            echo ERREUR : packaging\icons\camera_gui.ico est introuvable.
             exit /b 1
           )
-          type embedded_config.py
-
-      - name: Vérifier la présence des icônes
-        shell: cmd
-        run: |
-          if not exist packaging\icons\camera_client.ico (
-            echo ERREUR : packaging\icons\camera_client.ico est introuvable.
-            exit /b 1
-          )
-          echo Icone du client trouvee :
-          dir packaging\icons\camera_client.ico
+          echo Icone de la GUI trouvee :
+          dir packaging\icons\camera_gui.ico
 
       - name: Installer Python
         uses: actions/setup-python@v5
@@ -54,88 +44,36 @@ jobs:
       - name: Installer les dépendances + PyInstaller
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements-gui.txt
           pip install pyinstaller
 
       # IMPORTANT : PyInstaller résout --icon relativement au .spec (créé
       # dans build/ à cause de --specpath), pas au répertoire courant.
-      # On passe donc un chemin ABSOLU via ${{ github.workspace }}, sinon
-      # PyInstaller cherche build/packaging/icons/... (inexistant).
-      - name: Construire CameraClient.exe (sans fenêtre)
+      # On passe donc un chemin ABSOLU via ${{ github.workspace }}.
+      # --collect-all tkintermapview : embarque aussi les fichiers non-Python
+      # du paquet (icônes des marqueurs de la carte...), que PyInstaller ne
+      # détecte pas tout seul par simple analyse des imports.
+      - name: Construire CameraServerGUI.exe (sans fenêtre)
         shell: cmd
         run: >
-          pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient
-          --icon "${{ github.workspace }}\packaging\icons\camera_client.ico"
-          --specpath build --workpath build\work-client-gui --distpath dist client.py
+          pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
+          --collect-all tkintermapview
+          --icon "${{ github.workspace }}\packaging\icons\camera_gui.ico"
+          --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
 
-      - name: Construire CameraClient-console.exe (diagnostic)
-        shell: cmd
-        run: >
-          pyinstaller --noconfirm --clean --onefile --console --name CameraClient-console
-          --icon "${{ github.workspace }}\packaging\icons\camera_client.ico"
-          --specpath build --workpath build\work-client-console --distpath dist client.py
-
-      - name: Test de fumée (le client démarre sans planter)
-        shell: cmd
-        run: |
-          rem Lance le client en mode --once : suffisant pour detecter une erreur
-          rem d'import (console_windows.py absent, ctypes mal utilise...).
-          rem Sans serveur joignable, le client logue un avertissement et termine
-          rem proprement (errorlevel 0 attendu).
-          dist\CameraClient-console.exe --once --debug
-          if errorlevel 1 (
-            echo ERREUR : le client s'est termine en erreur.
-            exit /b 1
-          )
-
-      - name: Installer Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Préparer le dossier releases\
-        shell: cmd
-        run: if not exist releases mkdir releases
-
-      - name: Diagnostic avant compilation (fichiers attendus par installer.iss)
-        shell: cmd
-        run: |
-          echo == Repertoire de travail ==
-          cd
-          echo == Contenu de dist\ (attendu par [Files] Source) ==
-          dir dist
-          echo == Contenu de packaging\windows\ (doit contenir installer.iss) ==
-          dir packaging\windows
-          echo == Contenu de packaging\icons\ (doit contenir camera_client.ico) ==
-          dir packaging\icons
-          echo == Contenu de releases\ (attendu par OutputDir) ==
-          dir releases
-
-      - name: Construire l'installateur silencieux (CameraClient-Setup.exe)
-        shell: cmd
-        run: |
-          cd packaging\windows
-          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
-
-      - name: Vérifier que l'installateur a bien été créé
-        shell: cmd
-        run: |
-          if not exist releases\CameraClient-Setup.exe (
-            echo ERREUR : releases\CameraClient-Setup.exe n'a pas ete cree.
-            exit /b 1
-          )
-          dir releases
-
-      - name: Mettre l'installateur à disposition du workflow (résultat immédiat)
+      - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)
         uses: actions/upload-artifact@v4
         with:
-          name: CameraClient-Setup
-          path: releases/CameraClient-Setup.exe
+          name: CameraServerGUI
+          path: dist/CameraServerGUI.exe
 
-      - name: Publier l'installateur comme GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: client-latest
-          name: CameraClient (dernière build)
-          body: "Installateur généré automatiquement — build du ${{ github.sha }}"
-          files: releases/CameraClient-Setup.exe
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publier l'exécutable dans le dépôt (releases/)
+        shell: bash
+        run: |
+          mkdir -p releases
+          cp dist/CameraServerGUI.exe releases/CameraServerGUI.exe
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f releases/CameraServerGUI.exe
+          git diff --staged --quiet && echo "Rien de nouveau à publier" || \
+            (git commit -m "Build automatique de CameraServerGUI.exe [skip ci]" && git push)

