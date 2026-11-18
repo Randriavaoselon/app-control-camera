@@ -11,18 +11,25 @@ Le CMD Commandes n'est PAS dans ce module.
 
 Windows uniquement.
 
-CORRECTIFS v6 (fusion v3 + v5) :
-  - INJECTION : SendInput avec focus forcé en premier. Si SendInput échoue
-    (focus impossible), repli sur AttachConsole + WriteConsoleInputW.
-    Dans le repli, VK_RETURN porte wVirtualScanCode=0x1C ET uChar='\\r' —
-    sans quoi cmd.exe ignore le "Enter" et le texte reste collé au prompt.
-    On se DÉTACHE immédiatement après WriteConsoleInputW (FreeConsole),
-    pour ne pas laisser d'état résiduel entre fermeture et réouverture.
-  - CTRL_CLOSE_EVENT est ignoré via SetConsoleCtrlHandler : même si on est
-    attaché à la console quand elle se ferme, le process Python survit.
-    C'est ce qui empêche la déconnexion du client à la fermeture du CMD.
+CORRECTIFS v7 :
+  - MARQUEUR SendInput (dwExtraInfo = MAGIC_EXTRA_INFO) : le hook IGNORE
+    les événements injectés par nos propres SendInput. Sans cela, le '\\r'
+    de "echo Auteur: ..." / "echo Toi: ..." était capté par le hook et
+    bloqué → cmd.exe n'exécutait jamais l'echo, le texte restait collé au
+    prompt, et la frappe suivante était exécutée comme commande
+    ("n'est pas reconnu en tant que commande interne").
+  - THREAD SÉPARÉ pour _on_user_input : le hook ne fait plus requests.post
+    (bloquant jusqu'à 5 s). Il dépose la ligne dans une file, un thread
+    dédié l'envoie au serveur puis injecte l'écho local. Le hook reste
+    réactif en toutes circonstances (plus de VK_RETURN non bloqué en cas
+    de latence réseau).
+  - INJECTION : SendInput avec focus forcé en premier. Si SendInput échoue,
+    repli sur AttachConsole + WriteConsoleInputW avec uChar='\\r' pour
+    VK_RETURN, puis FreeConsole immédiat (pas d'attachement résiduel).
+  - CTRL_CLOSE_EVENT ignoré via SetConsoleCtrlHandler (le process Python
+    survit à la fermeture du CMD par l'utilisateur).
   - WndProc : WM_CLOSE bloqué INCONDITIONNELLEMENT ([X], Alt+F4 impossibles).
-    Seul close() (appelé sur ordre de server_gui) ferme la console, via
+    Seul close() (sur ordre de server_gui) ferme la console, via
     proc.terminate() qui contourne le WndProc.
   - WATCHDOG : relance cmd.exe en < 300 ms si l'utilisateur arrive quand
     même à le fermer (taskkill, gestionnaire de tâches, exit, crash).
@@ -34,6 +41,7 @@ CORRECTIFS v6 (fusion v3 + v5) :
 import ctypes
 import ctypes.wintypes
 import platform
+import queue
 import subprocess
 import sys
 import threading
@@ -57,6 +65,11 @@ KEY_EVENT = 0x0001
 STD_INPUT_HANDLE = -10
 
 WATCHDOG_INTERVAL = 0.3
+
+# Marqueur injecté dans dwExtraInfo de nos propres SendInput. Le hook
+# reconnaît ce marqueur et ignore l'événement (il ne le bloque pas), ce qui
+# permet à "echo Auteur: ...\r" et "echo Toi: ...\r" d'atteindre cmd.exe.
+MAGIC_EXTRA_INFO = 0x1A2B3C4D
 
 
 # --- Prototypes Win32 ---
@@ -203,6 +216,15 @@ class ChatConsole:
         self._hook_stop = threading.Event()
         self._hook_handle = None
         self._hook_proc = None
+
+        # File d'événements utilisateur : le hook ne fait que déposer la
+        # ligne ici. Un thread dédié l'envoie au serveur (requests.post
+        # bloquant) SANS bloquer le hook. C'est ce qui empêche le bug
+        # "test n'est pas reconnu en tant que commande interne" : sans
+        # cela, le hook était bloqué dans requests.post et VK_RETURN
+        # n'était plus bloqué pour les frappes suivantes.
+        self._user_input_queue: "queue.Queue[str]" = queue.Queue(maxsize=100)
+        self._input_thread: threading.Thread | None = None
 
         self._wndproc_installed = False
         self._new_wndproc = None
@@ -361,13 +383,16 @@ class ChatConsole:
         if proc is None or proc.poll() is not None:
             return False
 
-        # 1) SendInput avec focus forcé.
+        # 1) SendInput avec focus forcé. Les événements portent
+        #    MAGIC_EXTRA_INFO : le hook les ignore, donc le '\r' de
+        #    "echo Auteur: ...\r" atteint bien cmd.exe et exécute l'echo.
         if self._send_text_via_sendinput(text):
             return True
 
-        # 2) Repli : AttachConsole + WriteConsoleInputW, avec uChar='\r'
-        #    pour VK_RETURN (sinon cmd.exe ignore l'Enter et le texte reste
-        #    collé au prompt). On se détache immédiatement après.
+        # 2) Repli : AttachConsole + WriteConsoleInputW. Pas de marqueur
+        #    dwExtraInfo possible ici (writeConsoleInput n'en a pas), mais
+        #    le hook ne voit que les événements issus de SendInput, donc
+        #    ce repli est safe.
         return self._send_text_via_attach(text)
 
     def _send_text_via_sendinput(self, text: str) -> bool:
@@ -401,12 +426,16 @@ class ChatConsole:
             if ch == "\n":
                 continue
             if ch == "\r":
-                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(VK_RETURN, SCANCODE_RETURN, 0, 0, 0))))
-                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(VK_RETURN, SCANCODE_RETURN, KEYEVENTF_KEYUP, 0, 0))))
+                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(
+                    VK_RETURN, SCANCODE_RETURN, 0, 0, MAGIC_EXTRA_INFO))))
+                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(
+                    VK_RETURN, SCANCODE_RETURN, KEYEVENTF_KEYUP, 0, MAGIC_EXTRA_INFO))))
                 continue
             code = ord(ch)
-            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0))))
-            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0))))
+            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(
+                0, code, KEYEVENTF_UNICODE, 0, MAGIC_EXTRA_INFO))))
+            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(
+                0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, MAGIC_EXTRA_INFO))))
         if not inputs:
             return True
         arr = (INPUT * len(inputs))(*inputs)
@@ -432,9 +461,6 @@ class ChatConsole:
         if not records:
             return True
 
-        # AttachConsole pour obtenir le handle d'entrée de la console cible.
-        # FreeConsole d'abord : le process Python peut déjà être attaché à
-        # une autre console (celle qui l'a lancé, ou une précédente).
         try:
             _kernel32.FreeConsole()
         except Exception:
@@ -452,10 +478,6 @@ class ChatConsole:
         except Exception:
             return False
         finally:
-            # On se détache IMMÉDIATEMENT : pas d'état résiduel entre
-            # fermeture et réouverture de la console. Et si la console
-            # meurt pendant qu'on est attaché, CTRL_CLOSE_EVENT est ignoré
-            # (voir _install_ctrl_handler), donc le process Python survit.
             try:
                 _kernel32.FreeConsole()
             except Exception:
@@ -464,8 +486,7 @@ class ChatConsole:
     @staticmethod
     def _make_key_event(vk: int, ch: int, down: bool) -> "INPUT_RECORD":
         """VK_RETURN porte wVirtualScanCode=0x1C ET uChar='\\r' — sans cela,
-        cmd.exe ignore le "Enter" et le texte reste collé au prompt (le
-        client ne peut pas répondre sur une nouvelle ligne)."""
+        cmd.exe ignore le "Enter" et le texte reste collé au prompt."""
         rec = INPUT_RECORD()
         rec.EventType = KEY_EVENT
         rec.Event.KeyEvent.bKeyDown = bool(down)
@@ -493,9 +514,6 @@ class ChatConsole:
         self._guarded_hwnd = hwnd
 
         def new_wndproc(hwnd, msg, wparam, lparam):
-            # Blocage INCONDITIONNEL de WM_CLOSE. Seul close() (appelé sur
-            # ordre de server_gui) ferme la console, via proc.terminate()
-            # qui contourne ce WndProc.
             if msg == WM_CLOSE:
                 return 0
             return _user32.CallWindowProcW(
@@ -519,7 +537,7 @@ class ChatConsole:
         self._guarded_hwnd = None
 
     # ------------------------------------------------------------------
-    # Hook clavier
+    # Hook clavier + dispatcher d'entrée utilisateur
     # ------------------------------------------------------------------
     def _start_hook(self) -> None:
         if self._hook_thread is not None and self._hook_thread.is_alive():
@@ -527,6 +545,9 @@ class ChatConsole:
         self._hook_stop = threading.Event()
         self._hook_thread = threading.Thread(target=self._hook_loop, daemon=True)
         self._hook_thread.start()
+        # Thread dédié pour _on_user_input (requests.post bloquant).
+        self._input_thread = threading.Thread(target=self._input_dispatcher_loop, daemon=True)
+        self._input_thread.start()
 
     def _stop_hook(self) -> None:
         self._hook_stop.set()
@@ -539,6 +560,23 @@ class ChatConsole:
         if self._hook_thread is not None:
             self._hook_thread.join(timeout=2)
             self._hook_thread = None
+        if self._input_thread is not None:
+            self._input_thread.join(timeout=2)
+            self._input_thread = None
+
+    def _input_dispatcher_loop(self) -> None:
+        """Consomme la file des lignes tapées par l'utilisateur et appelle
+        _on_user_input HORS du thread du hook. requests.post peut prendre
+        jusqu'à 5 s : le hook reste réactif, VK_RETURN reste bloqué."""
+        while not self._hook_stop.is_set():
+            try:
+                line = self._user_input_queue.get(timeout=0.3)
+            except queue.Empty:
+                continue
+            try:
+                self._on_user_input(line)
+            except Exception:
+                pass
 
     def _hook_loop(self) -> None:
         user32 = ctypes.windll.user32
@@ -551,16 +589,32 @@ class ChatConsole:
         def hook_callback(n_code, w_param, l_param):
             if n_code >= 0 and w_param in (WM_KEYDOWN, WM_SYSKEYDOWN):
                 try:
+                    # Événements injectés par nos propres SendInput :
+                    # on les laisse passer SANS les traiter. Sans cela,
+                    # le '\r' de "echo Auteur: ...\r" / "echo Toi: ...\r"
+                    # serait bloqué et cmd.exe n'exécuterait jamais
+                    # l'echo → le texte resterait collé au prompt, puis
+                    # serait exécuté comme commande à la frappe suivante.
+                    info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    if info.dwExtraInfo == MAGIC_EXTRA_INFO:
+                        return user32.CallNextHookEx(
+                            self._hook_handle, n_code, w_param, l_param
+                        )
+
                     if self._is_our_window_foreground():
-                        info = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
                         vk = info.vkCode
                         if vk == VK_RETURN:
                             line = self._line_buffer
                             self._line_buffer = ""
                             self.touch()
                             if line.strip():
-                                self._on_user_input(line)
-                            return 1
+                                # Dépose dans la file ; le thread dispatcher
+                                # envoie au serveur et injecte l'écho local.
+                                try:
+                                    self._user_input_queue.put_nowait(line)
+                                except queue.Full:
+                                    pass
+                            return 1  # bloque VK_RETURN pour cmd.exe
                         if vk == VK_BACK:
                             self._line_buffer = self._line_buffer[:-1]
                             self.touch()
