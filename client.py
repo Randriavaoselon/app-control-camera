@@ -16,13 +16,13 @@ Fonctionnalités (toutes indépendantes) :
 
 Compatible Windows et Linux (le chat n'est actif que sous Windows).
 
-CORRECTIFS v7 :
+CORRECTIFS v8 :
   - _handle_user_chat : l'écho local "Toi: <msg>" est injecté AVANT
-    l'envoi réseau (retour visuel immédiat). L'injection porte le marqueur
-    MAGIC_EXTRA_INFO (voir console_windows.py), donc le hook ne la capte
-    pas et le '\r' atteint bien cmd.exe.
-  - Le hook ne bloque plus le thread : la ligne est déposée dans une file
-    et traitée par un thread dédié (voir console_windows.py).
+    l'envoi réseau (retour visuel immédiat). L'injection passe par
+    _send_text (AttachConsole + WriteConsoleInputW, voir console_windows.py),
+    qui ne vole pas le focus et n'est pas capté par le hook.
+  - _send_text n'a plus de paramètre force : l'injection est toujours
+    directe et déterministe.
 """
 
 import argparse
@@ -745,8 +745,9 @@ class CameraClient:
     def _handle_user_chat(self, line: str) -> None:
         """Appelée par le thread dispatcher de ChatConsole (PAS par le hook).
         On affiche l'écho local immédiatement (retour visuel rapide), puis
-        on envoie au serveur. L'injection porte MAGIC_EXTRA_INFO, donc le
-        hook ne capte pas ce '\r' et cmd.exe exécute bien l'echo."""
+        on envoie au serveur. L'injection passe par _send_text, qui utilise
+        AttachConsole + WriteConsoleInputW : pas de focus volé, pas de
+        capture par le hook."""
         try:
             if self._chat_console is not None and self._chat_console.is_open():
                 safe = (
@@ -757,7 +758,7 @@ class CameraClient:
                     .replace(">", "^>")
                     .replace('"', "'")
                 )
-                self._chat_console._send_text(f"echo Toi: {safe}\r", force=True)
+                self._chat_console._send_text(f"echo Toi: {safe}\r")
         except Exception as exc:
             logger.exception("Erreur lors de l'affichage local du message chat : %s", exc)
 
