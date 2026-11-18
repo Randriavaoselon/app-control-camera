@@ -13,22 +13,24 @@ client, il est géré dans client.py via un cmd.exe persistant sans fenêtre.
 Windows uniquement. Sous Linux, l'import échoue et client.py désactive
 automatiquement la fonctionnalité chat.
 
-CORRECTIFS v2 :
-  - _find_hwnd() identifie la console par PID du process cmd.exe, et non
-    par titre. GetWindowTextW ne renvoie rien pour les fenêtres de classe
-    ConsoleWindowClass ; la recherche par PID est fiable.
+CORRECTIFS v3 :
+  - VK_RETURN porte wVirtualScanCode = 0x1C et uChar.UnicodeChar = '\\r'.
+    Sans cela, cmd.exe ignore le "Enter" et le texte reste collé au prompt
+    (le client ne peut pas répondre sur une nouvelle ligne).
+  - L'injection utilise d'abord SendInput (focus clavier forcé via
+    SetForegroundWindow + SetFocus + AttachThreadInput), avec repli sur
+    AttachConsole + WriteConsoleInputW si SendInput échoue.
+  - AttachConsole/FreeConsole ne sont plus appelés à chaque injection :
+    on garde l'attache tant que la console vit (_attached_pid). Cela évite
+    les échecs ERROR_ACCESS_DENIED après fermeture/réouverture.
+  - _find_hwnd() identifie la console par PID, pas par titre.
   - open() attend la création réelle de la fenêtre (retry jusqu'à 3 s).
-  - L'injection GUI utilise AttachConsole(pid) + WriteConsoleInputW, qui
-    écrit DIRECTEMENT dans la file d'entrée de la console, sans dépendre
-    du focus clavier (SetForegroundWindow + SendInput échouaient souvent).
-  - show_incoming() ne dépend plus de is_hook_active() ni du hook : tant
-    que la console est ouverte, le message GUI s'affiche.
-  - is_hook_active() tolère les longues périodes d'inactivité (timeout
-    porté à 30 min) : l'utilisateur peut taper sans que VK_RETURN ne soit
-    soudain plus bloqué. Le [X] reste neutralisé tant que la console est
-    vivante, et redevient fonctionnel si le hook meurt vraiment.
+  - is_hook_active() ne dépend plus d'un timeout court : tant que la
+    console est ouverte et le thread du hook vivant, il reste actif.
+    Le [X] reste neutralisé ; un timeout très large (30 min) sert de
+    garde-fou en cas de perte réseau prolongée.
   - Le hook appelle touch() à chaque frappe : l'activité utilisateur
-    repousse aussi le timeout.
+    maintient le hook actif.
   - Tous les prototypes Win32 sont définis AVANT tout appel.
 """
 
@@ -52,16 +54,15 @@ VK_BACK = 0x08
 KEYEVENTF_UNICODE = 0x0004
 KEYEVENTF_KEYUP = 0x0002
 GWLP_WNDPROC = -4
-
-# WriteConsoleInput : codes d'événement de console
 KEY_EVENT = 0x0001
+STD_INPUT_HANDLE = -10
+SCANCODE_RETURN = 0x1C   # scan code standard de la touche Entrée
 
-# --- Prototypes Win32 (essentiel : sans eux, ctypes suppose c_int partout,
-#     ce qui provoque OverflowError sur les pointeurs 64 bits) ---
+
+# --- Prototypes Win32 ---
 _user32 = ctypes.windll.user32
 _kernel32 = ctypes.windll.kernel32
 
-# SetWindowLongPtrW : (HWND, int, LONG_PTR) -> LONG_PTR
 _user32.SetWindowLongPtrW.argtypes = [
     ctypes.wintypes.HWND,
     ctypes.c_int,
@@ -69,7 +70,6 @@ _user32.SetWindowLongPtrW.argtypes = [
 ]
 _user32.SetWindowLongPtrW.restype = ctypes.c_void_p
 
-# CallWindowProcW : (WNDPROC, HWND, UINT, WPARAM, LPARAM) -> LRESULT
 WNDPROC = ctypes.WINFUNCTYPE(
     ctypes.c_void_p,
     ctypes.wintypes.HWND,
@@ -86,21 +86,21 @@ _user32.CallWindowProcW.argtypes = [
 ]
 _user32.CallWindowProcW.restype = ctypes.c_void_p
 
-# GetWindowThreadProcessId : (HWND, LPDWORD) -> DWORD
 _user32.GetWindowThreadProcessId.argtypes = [
     ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD),
 ]
 _user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
 
-# AttachConsole / FreeConsole
 _kernel32.AttachConsole.argtypes = [ctypes.wintypes.DWORD]
 _kernel32.AttachConsole.restype = ctypes.wintypes.BOOL
 _kernel32.FreeConsole.argtypes = []
 _kernel32.FreeConsole.restype = ctypes.wintypes.BOOL
 
-# GetModuleHandleW : (LPCWSTR) -> HMODULE
 _kernel32.GetModuleHandleW.argtypes = [ctypes.wintypes.LPCWSTR]
 _kernel32.GetModuleHandleW.restype = ctypes.wintypes.HMODULE
+
+_kernel32.GetStdHandle.argtypes = [ctypes.wintypes.DWORD]
+_kernel32.GetStdHandle.restype = ctypes.wintypes.HANDLE
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -130,7 +130,6 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
     ]
 
 
-# --- Structures pour WriteConsoleInputW ---
 class CHAR_UNION(ctypes.Union):
     _fields_ = [("UnicodeChar", ctypes.wintypes.WCHAR), ("AsciiChar", ctypes.c_char)]
 
@@ -165,25 +164,10 @@ _kernel32.WriteConsoleInputW.argtypes = [
 ]
 _kernel32.WriteConsoleInputW.restype = ctypes.wintypes.BOOL
 
-_kernel32.GetStdHandle.argtypes = [ctypes.wintypes.DWORD]
-_kernel32.GetStdHandle.restype = ctypes.wintypes.HANDLE
-
-STD_INPUT_HANDLE = -10
-
 
 class ChatConsole:
-    """Vraie console cmd.exe visible chez le client, dédiée au chat.
+    """Vraie console cmd.exe visible chez le client, dédiée au chat."""
 
-    - L'utilisateur du client tape dans la console : le hook capte, bloque
-      VK_RETURN, envoie au serveur, puis injecte "echo Toi: <msg>".
-    - La GUI injecte "echo Auteur: <msg>" à la demande (via show_incoming).
-    - Le [X] est neutralisé (sous-classe WndProc) : seule la GUI peut fermer.
-    - Timeout de sécurité : si la console reste ouverte mais que le hook
-      meurt (SetWindowsHookExW échoue), le [X] redevient fonctionnel.
-    """
-
-    # Timeout très large : l'utilisateur peut lire/attendre longtemps avant
-    # de taper. Le hook doit rester actif tant que la console est vivante.
     SAFETY_TIMEOUT_SECONDS = 30 * 60.0
 
     def __init__(self, title: str, on_user_input):
@@ -205,6 +189,10 @@ class ChatConsole:
 
         self._last_server_message = time.monotonic()
 
+        # PID de la console à laquelle ce process Python est actuellement
+        # attaché (via AttachConsole). None = pas attaché.
+        self._attached_pid: int | None = None
+
     # ------------------------------------------------------------------
     # Cycle de vie
     # ------------------------------------------------------------------
@@ -223,7 +211,7 @@ class ChatConsole:
                 startupinfo=startupinfo,
             )
 
-        # Attend que la fenêtre de console soit réellement créée (retry).
+        # Attend que la fenêtre de console soit réellement créée.
         hwnd = None
         for _ in range(30):  # jusqu'à 3 s
             time.sleep(0.1)
@@ -232,8 +220,7 @@ class ChatConsole:
                 break
         if not hwnd:
             print(
-                "[ChatConsole] Fenêtre de console introuvable après 3 s : "
-                "le hook et l'injection GUI risquent de ne pas fonctionner.",
+                "[ChatConsole] Fenêtre de console introuvable après 3 s.",
                 file=sys.stderr,
             )
 
@@ -243,6 +230,7 @@ class ChatConsole:
         return True
 
     def close(self) -> None:
+        self._detach_console()
         self._stop_hook()
         self._restore_close_guard()
         with self._lock:
@@ -250,25 +238,27 @@ class ChatConsole:
             self.process = None
         if proc is None or proc.poll() is not None:
             return
-        self._send_text("exit\r\n", force=True)
+        # Demande de fermeture propre (sans injection : on kill directement
+        # si la console est déjà fermée par l'utilisateur).
         try:
-            proc.wait(timeout=3)
-        except subprocess.TimeoutExpired:
             proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def is_open(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
     def touch(self) -> None:
-        """Repousse le timeout de sécurité (message GUI reçu, frappe, etc.)."""
         self._last_server_message = time.monotonic()
 
     def is_hook_active(self) -> bool:
-        """Le hook est actif tant que le thread vit et que la console est
-        ouverte. Le timeout de sécurité (30 min) ne se déclenche que si le
-        thread du hook est mort (SetWindowsHookExW a échoué) OU si la
-        console est fermée — dans ces cas, le [X] doit redevenir
-        fonctionnel pour ne pas piéger l'utilisateur."""
+        """Actif tant que la console est ouverte et le thread du hook vivant.
+        Le timeout (30 min) n'est qu'un garde-fou contre un blocage prolongé
+        sans aucun message serveur ni frappe utilisateur."""
         if not self.is_open():
             return False
         if self._hook_thread is None or not self._hook_thread.is_alive():
@@ -279,11 +269,11 @@ class ChatConsole:
     # Injection par la GUI
     # ------------------------------------------------------------------
     def show_incoming(self, message: str) -> None:
-        """Affiche un message venu de la GUI dans la console.
+        """Affiche un message venu de la GUI dans la console, PUIS place le
+        curseur sur une nouvelle ligne prête à recevoir la frappe.
 
-        Ne dépend PAS du hook clavier : tant que la console est ouverte, le
-        message s'affiche (via AttachConsole + WriteConsoleInputW).
-        """
+        Format : 'Auteur: <message>' — le '\\r' final déclenche l'exécution
+        de 'echo' et réaffiche un prompt vierge."""
         if not self.is_open():
             return
         self.touch()
@@ -298,7 +288,7 @@ class ChatConsole:
         self._send_text(f"echo Auteur: {safe}\r", force=True)
 
     # ------------------------------------------------------------------
-    # Win32 : recherche du HWND par PID (fiable, indépendant du titre)
+    # Recherche HWND par PID
     # ------------------------------------------------------------------
     def _find_hwnd(self):
         proc = self.process
@@ -321,23 +311,82 @@ class ChatConsole:
         return found[0] if found else None
 
     # ------------------------------------------------------------------
-    # Injection fiable via AttachConsole + WriteConsoleInputW
+    # Injection : SendInput (focus forcé) + repli AttachConsole
     # ------------------------------------------------------------------
     def _send_text(self, text: str, force: bool = False) -> None:
-        """Injecte `text` dans la console via la file d'entrée de la console
-        (AttachConsole + WriteConsoleInputW).
+        """Injecte `text` dans la console.
 
-        Ne dépend ni du focus clavier ni de SendInput : écrit directement
-        les événements clavier que cmd.exe va lire via ReadConsoleInput.
-        `force` est conservé pour la compatibilité ; il n'est plus utilisé
-        pour conditionner l'injection (is_open() suffit).
+        Stratégie :
+          1. SendInput avec focus clavier forcé (SetForegroundWindow +
+             AttachThreadInput + SetFocus). Méthode fiable quand HWND est
+             correct, ne nécessite pas FreeConsole.
+          2. Si SendInput échoue, repli sur AttachConsole + WriteConsoleInputW
+             (attache persistante, pas de FreeConsole à chaque appel).
         """
         proc = self.process
         if proc is None or proc.poll() is not None:
             return
 
-        # Prépare le tableau d'INPUT_RECORD : chaque caractère en down + up,
-        # puis un VK_RETURN down + up.
+        if self._send_text_via_sendinput(text):
+            return
+        self._send_text_via_attach(text)
+
+    def _send_text_via_sendinput(self, text: str) -> bool:
+        """SendInput avec focus clavier forcé. Retourne True si tout est OK."""
+        hwnd = self._find_hwnd()
+        if not hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        try:
+            if user32.IsIconic(hwnd):
+                user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            # Force le focus clavier de façon robuste.
+            fg = user32.GetForegroundWindow()
+            fg_thread = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+            tgt_thread = user32.GetWindowThreadProcessId(hwnd, None)
+            if fg_thread and tgt_thread and fg_thread != tgt_thread:
+                user32.AttachThreadInput(fg_thread, tgt_thread, True)
+                try:
+                    user32.SetForegroundWindow(hwnd)
+                    user32.SetFocus(hwnd)
+                finally:
+                    user32.AttachThreadInput(fg_thread, tgt_thread, False)
+            else:
+                user32.SetForegroundWindow(hwnd)
+                user32.SetFocus(hwnd)
+        except Exception:
+            return False
+        time.sleep(0.08)  # laisse le focus s'établir
+
+        inputs = []
+        for ch in text:
+            if ch == "\n":
+                continue
+            if ch == "\r":
+                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(VK_RETURN, SCANCODE_RETURN, 0, 0, 0))))
+                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(VK_RETURN, SCANCODE_RETURN, KEYEVENTF_KEYUP, 0, 0))))
+                continue
+            code = ord(ch)
+            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0))))
+            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0))))
+        if not inputs:
+            return True
+        arr = (INPUT * len(inputs))(*inputs)
+        sent = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+        return sent == len(inputs)
+
+    def _send_text_via_attach(self, text: str) -> None:
+        """Repli : AttachConsole + WriteConsoleInputW.
+
+        L'attache est PERSISTANTE (pas de FreeConsole après l'écriture) :
+        cela évite les échecs ERROR_ACCESS_DENIED quand on rouvre la
+        console et qu'on rappelle _send_text. L'attache est libérée dans
+        close() via _detach_console().
+        """
+        proc = self.process
+        if proc is None or proc.poll() is not None:
+            return
+
         records = []
         for ch in text:
             if ch == "\n":
@@ -349,18 +398,20 @@ class ChatConsole:
             code = ord(ch)
             records.append(self._make_key_event(0, code, True))
             records.append(self._make_key_event(0, code, False))
-
         if not records:
             return
 
-        # AttachConsole permet d'obtenir le handle de la console cible.
-        # IMPORTANT : FreeConsole d'abord, car le process Python peut déjà
-        # être attaché à une autre console (celle qui a lancé le script).
-        _kernel32.FreeConsole()
-        if not _kernel32.AttachConsole(proc.pid):
-            # Échec : on retombe sur SendInput (moins fiable, mais au cas où).
-            self._send_text_via_sendinput(text)
-            return
+        if self._attached_pid != proc.pid:
+            # Détache d'une éventuelle console précédente, puis attache.
+            try:
+                _kernel32.FreeConsole()
+            except Exception:
+                pass
+            if not _kernel32.AttachConsole(proc.pid):
+                # Impossible de s'attacher : dernier recours SendInput.
+                self._send_text_via_sendinput(text)
+                return
+            self._attached_pid = proc.pid
 
         try:
             handle = _kernel32.GetStdHandle(STD_INPUT_HANDLE)
@@ -369,56 +420,40 @@ class ChatConsole:
                 return
             arr = (INPUT_RECORD * len(records))(*records)
             written = ctypes.wintypes.DWORD(0)
-            ok = _kernel32.WriteConsoleInputW(handle, arr, len(records), ctypes.byref(written))
-            if not ok:
-                self._send_text_via_sendinput(text)
-        finally:
-            _kernel32.FreeConsole()
+            _kernel32.WriteConsoleInputW(handle, arr, len(records), ctypes.byref(written))
+        except Exception:
+            pass
+
+    def _detach_console(self) -> None:
+        if self._attached_pid is not None:
+            try:
+                _kernel32.FreeConsole()
+            except Exception:
+                pass
+            self._attached_pid = None
 
     @staticmethod
     def _make_key_event(vk: int, ch: int, down: bool) -> "INPUT_RECORD":
-        """Construit un INPUT_RECORD de type KEY_EVENT.
+        """Construit un INPUT_RECORD KEY_EVENT.
 
-        - vk != 0 : touche spéciale (VK_RETURN, etc.), uChar = 0.
-        - vk == 0 : caractère Unicode, wVirtualKeyCode = 0, uChar = ch.
+        Pour VK_RETURN : wVirtualScanCode = 0x1C ET uChar = '\\r' — SANS
+        cela, cmd.exe ignore le "Enter" et le texte reste sur la même
+        ligne que le prompt (le client ne peut pas répondre sur une
+        nouvelle ligne).
         """
         rec = INPUT_RECORD()
         rec.EventType = KEY_EVENT
         rec.Event.KeyEvent.bKeyDown = bool(down)
         rec.Event.KeyEvent.wRepeatCount = 1
         rec.Event.KeyEvent.wVirtualKeyCode = vk
-        rec.Event.KeyEvent.wVirtualScanCode = 0
-        rec.Event.KeyEvent.uChar.UnicodeChar = chr(ch) if ch else "\x00"
+        if vk == VK_RETURN:
+            rec.Event.KeyEvent.wVirtualScanCode = SCANCODE_RETURN
+            rec.Event.KeyEvent.uChar.UnicodeChar = "\r"
+        else:
+            rec.Event.KeyEvent.wVirtualScanCode = 0
+            rec.Event.KeyEvent.uChar.UnicodeChar = chr(ch) if ch else "\x00"
         rec.Event.KeyEvent.dwControlKeyState = 0
         return rec
-
-    def _send_text_via_sendinput(self, text: str) -> None:
-        """Repli : SendInput classique (nécessite le focus clavier)."""
-        hwnd = self._find_hwnd()
-        if not hwnd:
-            return
-        user32 = ctypes.windll.user32
-        if user32.IsIconic(hwnd):
-            user32.ShowWindow(hwnd, 9)
-        try:
-            user32.SetForegroundWindow(hwnd)
-        except Exception:
-            pass
-        time.sleep(0.05)
-        inputs = []
-        for ch in text:
-            if ch == "\n":
-                continue
-            if ch == "\r":
-                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, VK_RETURN, 0, 0, 0))))
-                inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, VK_RETURN, KEYEVENTF_KEYUP, 0, 0))))
-                continue
-            code = ord(ch)
-            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE, 0, 0))))
-            inputs.append(INPUT(type=1, u=INPUT._U(ki=KEYBDINPUT(0, code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, 0))))
-        if inputs:
-            arr = (INPUT * len(inputs))(*inputs)
-            user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
 
     # ------------------------------------------------------------------
     # Sous-classe WndProc : neutralise le [X]
@@ -438,7 +473,7 @@ class ChatConsole:
                     self._old_wndproc_ptr, hwnd, msg, wparam, lparam
                 )
             if msg == WM_CLOSE:
-                return 0  # on ignore
+                return 0
             return _user32.CallWindowProcW(
                 self._old_wndproc_ptr, hwnd, msg, wparam, lparam
             )
@@ -462,7 +497,7 @@ class ChatConsole:
         self._guarded_hwnd = None
 
     # ------------------------------------------------------------------
-    # Hook clavier : capture les frappes, bloque VK_RETURN (Solution B)
+    # Hook clavier
     # ------------------------------------------------------------------
     def _start_hook(self) -> None:
         if self._hook_thread is not None and self._hook_thread.is_alive():
@@ -479,12 +514,20 @@ class ChatConsole:
             except Exception:
                 pass
             self._hook_handle = None
+        # Poste un message à nous-mêmes pour débloquer GetMessageW.
+        try:
+            ctypes.windll.user32.PostThreadMessageW(
+                ctypes.windll.kernel32.GetCurrentThreadId(), 0x0012, 0, 0  # WM_QUIT
+            )
+        except Exception:
+            pass
         if self._hook_thread is not None:
             self._hook_thread.join(timeout=2)
             self._hook_thread = None
 
     def _hook_loop(self) -> None:
         user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
 
         HOOKPROC = ctypes.WINFUNCTYPE(
             ctypes.c_void_p,
@@ -502,10 +545,10 @@ class ChatConsole:
                         if vk == VK_RETURN:
                             line = self._line_buffer
                             self._line_buffer = ""
-                            self.touch()  # activité utilisateur : repousse le timeout
+                            self.touch()
                             if line.strip():
                                 self._on_user_input(line)
-                            return 1  # bloque la propagation vers cmd.exe
+                            return 1
                         if vk == VK_BACK:
                             self._line_buffer = self._line_buffer[:-1]
                             self.touch()
@@ -539,15 +582,12 @@ class ChatConsole:
         user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
         user32.UnhookWindowsHookEx.restype = ctypes.wintypes.BOOL
 
-        # Pour WH_KEYBOARD_LL, hMod DOIT être NULL.
         self._hook_handle = user32.SetWindowsHookExW(
             WH_KEYBOARD_LL, self._hook_proc, None, 0
         )
         if not self._hook_handle:
             print(
-                "[ChatConsole] SetWindowsHookExW a échoué : le hook clavier "
-                "est inactif. Les messages de la GUI s'afficheront toutefois "
-                "dans la console (AttachConsole + WriteConsoleInputW).",
+                "[ChatConsole] SetWindowsHookExW a échoué : le hook clavier est inactif.",
                 file=sys.stderr,
             )
             return
