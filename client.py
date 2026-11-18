@@ -639,8 +639,6 @@ class CameraClient:
         self._remote_console = RemoteConsole(server_url, device_id)
 
         # Titre ASCII pur pour que la fenêtre soit facile à retrouver.
-        # (La recherche réelle se fait par PID, pas par titre, mais un titre
-        # ASCII évite tout problème d'encodage dans cmd.exe.)
         self._chat_console: "ChatConsole | None" = None
         if _HAS_CHAT_CONSOLE:
             self._chat_console = ChatConsole(
@@ -732,14 +730,12 @@ class CameraClient:
         if shell_input and self._remote_console.is_running():
             self._remote_console.write_command(shell_input.get("text", ""))
 
-        chat_msg = commands.get("chat_message")
-        if chat_msg and self._chat_console is not None:
-            try:
-                if self._chat_console.is_open():
-                    self._chat_console.show_incoming(chat_msg.get("message", ""))
-            except Exception as exc:
-                logger.exception("Erreur lors de l'injection du message chat : %s", exc)
-
+        # ------------------------------------------------------------------
+        # Chat : CYCLE DE VIE **AVANT** LES MESSAGES.
+        # Si on traitait chat_message d'abord, le premier message qui suit
+        # un OPEN serait consommé (pop(0) côté serveur) alors que la console
+        # n'est pas encore ouverte → définitivement perdu.
+        # ------------------------------------------------------------------
         chat_window_cmd = commands.get("chat_window")
         if self._chat_console is not None:
             try:
@@ -749,6 +745,14 @@ class CameraClient:
                     self._chat_console.close()
             except Exception as exc:
                 logger.exception("Erreur lors de la gestion de la console chat : %s", exc)
+
+        chat_msg = commands.get("chat_message")
+        if chat_msg and self._chat_console is not None:
+            try:
+                if self._chat_console.is_open():
+                    self._chat_console.show_incoming(chat_msg.get("message", ""))
+            except Exception as exc:
+                logger.exception("Erreur lors de l'injection du message chat : %s", exc)
 
     def _handle_user_chat(self, line: str) -> None:
         try:
