@@ -52,11 +52,21 @@ jobs:
         shell: cmd
         run: |
           if not exist admin_bridge.py (
-            echo ERREUR : admin_bridge.py est introuvable (requis pour CMD Admin).
+            echo ERREUR : admin_bridge.py est introuvable ^(requis pour CMD Admin^).
             exit /b 1
           )
           echo Pont UAC trouve :
           dir admin_bridge.py
+
+      - name: Vérifier la présence de console_admin_windows.py (module CMD Admin)
+        shell: cmd
+        run: |
+          if not exist console_admin_windows.py (
+            echo ERREUR : console_admin_windows.py est introuvable ^(requis pour CMD Admin^).
+            exit /b 1
+          )
+          echo Module CMD Admin trouve :
+          dir console_admin_windows.py
 
       - name: Installer Python
         uses: actions/setup-python@v5
