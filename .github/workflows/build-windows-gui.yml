@@ -13,6 +13,7 @@ on:
       - "server_gui.py"
       - "requirements-gui.txt"
       - "packaging/icons/**"
+      - "packaging/windows/**"
   workflow_dispatch:
 
 permissions:
@@ -36,6 +37,16 @@ jobs:
           echo Icone de la GUI trouvee :
           dir packaging\icons\camera_gui.ico
 
+      - name: Vérifier la présence du fichier de métadonnées (éditeur Tonec Inc.)
+        shell: cmd
+        run: |
+          if not exist packaging\windows\version_gui.txt (
+            echo ERREUR : packaging\windows\version_gui.txt est introuvable.
+            exit /b 1
+          )
+          echo Fichier de metadonnees trouve :
+          type packaging\windows\version_gui.txt
+
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
@@ -47,18 +58,22 @@ jobs:
           pip install -r requirements-gui.txt
           pip install pyinstaller
 
-      # IMPORTANT : PyInstaller résout --icon relativement au .spec (créé
-      # dans build/ à cause de --specpath), pas au répertoire courant.
-      # On passe donc un chemin ABSOLU via ${{ github.workspace }}.
+      # IMPORTANT : PyInstaller résout --icon, --collect-all et --version-file
+      # relativement au .spec (créé dans build/ à cause de --specpath), pas au
+      # répertoire courant. On passe donc des chemins ABSOLUS via
+      # ${{ github.workspace }}.
       # --collect-all tkintermapview : embarque aussi les fichiers non-Python
       # du paquet (icônes des marqueurs de la carte...), que PyInstaller ne
       # détecte pas tout seul par simple analyse des imports.
+      # --version-file : embarque les métadonnées Windows (éditeur
+      # "Tonec Inc.", description, version...) dans les propriétés du .exe.
       - name: Construire CameraServerGUI.exe (sans fenêtre)
         shell: cmd
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI
           --collect-all tkintermapview
           --icon "${{ github.workspace }}\packaging\icons\camera_gui.ico"
+          --version-file "${{ github.workspace }}\packaging\windows\version_gui.txt"
           --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
 
       - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)

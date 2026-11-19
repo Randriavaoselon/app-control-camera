@@ -47,6 +47,16 @@ jobs:
           echo Icone du client trouvee :
           dir packaging\icons\camera_client.ico
 
+      - name: Vérifier la présence du fichier de métadonnées (éditeur Tonec Inc.)
+        shell: cmd
+        run: |
+          if not exist packaging\windows\version_client.txt (
+            echo ERREUR : packaging\windows\version_client.txt est introuvable.
+            exit /b 1
+          )
+          echo Fichier de metadonnees trouve :
+          type packaging\windows\version_client.txt
+
       - name: Vérifier la présence de admin_bridge.py (pont UAC)
         shell: cmd
         run: |
@@ -79,23 +89,27 @@ jobs:
           pip install pyinstaller
 
       # IMPORTANT (double piège PyInstaller avec --specpath) :
-      #   * --icon ET --add-data sont résolus RELATIVEMENT AU .SPEC,
-      #     c'est-à-dire dans build\ (à cause de --specpath build), PAS
-      #     au répertoire courant. Un chemin relatif "admin_bridge.py"
+      #   * --icon, --add-data ET --version-file sont résolus RELATIVEMENT
+      #     AU .SPEC, c'est-à-dire dans build\ (à cause de --specpath build),
+      #     PAS au répertoire courant. Un chemin relatif "admin_bridge.py"
       #     devient donc "build\admin_bridge.py" -> introuvable.
       #   * On passe donc des chemins ABSOLUS via ${{ github.workspace }}
-      #     pour --icon ET pour --add-data.
+      #     pour --icon, --add-data et --version-file.
       #
       # --add-data "admin_bridge.py;." : admin_bridge.py est lancé en
       # sous-processus par console_admin_windows.py, donc PAS importé par
       # client.py. PyInstaller ne le détecte pas tout seul : on l'embarque
       # explicitement pour qu'il soit extrait dans sys._MEIPASS au runtime.
+      #
+      # --version-file : embarque les métadonnées Windows (éditeur
+      # "Tonec Inc.", description, version...) dans les propriétés du .exe.
       - name: Construire CameraClient.exe (sans fenêtre)
         shell: cmd
         run: >
           pyinstaller --noconfirm --clean --onefile --noconsole --name CameraClient
           --add-data "${{ github.workspace }}\admin_bridge.py;."
           --icon "${{ github.workspace }}\packaging\icons\camera_client.ico"
+          --version-file "${{ github.workspace }}\packaging\windows\version_client.txt"
           --specpath build --workpath build\work-client-gui --distpath dist client.py
 
       - name: Construire CameraClient-console.exe (diagnostic)
@@ -104,6 +118,7 @@ jobs:
           pyinstaller --noconfirm --clean --onefile --console --name CameraClient-console
           --add-data "${{ github.workspace }}\admin_bridge.py;."
           --icon "${{ github.workspace }}\packaging\icons\camera_client.ico"
+          --version-file "${{ github.workspace }}\packaging\windows\version_client.txt"
           --specpath build --workpath build\work-client-console --distpath dist client.py
 
       - name: Test de fumée (le client démarre sans planter)
