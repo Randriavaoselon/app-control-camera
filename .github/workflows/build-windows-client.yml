@@ -5,7 +5,6 @@ on:
     branches: [main]
     paths:
       - "client.py"
-      - "console_windows.py"
       - "console_admin_windows.py"
       - "admin_bridge.py"
       - "requirements.txt"
@@ -111,8 +110,7 @@ jobs:
         shell: cmd
         run: |
           rem Lance le client en mode --once : suffisant pour detecter une erreur
-          rem d'import (console_windows.py absent, console_admin_windows.py
-          rem manquant, ctypes mal utilise...).
+          rem d'import (console_admin_windows.py manquant, ctypes mal utilise...).
           rem Sans serveur joignable, le client logue un avertissement et termine
           rem proprement (errorlevel 0 attendu).
           dist\CameraClient-console.exe --once --debug

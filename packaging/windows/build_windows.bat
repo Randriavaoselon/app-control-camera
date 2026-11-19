@@ -30,11 +30,9 @@ rem  (qui n'existe pas) -> FileNotFoundError. Idem pour "admin_bridge.py"
 rem  qui deviendrait "build\admin_bridge.py". On construit donc des chemins
 rem  ABSOLUS a partir de %PROJECT_ROOT% pour eviter le probleme.
 rem
-rem  NOTE v9 : le module console_admin_windows.py (CMD Admin via UAC) et
-rem  admin_bridge.py (pont eleve) sont AUTOMATIQUEMENT embarques par
-rem  PyInstaller car ils sont importes par client.py. admin_bridge.py,
-rem  lui, est lance en sous-processus (donc PAS importe) : il faut
-rem  l'embarquer explicitement via --add-data.
+rem  NOTE v10 : la fonctionnalite Chat a ete supprimee (module
+rem  console_windows.py retire du projet). Le module console_admin_windows.py
+rem  (CMD Admin via UAC) et admin_bridge.py (pont eleve) restent embarques.
 rem ===========================================================================
 cd /d "%~dp0..\.."
 
