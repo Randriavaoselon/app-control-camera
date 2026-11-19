@@ -26,6 +26,11 @@ fenêtre réaffiche le buffer courant.
 CMD Commandes ADMIN : idem, mais pour la console élevée (UAC Windows).
 La fenêtre GUI pointe vers /api/shell/admin/*. Bouton désactivé si
 l'appareil sélectionné n'est pas sous Windows.
+
+CORRECTIFS v10 :
+  - Ajout d'un avertissement dans la fenêtre CMD Admin : pendant que
+    l'utilisateur répond au popup UAC, la capture d'écran est suspendue
+    (fenêtre de sécurité Windows non capturable).
 """
 
 import argparse
@@ -1527,6 +1532,8 @@ class CameraServerApp:
         refresh()
         output["state"] = "normal"
         output.insert("end", "Cliquez sur « Ouvrir chez le client (UAC) » pour démarrer la console élevée.\n")
+        output.insert("end", "⚠ Pendant que l'utilisateur répond au popup UAC, la capture d'écran "
+                             "est suspendue (fenêtre de sécurité Windows non capturable).\n")
         output["state"] = "disabled"
         # Fermer la fenêtre GUI NE ferme PAS la console distante.
         win.protocol("WM_DELETE_WINDOW", lambda: self._close_admin_cmd_window(device_id, win))

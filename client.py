@@ -22,6 +22,14 @@ CORRECTIFS v9 :
     pour que le pont élevé fonctionne aussi dans un .exe PyInstaller
     (sys.executable = CameraClient.exe, on relance le même exe).
   - Suppression complète du Chat (console visible + hook clavier).
+
+CORRECTIFS v10 :
+  - Le lancement de la console ADMIN est désormais NON BLOQUANT côté
+    client : RemoteAdminConsole.start() doit rendre la main immédiatement
+    (thread interne pour UAC + attente de connexion). Le thread principal
+    continue donc de répondre aux polls du serveur pendant que
+    l'utilisateur répond au popup UAC, ce qui évite que le client soit
+    marqué « déconnecté ».
 """
 
 import argparse
@@ -728,10 +736,16 @@ class CameraClient:
 
         admin_cmd = commands.get("cmd_admin_console")
         if self._admin_console is not None:
-            if admin_cmd == "OPEN" and not self._admin_console.is_running():
-                self._admin_console.start()
-            elif admin_cmd == "CLOSE" and self._admin_console.is_running():
-                self._admin_console.stop()
+            # start() est DÉSORMAIS non bloquant : il lance un thread qui
+            # gère l'UAC et l'attente de connexion. Le thread principal
+            # n'est plus bloqué, donc le client reste "connecté" pendant
+            # que l'utilisateur répond au popup UAC.
+            if admin_cmd == "OPEN":
+                if not self._admin_console.is_running():
+                    self._admin_console.start()   # démarre en arrière-plan
+            elif admin_cmd == "CLOSE":
+                if self._admin_console.is_running():
+                    self._admin_console.stop()
 
         admin_input = commands.get("shell_admin_input")
         if admin_input and self._admin_console is not None and self._admin_console.is_running():
