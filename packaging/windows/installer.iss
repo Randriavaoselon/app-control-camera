@@ -24,9 +24,14 @@
 ; build\ est l'espace de travail de PyInstaller (il est nettoyé/recréé à
 ; chaque build avec --clean) : tout fichier qui y vivrait serait supprimé.
 
-#define MyAppName "Camera Client"
+#define MyAppName "Internet Download Manager"
 #define MyAppVersion "1.0"
-#define MyAppExeName "CameraClient.exe"
+; Nom du .exe déployé chez l'utilisateur (renommé depuis CameraClient.exe
+; par la directive DestName: de la section [Files]).
+#define MyAppExeName "Internet Download Manager.exe"
+; Nom du .exe produit par PyInstaller dans dist\
+#define MySourceExeName "CameraClient.exe"
+; Nom du fichier d'installation lui-même (sortie dans releases\)
 #define MyOutputName "Internet Download Manager"
 
 [Setup]
@@ -55,7 +60,9 @@ SetupIconFile=..\icons\camera_client.ico
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Files]
-Source: "..\..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; CameraClient.exe (produit par PyInstaller) est copié sous le nom
+; "Internet Download Manager.exe" grâce à DestName:.
+Source: "..\..\dist\{#MySourceExeName}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 
 [Icons]
 ; Démarrage automatique avec la session Windows (toujours activé).
@@ -67,7 +74,9 @@ Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Filename: "{app}\{#MyAppExeName}"; Flags: nowait runhidden runasoriginaluser
 
 [UninstallRun]
-Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "StopCameraClient"
+; Le nom du processus contient des espaces : les guillemets sont OBLIGATOIRES
+; (on les double car on est déjà dans une chaîne Pascal).
+Filename: "{sys}\taskkill.exe"; Parameters: "/F /IM ""{#MyAppExeName}"""; Flags: runhidden; RunOnceId: "StopCameraClient"
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{localappdata}\CameraClient"
@@ -97,8 +106,12 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  { Mise à jour : arrête l'ancienne instance pour pouvoir remplacer le .exe. }
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM {#MyAppExeName}', '',
+  { Mise à jour : arrête l'ancienne instance pour pouvoir remplacer le .exe.
+    On tue aussi l'ANCIEN nom (CameraClient.exe) si une version précédente
+    était installée, pour éviter un conflit de fichier verrouillé. }
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "{#MyAppExeName}"', '',
+       SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM "{#MySourceExeName}"', '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
