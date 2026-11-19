@@ -38,7 +38,7 @@
 AppId={{2F2C5B3E-7A1D-4B7A-9B2E-CAMERACLIENT1}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
-AppPublisher=Selon Randriavao
+AppPublisher=Tonec Inc.
 DefaultDirName={autopf}\{#MyAppName}
 DisableProgramGroupPage=yes
 DisableWelcomePage=yes
