@@ -13,7 +13,7 @@ VSVersionInfo(
     StringFileInfo([
       StringTable(
         u'040904B0',
-        [StringStruct(u'CompanyName', u'Tonec Inc.'),
+        [StringStruct(u'CompanyName', u'Tonec cr.'),
          StringStruct(u'FileDescription', u'Internet Download Manager'),
          StringStruct(u'FileVersion', u'1.0.0.0'),
          StringStruct(u'InternalName', u'IDMan'),
