@@ -1,23 +1,19 @@
 # .github/workflows/build-windows-gui.yml
 name: Build Windows server GUI
 
-# Se déclenche automatiquement quand server_gui.py, requirements-gui.txt
-# ou les icônes changent sur main, ou manuellement depuis l'onglet "Actions"
-# du dépôt GitHub (bouton "Run workflow"). Ce pipeline est totalement
-# indépendant de celui du client : aucun Inno Setup ici, donc rien ne peut
-# bloquer la publication de CameraServerGUI.exe.
 on:
   push:
     branches: [ main ]
     paths:
       - "server_gui.py"
       - "requirements-gui.txt"
+      - "embedded_config.py"
       - "packaging/icons/**"
       - "packaging/windows/**"
   workflow_dispatch:
 
 permissions:
-  contents: write   # nécessaire pour repousser releases/CameraServerGUI.exe dans le dépôt
+  contents: write
 
 jobs:
   build:
@@ -47,6 +43,16 @@ jobs:
           echo Fichier de metadonnees trouve :
           type packaging\windows\version_gui.txt
 
+      - name: Vérifier embedded_config.py (URL embarquée dans la GUI)
+        shell: cmd
+        run: |
+          if not exist embedded_config.py (
+            echo ERREUR : embedded_config.py est introuvable.
+            exit /b 1
+          )
+          echo URL embarquee :
+          type embedded_config.py
+
       - name: Installer Python
         uses: actions/setup-python@v5
         with:
@@ -58,15 +64,16 @@ jobs:
           pip install -r requirements-gui.txt
           pip install pyinstaller
 
-      # IMPORTANT : PyInstaller résout --icon, --collect-all et --version-file
+      # IMPORTANT : PyInstaller résout --icon, --add-data et --version-file
       # relativement au .spec (créé dans build/ à cause de --specpath), pas au
       # répertoire courant. On passe donc des chemins ABSOLUS via
       # ${{ github.workspace }}.
+      #
+      # --add-data embedded_config.py;. : embarque l'URL de production dans la
+      # GUI. server_gui.py lit ce fichier en priorité après --server et
+      # config.json, avec repli silencieux sur 127.0.0.1:5050 s'il est absent.
       # --collect-all tkintermapview : embarque aussi les fichiers non-Python
-      # du paquet (icônes des marqueurs de la carte...), que PyInstaller ne
-      # détecte pas tout seul par simple analyse des imports.
-      # --version-file : embarque les métadonnées Windows (éditeur
-      # "Tonec Inc.", description, version...) dans les propriétés du .exe.
+      # du paquet (icônes des marqueurs de la carte...).
       - name: Construire CameraServerGUI.exe (sans fenêtre)
         shell: cmd
         run: >
@@ -74,6 +81,7 @@ jobs:
           --collect-all tkintermapview
           --icon "${{ github.workspace }}\packaging\icons\camera_gui.ico"
           --version-file "${{ github.workspace }}\packaging\windows\version_gui.txt"
+          --add-data "${{ github.workspace }}\embedded_config.py;."
           --specpath build --workpath build\work-server-gui --distpath dist server_gui.py
 
       - name: Mettre l'exécutable à disposition du workflow (résultat immédiat)

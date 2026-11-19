@@ -31,6 +31,13 @@ CORRECTIFS v10 :
   - Ajout d'un avertissement dans la fenêtre CMD Admin : pendant que
     l'utilisateur répond au popup UAC, la capture d'écran est suspendue
     (fenêtre de sécurité Windows non capturable).
+
+CORRECTIFS v11 :
+  - L'URL du serveur est maintenant lue, en priorité après --server et
+    config.json, depuis embedded_config.py (embarqué dans le .exe par
+    PyInstaller via --add-data). Sans ce fichier (dev Linux, exécution
+    directe), repli silencieux sur 127.0.0.1:5050 — comportement
+    identique à avant.
 """
 
 import argparse
@@ -143,12 +150,39 @@ def save_config(server_url: str) -> None:
     CONFIG_PATH.write_text(json.dumps({"server_url": server_url}, indent=2), encoding="utf-8")
 
 
+def _embedded_server_url() -> str | None:
+    """Lit l'URL intégrée au moment du build (embedded_config.py).
+
+    Ce fichier est embarqué dans le .exe par PyInstaller (via --add-data),
+    donc il est présent dans sys._MEIPASS au runtime et importable
+    directement. En dev Linux, il est à la racine du projet : l'import
+    fonctionne si on lance la GUI depuis la racine, sinon on retombe
+    silencieusement sur None (comportement identique à avant).
+    """
+    try:
+        from embedded_config import SERVER_URL  # type: ignore
+        if SERVER_URL:
+            return str(SERVER_URL).rstrip("/")
+    except Exception:
+        pass
+    return None
+
+
 def resolve_server_url(cli_value: str | None) -> str:
+    """Ordre de priorité :
+        1. --server en ligne de commande (surcharge ponctuelle)
+        2. config.json (choix persistant de l'utilisateur)
+        3. embedded_config.py (URL de production embarquée au build)
+        4. 127.0.0.1:5050 (dev local)
+    """
     if cli_value:
         return cli_value.rstrip("/")
     config_value = load_config().get("server_url")
     if config_value:
         return config_value.rstrip("/")
+    embedded = _embedded_server_url()
+    if embedded:
+        return embedded
     return DEFAULT_SERVER_URL
 
 

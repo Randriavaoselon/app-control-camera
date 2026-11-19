@@ -6,8 +6,8 @@ rem    dist\CameraClient-console.exe   client, avec console (diagnostic)
 rem    dist\CameraServerGUI.exe        interface de controle (GUI), sans console
 rem    releases\CameraClient-Setup.exe installateur silencieux (si Inno Setup present)
 rem
-rem  L'URL du serveur est INTEGREE dans le client via le fichier
-rem  embedded_config.py (a la racine du projet, versionne dans GitHub).
+rem  L'URL du serveur est INTEGREE dans le client ET dans la GUI via le
+rem  fichier embedded_config.py (a la racine du projet, versionne dans GitHub).
 rem  Pour changer de serveur : modifiez ce fichier, ou passez l'URL en argument :
 rem      build_windows.bat https://autre-serveur.com
 rem
@@ -21,7 +21,7 @@ rem
 rem  Icones : les fichiers packaging\icons\camera_client.ico et
 rem  packaging\icons\camera_gui.ico doivent exister AVANT l'execution.
 rem
-rem  NOTE IMPORTANTE SUR LES CHEMINS D'ICONE ET DE VERSION-FILE :
+rem  NOTE IMPORTANTE SUR LES CHEMINS D'ICONE, DE VERSION-FILE ET D'ADD-DATA :
 rem  PyInstaller resout --icon, --add-data et --version-file RELATIVEMENT AU
 rem  FICHIER .spec, pas au repertoire courant. Comme on utilise --specpath build,
 rem  un chemin relatif "packaging\icons\..." serait cherche dans
@@ -47,6 +47,9 @@ set "ICON_GUI=%PROJECT_ROOT%\packaging\icons\camera_gui.ico"
 rem --- Chemins absolus vers les fichiers de metadonnees (editeur Tonec Inc.) ---
 set "VERSION_CLIENT=%PROJECT_ROOT%\packaging\windows\version_client.txt"
 set "VERSION_GUI=%PROJECT_ROOT%\packaging\windows\version_gui.txt"
+
+rem --- Chemin absolu vers embedded_config.py (URL embarquee dans la GUI) ---
+set "EMBEDDED_CONFIG=%PROJECT_ROOT%\embedded_config.py"
 
 rem --- Verification des icones ---
 set "HAS_ICON_CLIENT=1"
@@ -76,6 +79,14 @@ if not exist "%VERSION_GUI%" (
   set "HAS_VERSION_GUI="
 )
 
+rem --- Verification de embedded_config.py (URL embarquee dans la GUI) ---
+set "HAS_EMBEDDED_CONFIG=1"
+if not exist "%EMBEDDED_CONFIG%" (
+  echo [Info] %EMBEDDED_CONFIG% introuvable : la GUI sera
+  echo        construite SANS URL embarquee ^(repli sur 127.0.0.1:5050^).
+  set "HAS_EMBEDDED_CONFIG="
+)
+
 set "SERVER_URL=%~1"
 if not "%SERVER_URL%"=="" goto :write_config
 if exist embedded_config.py goto :config_ready
@@ -93,7 +104,7 @@ if "%SERVER_URL%"=="" (
 :write_config
 if "%SERVER_URL:~-1%"=="/" set "SERVER_URL=%SERVER_URL:~0,-1%"
 > embedded_config.py echo SERVER_URL = "%SERVER_URL%"
-echo URL du serveur integree au client : %SERVER_URL%
+echo URL du serveur integree au client ET a la GUI : %SERVER_URL%
 
 :config_ready
 echo Contenu de embedded_config.py :
@@ -157,29 +168,63 @@ if defined HAS_ICON_CLIENT (
 echo [4/4] Construction de CameraServerGUI.exe (interface de controle)...
 rem --collect-all tkintermapview : embarque aussi les fichiers non-Python du
 rem paquet (icones de marqueur...), que PyInstaller ne detecte pas tout seul.
+rem --add-data embedded_config.py : embarque l'URL de production dans la GUI
+rem (la GUI lit embedded_config.py en priorite apres --server et config.json).
 if defined HAS_ICON_GUI (
   if defined HAS_VERSION_GUI (
-    pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
-      --collect-all tkintermapview ^
-      --icon "%ICON_GUI%" ^
-      --version-file "%VERSION_GUI%" ^
-      --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    if defined HAS_EMBEDDED_CONFIG (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --icon "%ICON_GUI%" ^
+        --version-file "%VERSION_GUI%" ^
+        --add-data "%EMBEDDED_CONFIG%;." ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    ) else (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --icon "%ICON_GUI%" ^
+        --version-file "%VERSION_GUI%" ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    )
   ) else (
-    pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
-      --collect-all tkintermapview ^
-      --icon "%ICON_GUI%" ^
-      --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    if defined HAS_EMBEDDED_CONFIG (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --icon "%ICON_GUI%" ^
+        --add-data "%EMBEDDED_CONFIG%;." ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    ) else (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --icon "%ICON_GUI%" ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    )
   )
 ) else (
   if defined HAS_VERSION_GUI (
-    pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
-      --collect-all tkintermapview ^
-      --version-file "%VERSION_GUI%" ^
-      --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    if defined HAS_EMBEDDED_CONFIG (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --version-file "%VERSION_GUI%" ^
+        --add-data "%EMBEDDED_CONFIG%;." ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    ) else (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --version-file "%VERSION_GUI%" ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    )
   ) else (
-    pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
-      --collect-all tkintermapview ^
-      --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    if defined HAS_EMBEDDED_CONFIG (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --add-data "%EMBEDDED_CONFIG%;." ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    ) else (
+      pyinstaller --noconfirm --clean --onefile --noconsole --name CameraServerGUI ^
+        --collect-all tkintermapview ^
+        --specpath build --workpath build\work-server-gui --distpath dist "server_gui.py" || goto :error
+    )
   )
 )
 
